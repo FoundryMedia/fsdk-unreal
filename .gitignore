@@ -1,0 +1,33 @@
+# Unreal Engine generated / build output
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.VC.db
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.xcodeproj
+*.xcworkspace
+
+# Vendored fsdk-core built artifacts (the static libs are built, not committed)
+ThirdParty/fsdk-core/lib/
+ThirdParty/fsdk-core/build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs / tmp
+*.log
+.tmp/
+.cache/
