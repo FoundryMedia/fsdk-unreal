@@ -1,0 +1,115 @@
+name: SDK (package + release)
+
+# Packages the FoundryFSDK Unreal plugin into a versioned zip and publishes a
+# GitHub Release that the dev console's "Get the SDK" CTA reads (releases/latest).
+#
+# fsdk-unreal is PUBLIC, so this self-deploys HERE - a public repo cannot call
+# foundry-ops' private reusable workflows (GitHub limitation; the documented
+# public-repo exception in foundry-cicd-models.md). Mirrors the foundry CLI's
+# cli-release.yml self-contained pattern.
+#
+# There is NO engine compile in CI: the plugin is a source/code plugin built by
+# UBT in the consumer's project, and the only verified config (UE 5.7 from
+# source) cannot run on a hosted runner. So "build" = assemble + validate the
+# installable plugin zip; correctness is proven by the consumer build.
+#
+#   PR (plugin files)          -> assemble + validate the zip (no release)
+#   push to release (plugin)   -> package + publish a Release IF the version is new
+#   workflow_dispatch          -> package + publish (skips if the version already shipped)
+#
+# To cut a release: bump VersionName in FoundryFSDK.uplugin, merge to release
+# (or run the workflow). An unchanged version is a no-op.
+
+on:
+  pull_request:
+    paths: ['FoundryFSDK.uplugin', 'Source/**', 'README.md', 'LICENSE', '.github/workflows/release.yml']
+  push:
+    branches: [release]
+    paths: ['FoundryFSDK.uplugin', 'Source/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: fsdk-unreal-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V=$(jq -r '.VersionName' FoundryFSDK.uplugin)
+          if [ -z "$V" ] || [ "$V" = "null" ]; then
+            echo "::error::FoundryFSDK.uplugin has no VersionName"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "FoundryFSDK version: $V"
+
+      - name: Validate plugin structure
+        run: |
+          jq -e '.Modules[0].Name == "FoundryFSDK"' FoundryFSDK.uplugin >/dev/null \
+            || { echo "::error::.uplugin module name is not FoundryFSDK"; exit 1; }
+          test -f Source/FoundryFSDK/FoundryFSDK.Build.cs \
+            || { echo "::error::missing Source/FoundryFSDK/FoundryFSDK.Build.cs"; exit 1; }
+          test -f Source/FoundryFSDK/Public/FoundryFSDKSubsystem.h \
+            || { echo "::error::missing the subsystem header"; exit 1; }
+
+      - name: Assemble installable plugin zip
+        id: pkg
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          STAGE="dist/FoundryFSDK"
+          mkdir -p "$STAGE"
+          # Ship only what a consumer drops into Plugins/FoundryFSDK/ - the
+          # descriptor, the source the engine compiles, and the license/readme.
+          # Build artifacts are gitignored (absent from a fresh checkout); the
+          # superseded ThirdParty/ stub and CI dir are intentionally excluded.
+          cp FoundryFSDK.uplugin "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          cp -r Source "$STAGE/"
+          ZIP="FoundryFSDK-v$V.zip"
+          (cd dist && zip -rq "../$ZIP" FoundryFSDK)
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "Packaged $ZIP:"; unzip -l "$ZIP"
+
+      - name: Upload zip artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FoundryFSDK-v${{ steps.ver.outputs.version }}
+          path: ${{ steps.pkg.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Does this release already exist?
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.ver.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Release
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          PRERELEASE=""
+          case "$V" in *-*) PRERELEASE="--prerelease";; esac
+          gh release create "v$V" -R "$GITHUB_REPOSITORY" \
+            --title "Foundry FSDK (Unreal) v$V" \
+            --notes "Unreal Engine plugin for the Foundry SDK. Verified against UE 5.7 (source build). Drop the unzipped \`FoundryFSDK/\` into your project's \`Plugins/\` and rebuild. See the README for the quickstart." \
+            $PRERELEASE \
+            "${{ steps.pkg.outputs.zip }}"
+
+      - name: Already released (no-op)
+        if: steps.exists.outputs.exists == 'true'
+        run: echo "Release v${{ steps.ver.outputs.version }} already exists - bump VersionName in FoundryFSDK.uplugin to publish a new one."
