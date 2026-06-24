@@ -1,46 +1,30 @@
-# ThirdParty/fsdk-core (placeholder)
+# ThirdParty/fsdk-core (unused — superseded)
 
-This directory vendors the shared **fsdk-core** C ABI that the FoundryFSDK Unreal
-module links against. It is a **placeholder** in the scaffold - no headers or
-built binaries are committed here yet.
-
-## How this is meant to be populated
-
-`fsdk-core` is the source-of-truth repo at `../fsdk-core` (sibling of this repo).
-Vendor it here as a **git submodule** so the Unreal plugin always builds against
-a pinned core revision:
-
-```sh
-# from the fsdk-unreal repo root
-git submodule add ../fsdk-core ThirdParty/fsdk-core/repo
-```
-
-Then expose its artifacts in the layout `FoundryFSDK.Build.cs` expects:
+**This directory is no longer used.** The original scaffold planned to link a
+prebuilt `fsdk_core` static lib here. We instead **vendor the fsdk-core CLIENT
+sources directly into the module** and let UBT compile them as C:
 
 ```
-ThirdParty/fsdk-core/
-  include/foundry/fsdk.h        # the public C ABI header
-  lib/Win64/fsdk_core.lib       # static lib built from fsdk-core (per platform)
-  lib/Linux/libfsdk_core.a
-  lib/Mac/libfsdk_core.a
+Source/FoundryFSDK/Private/FsdkCore/
+  include/foundry/fsdk.h     # public C ABI header
+  fsdk_internal.h
+  fsdk.c                     # version / result strings / log sink / transport store
+  transport.c                # builds the URL, dispatches to the host transport
+  client.c                   # auth + matchmaking (the player-scoped conversation)
 ```
 
-Practically:
+Why this instead of a prebuilt lib:
 
-1. Add the submodule (above), or copy `fsdk-core/include` here as `include/`.
-2. Build `fsdk-core` per target platform with its CMake:
-   ```sh
-   cmake -S <fsdk-core> -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-   cmake --build build --config Release
-   ```
-3. Drop the resulting static lib at `lib/<Platform>/` using the names above.
+- **No CMake / no per-platform static lib build.** UBT (the engine toolchain)
+  compiles the C in-module, so the plugin builds hermetically on any platform the
+  engine targets.
+- **The engine owns the network + TLS.** fsdk-core bakes in no HTTP stack; it
+  exposes a transport seam (`fsdk_set_http_transport`). The module installs a
+  transport backed by the engine's HTTP module (`FoundryFSDKTransport.cpp`).
+- **Client-only.** Only the client translation units are vendored — the
+  server/Agones/token-verify code is deliberately absent from the player binary.
 
-`FoundryFSDK.Build.cs` adds `include/` to the include path and links
-`lib/<Platform>/...` when the file is present (it guards with `File.Exists`, so
-the scaffold parses without the binaries).
-
-## Why vendored, not system-installed
-
-The Unreal plugin must build hermetically on the engine's toolchain across
-platforms. Vendoring (submodule) pins an exact, reviewed core revision and keeps
-the C ABI - the security-critical contract - in lockstep with the plugin.
+`FoundryFSDK.Build.cs` adds `Private/FsdkCore/include` and `Private/FsdkCore` to the
+include path. To refresh the vendored copy, re-copy those files from the
+`fsdk-core` repo (`../fsdk-core`, sibling). Keep the C ABI — the security-critical
+contract — in lockstep with `fsdk-core/SECURITY.md`.

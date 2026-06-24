@@ -1,14 +1,55 @@
 // Copyright Foundry Media. FoundryFSDK Unreal subsystem facade (implementation).
 //
-// Thin idiomatic-UE wrapper over the fsdk-core CLIENT C ABI. SCAFFOLD: forwards
-// to the C ABI stubs; real behavior arrives when fsdk-core is implemented and
-// the ThirdParty static lib is linked (see ../../ThirdParty/fsdk-core/README.md).
+// Idiomatic-UE wrapper over the fsdk-core CLIENT C ABI (vendored + compiled
+// in-module under Private/FsdkCore). The core performs the real player-scoped
+// HTTPS conversation via the host transport installed at module startup (engine
+// HTTP module - see FoundryFSDKModule.cpp / FoundryFSDKTransport.cpp).
+//
+// The core ABI is synchronous and blocks on the network, so each public method
+// runs its core call on a WORKER THREAD and broadcasts an On...Complete delegate
+// back on the GAME THREAD - the game thread never blocks. The core is not
+// thread-safe, so access is serialized by a per-state critical section, and the
+// core handles live behind a ref-counted FFsdkCoreState so an in-flight worker
+// can never touch a freed client (e.g. if the subsystem is torn down mid-call).
+//
+// SECURITY: the player token is forwarded to the core and never persisted or
+// logged here. See ../../fsdk-core/SECURITY.md.
 
 #include "FoundryFSDKSubsystem.h"
 
 #include "foundry/fsdk.h"
 
+#include "Async/Async.h"
+#include "HAL/CriticalSection.h"
+#include "Misc/ScopeLock.h"
+
 DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDK, Log, All);
+
+/**
+ * Ref-counted owner of the fsdk-core handles + the lock that serializes core
+ * access. Shared (by value) into every worker, so the handles outlive any
+ * in-flight call even if the subsystem is destroyed. The destructor runs only
+ * when the last owner releases - no other thread can be mid-call - so it frees
+ * without locking.
+ */
+struct FFsdkCoreState
+{
+	fsdk_client* Client = nullptr;
+	fsdk_ticket* ActiveTicket = nullptr;
+	FCriticalSection CS;
+
+	~FFsdkCoreState()
+	{
+		if (ActiveTicket != nullptr)
+		{
+			fsdk_ticket_destroy(ActiveTicket);
+		}
+		if (Client != nullptr)
+		{
+			fsdk_client_destroy(Client);
+		}
+	}
+};
 
 namespace
 {
@@ -26,6 +67,28 @@ namespace
 			default:                   return EFoundryMatchStatus::Unknown;
 		}
 	}
+
+	/** Map an fsdk_result (C ABI) to the Blueprint result enum. */
+	EFoundryFsdkResult ToBlueprintResult(fsdk_result Result)
+	{
+		switch (Result)
+		{
+			case FSDK_OK:                    return EFoundryFsdkResult::Ok;
+			case FSDK_NOT_IMPLEMENTED:       return EFoundryFsdkResult::NotImplemented;
+			case FSDK_ERR_INVALID_ARG:       return EFoundryFsdkResult::InvalidArg;
+			case FSDK_ERR_NOT_AUTHENTICATED: return EFoundryFsdkResult::NotAuthenticated;
+			case FSDK_ERR_UNAUTHORIZED:      return EFoundryFsdkResult::Unauthorized;
+			case FSDK_ERR_NETWORK:           return EFoundryFsdkResult::Network;
+			case FSDK_ERR_TIMEOUT:           return EFoundryFsdkResult::Timeout;
+			case FSDK_ERR_PROTOCOL:          return EFoundryFsdkResult::Protocol;
+			case FSDK_ERR_TOKEN_INVALID:     return EFoundryFsdkResult::Protocol;
+			case FSDK_ERR_TOKEN_EXPIRED:     return EFoundryFsdkResult::Unauthorized;
+			case FSDK_ERR_NO_MATCH:          return EFoundryFsdkResult::NoMatch;
+			case FSDK_ERR_AGONES:            return EFoundryFsdkResult::Internal;
+			case FSDK_ERR_INTERNAL:          return EFoundryFsdkResult::Internal;
+			default:                         return EFoundryFsdkResult::Unknown;
+		}
+	}
 }
 
 void UFoundryFSDKSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -37,137 +100,212 @@ void UFoundryFSDKSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UFoundryFSDKSubsystem::Deinitialize()
 {
-	if (ActiveTicket != nullptr)
-	{
-		fsdk_ticket_destroy(static_cast<fsdk_ticket*>(ActiveTicket));
-		ActiveTicket = nullptr;
-	}
-	if (Client != nullptr)
-	{
-		fsdk_client_destroy(Client);
-		Client = nullptr;
-	}
+	// Drop the subsystem's reference. Any worker mid-call holds its own ref, so
+	// the handles stay alive until that call returns, then free on the last release.
+	Core.Reset();
 	Super::Deinitialize();
 }
 
 bool UFoundryFSDKSubsystem::InitializeClient(const FString& BaseUrl)
 {
-	if (Client != nullptr)
-	{
-		fsdk_client_destroy(Client);
-		Client = nullptr;
-	}
+	TSharedRef<FFsdkCoreState, ESPMode::ThreadSafe> NewState =
+		MakeShared<FFsdkCoreState, ESPMode::ThreadSafe>();
 
-	const fsdk_result Result = fsdk_client_create(TCHAR_TO_UTF8(*BaseUrl), &Client);
+	fsdk_client* NewClient = nullptr;
+	const fsdk_result Result = fsdk_client_create(TCHAR_TO_UTF8(*BaseUrl), &NewClient);
 	if (Result != FSDK_OK)
 	{
 		UE_LOG(LogFoundryFSDK, Error, TEXT("fsdk_client_create failed: %s"),
 			UTF8_TO_TCHAR(fsdk_result_str(Result)));
 		return false;
 	}
+	NewState->Client = NewClient;
+
+	// Replace any prior state; its handles free once no worker still holds a ref.
+	Core = NewState;
 	return true;
 }
 
-bool UFoundryFSDKSubsystem::Authenticate(const FString& PlayerToken)
+void UFoundryFSDKSubsystem::Authenticate(const FString& PlayerToken)
 {
-	if (Client == nullptr)
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
 		UE_LOG(LogFoundryFSDK, Error, TEXT("Authenticate called before InitializeClient"));
-		return false;
+		OnAuthenticateComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated);
+		return;
 	}
 
-	// SECURITY: PlayerToken is the player's own FID session token, passed in by
-	// game code. We forward it to the C ABI and do not log or persist it.
-	const fsdk_result Result = fsdk_authenticate(Client, TCHAR_TO_UTF8(*PlayerToken));
-	if (Result != FSDK_OK)
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	const FString Token = PlayerToken; // deep copy for the worker
+
+	// SECURITY: the token is the player's own FID session token; forwarded to the
+	// core (bearer) and never persisted or logged here.
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, Token]()
 	{
-		UE_LOG(LogFoundryFSDK, Warning, TEXT("fsdk_authenticate failed: %s"),
-			UTF8_TO_TCHAR(fsdk_result_str(Result)));
-		return false;
-	}
-	return true;
+		fsdk_result R;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			const FTCHARToUTF8 TokenUtf8(*Token);
+			R = fsdk_authenticate(CoreRef->Client, TokenUtf8.Get());
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnAuthenticateComplete.Broadcast(Result);
+			}
+		});
+	});
 }
 
-bool UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& AttributesJson)
+void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& AttributesJson)
 {
-	if (Client == nullptr)
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
 		UE_LOG(LogFoundryFSDK, Error, TEXT("RequestMatch called before InitializeClient"));
-		return false;
+		OnRequestMatchComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated);
+		return;
 	}
 
-	// Drop any previous ticket.
-	if (ActiveTicket != nullptr)
-	{
-		fsdk_ticket_destroy(static_cast<fsdk_ticket*>(ActiveTicket));
-		ActiveTicket = nullptr;
-	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	const FString QueueCopy = Queue;
+	const FString AttrsCopy = AttributesJson;
 
-	const char* Attrs = AttributesJson.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*AttributesJson);
-	fsdk_ticket* Ticket = nullptr;
-	const fsdk_result Result = fsdk_request_match(Client, TCHAR_TO_UTF8(*Queue), Attrs, &Ticket);
-	if (Result != FSDK_OK)
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, QueueCopy, AttrsCopy]()
 	{
-		UE_LOG(LogFoundryFSDK, Warning, TEXT("fsdk_request_match failed: %s"),
-			UTF8_TO_TCHAR(fsdk_result_str(Result)));
-		return false;
-	}
-	ActiveTicket = Ticket;
-	return true;
+		fsdk_result R;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			// Drop any previous ticket.
+			if (CoreRef->ActiveTicket != nullptr)
+			{
+				fsdk_ticket_destroy(CoreRef->ActiveTicket);
+				CoreRef->ActiveTicket = nullptr;
+			}
+			const FTCHARToUTF8 QueueUtf8(*QueueCopy);
+			const FTCHARToUTF8 AttrsUtf8(*AttrsCopy);
+			const char* Attrs = AttrsCopy.IsEmpty() ? nullptr : AttrsUtf8.Get();
+			fsdk_ticket* Ticket = nullptr;
+			R = fsdk_request_match(CoreRef->Client, QueueUtf8.Get(), Attrs, &Ticket);
+			if (R == FSDK_OK)
+			{
+				CoreRef->ActiveTicket = Ticket;
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnRequestMatchComplete.Broadcast(Result);
+			}
+		});
+	});
 }
 
-EFoundryMatchStatus UFoundryFSDKSubsystem::PollMatch()
+void UFoundryFSDKSubsystem::PollMatch()
 {
-	if (Client == nullptr || ActiveTicket == nullptr)
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		return EFoundryMatchStatus::Unknown;
+		OnPollMatchComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, EFoundryMatchStatus::Unknown);
+		return;
 	}
 
-	fsdk_match_status Status = FSDK_MATCH_PENDING;
-	const fsdk_result Result =
-		fsdk_poll_match(Client, static_cast<fsdk_ticket*>(ActiveTicket), &Status);
-	if (Result != FSDK_OK)
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
-		UE_LOG(LogFoundryFSDK, Verbose, TEXT("fsdk_poll_match failed: %s"),
-			UTF8_TO_TCHAR(fsdk_result_str(Result)));
-		return EFoundryMatchStatus::Unknown;
-	}
-	return ToBlueprintStatus(Status);
+		fsdk_result R;
+		fsdk_match_status S = FSDK_MATCH_PENDING;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			if (CoreRef->ActiveTicket == nullptr)
+			{
+				R = FSDK_ERR_NO_MATCH;
+			}
+			else
+			{
+				R = fsdk_poll_match(CoreRef->Client, CoreRef->ActiveTicket, &S);
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		const EFoundryMatchStatus Status =
+			(R == FSDK_OK) ? ToBlueprintStatus(S) : EFoundryMatchStatus::Unknown;
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Status]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPollMatchComplete.Broadcast(Result, Status);
+			}
+		});
+	});
 }
 
-bool UFoundryFSDKSubsystem::GetConnection(FFoundryConnection& OutConnection)
+void UFoundryFSDKSubsystem::GetConnection()
 {
-	OutConnection = FFoundryConnection();
-	if (Client == nullptr || ActiveTicket == nullptr)
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		return false;
+		OnGetConnectionComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundryConnection());
+		return;
 	}
 
-	fsdk_connection Conn;
-	const fsdk_result Result =
-		fsdk_get_connection(Client, static_cast<fsdk_ticket*>(ActiveTicket), &Conn);
-	if (Result != FSDK_OK)
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
-		// FSDK_ERR_NO_MATCH / FSDK_NOT_IMPLEMENTED (scaffold) land here.
-		UE_LOG(LogFoundryFSDK, Verbose, TEXT("fsdk_get_connection not ready: %s"),
-			UTF8_TO_TCHAR(fsdk_result_str(Result)));
-		return false;
-	}
-
-	// ip:port is an opaque rendezvous (box today, relay later) - see SECURITY.md.
-	OutConnection.Ip = UTF8_TO_TCHAR(Conn.ip);
-	OutConnection.Port = static_cast<int32>(Conn.port);
-	OutConnection.MatchToken = UTF8_TO_TCHAR(Conn.match_token);
-	return true;
+		fsdk_result R;
+		fsdk_connection Conn;
+		FMemory::Memzero(&Conn, sizeof(Conn));
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			if (CoreRef->ActiveTicket == nullptr)
+			{
+				R = FSDK_ERR_NO_MATCH;
+			}
+			else
+			{
+				R = fsdk_get_connection(CoreRef->Client, CoreRef->ActiveTicket, &Conn);
+			}
+		}
+		FFoundryConnection Out;
+		if (R == FSDK_OK)
+		{
+			// ip:port is an opaque rendezvous (box today, relay later) - see SECURITY.md.
+			Out.Ip = UTF8_TO_TCHAR(Conn.ip);
+			Out.Port = static_cast<int32>(Conn.port);
+			Out.MatchToken = UTF8_TO_TCHAR(Conn.match_token);
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Out]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnGetConnectionComplete.Broadcast(Result, Out);
+			}
+		});
+	});
 }
 
 void UFoundryFSDKSubsystem::CancelMatch()
 {
-	if (Client == nullptr || ActiveTicket == nullptr)
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
 		return;
 	}
-	fsdk_cancel_match(Client, static_cast<fsdk_ticket*>(ActiveTicket));
-	fsdk_ticket_destroy(static_cast<fsdk_ticket*>(ActiveTicket));
-	ActiveTicket = nullptr;
+
+	// Fire-and-forget; cancel + drop the ticket under the serialization lock.
+	Async(EAsyncExecution::Thread, [CoreRef]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->ActiveTicket != nullptr)
+		{
+			fsdk_cancel_match(CoreRef->Client, CoreRef->ActiveTicket);
+			fsdk_ticket_destroy(CoreRef->ActiveTicket);
+			CoreRef->ActiveTicket = nullptr;
+		}
+	});
 }
