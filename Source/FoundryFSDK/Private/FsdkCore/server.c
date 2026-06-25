@@ -176,6 +176,18 @@ fsdk_result fsdk_server_validate_player(fsdk_server* server,
      * (FSDK_NOT_IMPLEMENTED = no verifier installed = also a drop, fail-closed). */
     fsdk_player_info info_local;
     fsdk_player_info* info = (out != NULL) ? out : &info_local;
+
+    /* Lazy binding read: the fcg/match-id annotation is applied at ALLOCATION (after the box is
+     * Ready), so a startup get_binding misses it. Read it here on the FIRST validation rather than
+     * forcing a restart - by the time any player connects the GameServer is Allocated and the
+     * annotation is present. Once latched it sticks (cached on the handle), so this costs one extra
+     * sidecar GET on the first join only; NULL stays NULL when no annotation exists (binding skipped). */
+    if (server->match_id == NULL) {
+        char* binding = NULL;
+        (void)fsdk_server_get_binding(server, &binding);
+        fsdk_string_free(binding);
+    }
+
     fsdk_result vr = fsdk_token_verify(match_token, server->match_id, info);
     if (vr != FSDK_OK) {
         fsdk_log(FSDK_LOG_WARN, "fsdk validate_player: token rejected");
