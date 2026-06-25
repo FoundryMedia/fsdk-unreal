@@ -25,32 +25,6 @@
 #define FSDK_PATH_ME            "/v1/me/user"
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
 
-/* Small internal helper: heap-duplicate a NUL-terminated string. Returns NULL
- * on NULL input or allocation failure. */
-static char* fsdk_strdup(const char* s) {
-    if (s == NULL) {
-        return NULL;
-    }
-    size_t n = strlen(s) + 1;
-    char* copy = (char*)malloc(n);
-    if (copy != NULL) {
-        memcpy(copy, s, n);
-    }
-    return copy;
-}
-
-/* Bounded copy into a fixed buffer (always NUL-terminates; no CRT _s funcs). */
-static void copy_bounded(char* dst, size_t dst_sz, const char* src) {
-    if (dst == NULL || dst_sz == 0) {
-        return;
-    }
-    size_t i = 0;
-    for (; src != NULL && src[i] != '\0' && i + 1 < dst_sz; i++) {
-        dst[i] = src[i];
-    }
-    dst[i] = '\0';
-}
-
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
  * 408/504 -> TIMEOUT; anything else unexpected -> PROTOCOL. */
@@ -95,67 +69,11 @@ static fsdk_match_status ticket_state_to_status(const char* state) {
  * from the small, well-known fid JsonApiResponse shapes (the "data" object).
  * A production core links a real JSON library; this stays zero-dependency. */
 
-/* Return a pointer to the value just after `"key":` (skipping whitespace), or
- * NULL. Search begins at `from`. Matches a quoted key only. */
-static const char* json_value_after(const char* from, const char* key) {
-    if (from == NULL || key == NULL) {
-        return NULL;
-    }
-    size_t klen = strlen(key);
-    const char* p = from;
-    while ((p = strchr(p, '"')) != NULL) {
-        if (strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"') {
-            const char* q = p + 1 + klen + 1; /* past the key's closing quote */
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
-                q++;
-            }
-            if (*q == ':') {
-                q++;
-                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
-                    q++;
-                }
-                return q;
-            }
-        }
-        p++;
-    }
-    return NULL;
-}
-
 /* Narrow to the envelope's "data" object so field lookups don't collide with
  * keys in "meta"/"errors". Falls back to the whole body if absent. */
 static const char* json_data_object(const char* body) {
     const char* v = json_value_after(body, "data");
     return (v != NULL && *v == '{') ? v : body;
-}
-
-/* Extract a string field's value into out (bounded). Returns 1 on success. */
-static int json_extract_string(const char* body, const char* key,
-                               char* out, size_t out_sz) {
-    const char* v = json_value_after(body, key);
-    if (out_sz > 0) {
-        out[0] = '\0';
-    }
-    if (v == NULL || *v != '"') {
-        return 0;
-    }
-    v++; /* opening quote of the value */
-    size_t i = 0;
-    while (*v != '\0' && *v != '"') {
-        char c = *v;
-        if (c == '\\' && v[1] != '\0') {
-            v++;
-            c = *v; /* copy the escaped char literally (ids/states have none) */
-        }
-        if (i + 1 < out_sz) {
-            out[i++] = c;
-        }
-        v++;
-    }
-    if (i < out_sz) {
-        out[i] = '\0';
-    }
-    return (*v == '"');
 }
 
 /* Extract an integer field's value. Returns 1 on success. */

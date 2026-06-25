@@ -33,54 +33,8 @@
 /* Default Agones SDK sidecar REST gateway (the gRPC SDK is :9357; the HTTP gateway is :9358). */
 #define FSDK_AGONES_DEFAULT_ADDR "http://127.0.0.1:9358"
 
-static char* fsdk_strdup_srv(const char* s) {
-    if (s == NULL) {
-        return NULL;
-    }
-    size_t n = strlen(s) + 1;
-    char* copy = (char*)malloc(n);
-    if (copy != NULL) {
-        memcpy(copy, s, n);
-    }
-    return copy;
-}
-
-/* Minimal JSON string-field reader for the GameServer binding (flat key search; the annotation key
- * is unique in the doc so nesting under metadata.annotations is fine). Mirrors token.c/client.c's
- * readers - a shared json helper is a cleanup follow-on. */
-static int srv_json_string(const char* body, const char* key, char* out, size_t out_sz) {
-    if (out_sz > 0) {
-        out[0] = '\0';
-    }
-    if (body == NULL || key == NULL) {
-        return 0;
-    }
-    size_t klen = strlen(key);
-    const char* p = body;
-    while ((p = strchr(p, '"')) != NULL) {
-        if (strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"') {
-            const char* q = p + 1 + klen + 1;
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            if (*q == ':') {
-                q++;
-                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-                if (*q != '"') return 0;
-                q++;
-                size_t i = 0;
-                while (*q != '\0' && *q != '"') {
-                    char c = *q;
-                    if (c == '\\' && q[1] != '\0') { q++; c = *q; }
-                    if (i + 1 < out_sz) out[i++] = c;
-                    q++;
-                }
-                if (i < out_sz) out[i] = '\0';
-                return (*q == '"');
-            }
-        }
-        p++;
-    }
-    return 0;
-}
+/* fsdk_strdup + json_extract_string (used for the flat fcg/match-id annotation) are shared
+ * via fsdk_internal.h. */
 
 /* POST {} to an Agones sidecar path through the host http transport; 2xx => FSDK_OK. */
 static fsdk_result agones_post(fsdk_server* server, const char* path) {
@@ -112,7 +66,7 @@ fsdk_result fsdk_server_create(const char* agones_addr, fsdk_server** out_server
     /* agones_addr is the sidecar HTTP gateway base; NULL -> the Agones default. */
     const char* addr = (agones_addr != NULL && agones_addr[0] != '\0')
             ? agones_addr : FSDK_AGONES_DEFAULT_ADDR;
-    server->agones_addr = fsdk_strdup_srv(addr);
+    server->agones_addr = fsdk_strdup(addr);
     if (server->agones_addr == NULL) {
         free(server);
         return FSDK_ERR_INTERNAL;
@@ -220,9 +174,9 @@ fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json) {
 
     if (body != NULL) {
         char mid[64];
-        if (srv_json_string(body, "fcg/match-id", mid, sizeof mid) && mid[0] != '\0') {
+        if (json_extract_string(body, "fcg/match-id", mid, sizeof mid) && mid[0] != '\0') {
             free(server->match_id);
-            server->match_id = fsdk_strdup_srv(mid);
+            server->match_id = fsdk_strdup(mid);
             fsdk_log(FSDK_LOG_INFO, "fsdk get_binding: latched match binding");
         }
     }

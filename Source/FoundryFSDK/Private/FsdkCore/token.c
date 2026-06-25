@@ -90,42 +90,8 @@ static int b64url_decode(const char* in, size_t in_len,
     return 1;
 }
 
-/* --- minimal JSON readers (flat objects; same shape as client.c's) --------- */
-
-static const char* json_value_after(const char* from, const char* key) {
-    if (from == NULL || key == NULL) return NULL;
-    size_t klen = strlen(key);
-    const char* p = from;
-    while ((p = strchr(p, '"')) != NULL) {
-        if (strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"') {
-            const char* q = p + 1 + klen + 1;
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-            if (*q == ':') {
-                q++;
-                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-                return q;
-            }
-        }
-        p++;
-    }
-    return NULL;
-}
-
-static int json_extract_string(const char* body, const char* key, char* out, size_t out_sz) {
-    const char* v = json_value_after(body, key);
-    if (out_sz > 0) out[0] = '\0';
-    if (v == NULL || *v != '"') return 0;
-    v++;
-    size_t i = 0;
-    while (*v != '\0' && *v != '"') {
-        char c = *v;
-        if (c == '\\' && v[1] != '\0') { v++; c = *v; }
-        if (i + 1 < out_sz) out[i++] = c;
-        v++;
-    }
-    if (i < out_sz) out[i] = '\0';
-    return (*v == '"');
-}
+/* --- minimal JSON readers (json_value_after / json_extract_string + copy_bounded
+ * are shared via fsdk_internal.h; the readers below are token-specific) ------- */
 
 static int json_extract_long(const char* body, const char* key, long* out) {
     const char* v = json_value_after(body, key);
@@ -168,14 +134,6 @@ static int json_aud_matches(const char* body, const char* expected) {
         }
     }
     return 0;
-}
-
-static void copy_bounded(char* dst, size_t cap, const char* src) {
-    if (cap == 0) return;
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = '\0';
 }
 
 /* --- verify ---------------------------------------------------------------- */

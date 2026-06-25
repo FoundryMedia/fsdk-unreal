@@ -10,6 +10,98 @@
 
 #include "foundry/fsdk.h"
 
+#include <stdlib.h>
+#include <string.h>
+
+/* -------------------------------------------------------------------------- */
+/* Shared small helpers (header-inline; one source instead of per-.c copies).  */
+/* Identical logic previously duplicated across client.c/token.c/server.c.     */
+/* -------------------------------------------------------------------------- */
+
+/* Heap-duplicate a NUL-terminated string; NULL on NULL input or allocation failure. */
+static inline char* fsdk_strdup(const char* s) {
+    if (s == NULL) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char* copy = (char*)malloc(n);
+    if (copy != NULL) {
+        memcpy(copy, s, n);
+    }
+    return copy;
+}
+
+/* Bounded copy into a fixed buffer (always NUL-terminates; NULL-safe; no CRT _s). */
+static inline void copy_bounded(char* dst, size_t dst_sz, const char* src) {
+    if (dst == NULL || dst_sz == 0) {
+        return;
+    }
+    size_t i = 0;
+    for (; src != NULL && src[i] != '\0' && i + 1 < dst_sz; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+}
+
+/* Minimal flat-JSON readers (NOT a general parser): read only the small, well-known
+ * fid JsonApiResponse / JWT-claim shapes. A production core links a real JSON
+ * library; this stays zero-dependency. */
+
+/* Pointer to the value just after `"key":` (skipping whitespace), or NULL. Quoted key only. */
+static inline const char* json_value_after(const char* from, const char* key) {
+    if (from == NULL || key == NULL) {
+        return NULL;
+    }
+    size_t klen = strlen(key);
+    const char* p = from;
+    while ((p = strchr(p, '"')) != NULL) {
+        if (strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"') {
+            const char* q = p + 1 + klen + 1; /* past the key's closing quote */
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                q++;
+            }
+            if (*q == ':') {
+                q++;
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                    q++;
+                }
+                return q;
+            }
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/* Extract a string field's value into out (bounded). Returns 1 on success. */
+static inline int json_extract_string(const char* body, const char* key,
+                                      char* out, size_t out_sz) {
+    const char* v = json_value_after(body, key);
+    if (out_sz > 0) {
+        out[0] = '\0';
+    }
+    if (v == NULL || *v != '"') {
+        return 0;
+    }
+    v++; /* opening quote of the value */
+    size_t i = 0;
+    while (*v != '\0' && *v != '"') {
+        char c = *v;
+        if (c == '\\' && v[1] != '\0') {
+            v++;
+            c = *v; /* copy the escaped char literally (ids/states have none) */
+        }
+        if (i + 1 < out_sz) {
+            out[i++] = c;
+        }
+        v++;
+    }
+    if (i < out_sz) {
+        out[i] = '\0';
+    }
+    return (*v == '"');
+}
+
 /* -------------------------------------------------------------------------- */
 /* Opaque handle definitions                                                  */
 /* -------------------------------------------------------------------------- */
