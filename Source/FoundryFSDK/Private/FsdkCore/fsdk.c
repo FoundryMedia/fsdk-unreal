@@ -85,6 +85,31 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
 }
 
 /* -------------------------------------------------------------------------- */
+/* JWT signature verifier (host-provided, SERVER-side only)                   */
+/* -------------------------------------------------------------------------- */
+
+static fsdk_jwt_verify_fn g_jwt_verifier = NULL;
+static void*              g_jwt_user_data = NULL;
+
+void fsdk_set_jwt_verifier(fsdk_jwt_verify_fn verifier, void* user_data) {
+    g_jwt_verifier = verifier;
+    g_jwt_user_data = user_data;
+}
+
+fsdk_result fsdk_dispatch_jwt_verify(const char* kid,
+                                     const char* signing_input,
+                                     const unsigned char* signature,
+                                     size_t signature_len) {
+    if (g_jwt_verifier == NULL) {
+        /* No crypto baked in - the server binding must install a verifier. Fail
+         * closed: an unverifiable token is a rejected token. */
+        fsdk_log(FSDK_LOG_DEBUG, "fsdk jwt: no verifier installed");
+        return FSDK_NOT_IMPLEMENTED;
+    }
+    return g_jwt_verifier(kid, signing_input, signature, signature_len, g_jwt_user_data);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Memory helpers                                                             */
 /* -------------------------------------------------------------------------- */
 

@@ -22,6 +22,10 @@ struct fsdk_client {
 
 struct fsdk_server {
     char* agones_addr;    /* Local Agones sidecar gRPC address (copied).       */
+    char* match_id;       /* This box's bound match id (the admission gate checks
+                           * a joining token's match_id against it). NULL until
+                           * fsdk_server_get_binding populates it (Agones - TODO);
+                           * NULL means validate_player skips the binding check.  */
     /* TODO(server identity): hold the short-lived, scoped server token minted
      * at allocation time, read from the environment - NEVER baked in. */
 };
@@ -78,14 +82,20 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
 /* Internal token verification. Implemented in token.c.                       */
 /* -------------------------------------------------------------------------- */
 
-/* Verify a FID-signed match token (a JWT): signature against FID's published
- * JWKS, expiry, audience, and that it binds to expected_match_id (NULL skips
- * the binding check). On FSDK_OK, *out_info is populated.
- *
- * SCAFFOLD: returns FSDK_NOT_IMPLEMENTED. A real JWT/JWKS verifier gets linked
- * in a follow-on. */
+/* Verify a platform-signed (auth-efga) match token (a JWT): RS256 signature (via
+ * the host-installed verifier seam, keyed by the header `kid`), algorithm pinning,
+ * iss/aud, exp/nbf, and that it binds to expected_match_id (NULL skips the binding
+ * check). On FSDK_OK, *out_info is populated (foundry_id=sub, match_id, expires_at=exp).
+ * Fails closed (FSDK_NOT_IMPLEMENTED) when no verifier is installed. */
 fsdk_result fsdk_token_verify(const char* match_token,
                               const char* expected_match_id,
                               fsdk_player_info* out_info);
+
+/* Dispatch a raw RS256 signature check to the host-installed verifier
+ * (fsdk_set_jwt_verifier). Implemented in fsdk.c. FSDK_NOT_IMPLEMENTED if none. */
+fsdk_result fsdk_dispatch_jwt_verify(const char* kid,
+                                     const char* signing_input,
+                                     const unsigned char* signature,
+                                     size_t signature_len);
 
 #endif /* FOUNDRY_FSDK_INTERNAL_H */

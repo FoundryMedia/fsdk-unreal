@@ -181,6 +181,37 @@ typedef fsdk_result (*fsdk_http_fn)(fsdk_http_method method,
  * bakes in its own network stack. */
 void fsdk_set_http_transport(fsdk_http_fn transport, void* user_data);
 
+/* Host-provided RS256 signature verifier for SERVER-side match-token validation.
+ * The core does ALL the dependency-free JWT work itself (compact split, base64url
+ * decode, claim + match-binding checks, algorithm pinning); it delegates ONLY the
+ * raw signature check to this callback, so the core links NO crypto library and
+ * stays vendorable into any binary. The dedicated-server binding backs this with
+ * OpenSSL (or its platform crypto), resolving the signing key by `kid` from FID's
+ * published JWKS - the server is trusted and MAY link such a library (the CLIENT
+ * never does; this seam is only used by the server path).
+ *
+ * Contract:
+ *   kid           : the JWT header "kid" (which JWKS key signed it); "" if absent.
+ *   signing_input : the exact ASCII "<header_b64url>.<payload_b64url>" that was
+ *                   signed (NUL-terminated). RS256 = RSASSA-PKCS1-v1_5 over
+ *                   SHA-256(signing_input).
+ *   signature     : the decoded signature bytes.
+ *   signature_len : length of signature in bytes.
+ *   user_data     : passed back verbatim from fsdk_set_jwt_verifier.
+ *
+ * Return FSDK_OK iff the signature is valid for the key identified by kid;
+ * otherwise FSDK_ERR_TOKEN_INVALID (unknown kid / bad signature). */
+typedef fsdk_result (*fsdk_jwt_verify_fn)(const char* kid,
+                                          const char* signing_input,
+                                          const unsigned char* signature,
+                                          size_t signature_len,
+                                          void* user_data);
+
+/* Install the process-wide JWT signature verifier (pass NULL to remove). With NO
+ * verifier installed, fsdk_token_verify / fsdk_server_validate_player FAIL CLOSED
+ * (FSDK_NOT_IMPLEMENTED) - an unverifiable token is a rejected token. */
+void fsdk_set_jwt_verifier(fsdk_jwt_verify_fn verifier, void* user_data);
+
 /* -------------------------------------------------------------------------- */
 /* CLIENT API (ships inside the game client - assume reverse-engineered)      */
 /* -------------------------------------------------------------------------- */
