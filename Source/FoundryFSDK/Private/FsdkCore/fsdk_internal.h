@@ -10,6 +10,98 @@
 
 #include "foundry/fsdk.h"
 
+#include <stdlib.h>
+#include <string.h>
+
+/* -------------------------------------------------------------------------- */
+/* Shared small helpers (header-inline; one source instead of per-.c copies).  */
+/* Identical logic previously duplicated across client.c/token.c/server.c.     */
+/* -------------------------------------------------------------------------- */
+
+/* Heap-duplicate a NUL-terminated string; NULL on NULL input or allocation failure. */
+static inline char* fsdk_strdup(const char* s) {
+    if (s == NULL) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char* copy = (char*)malloc(n);
+    if (copy != NULL) {
+        memcpy(copy, s, n);
+    }
+    return copy;
+}
+
+/* Bounded copy into a fixed buffer (always NUL-terminates; NULL-safe; no CRT _s). */
+static inline void copy_bounded(char* dst, size_t dst_sz, const char* src) {
+    if (dst == NULL || dst_sz == 0) {
+        return;
+    }
+    size_t i = 0;
+    for (; src != NULL && src[i] != '\0' && i + 1 < dst_sz; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+}
+
+/* Minimal flat-JSON readers (NOT a general parser): read only the small, well-known
+ * fid JsonApiResponse / JWT-claim shapes. A production core links a real JSON
+ * library; this stays zero-dependency. */
+
+/* Pointer to the value just after `"key":` (skipping whitespace), or NULL. Quoted key only. */
+static inline const char* json_value_after(const char* from, const char* key) {
+    if (from == NULL || key == NULL) {
+        return NULL;
+    }
+    size_t klen = strlen(key);
+    const char* p = from;
+    while ((p = strchr(p, '"')) != NULL) {
+        if (strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"') {
+            const char* q = p + 1 + klen + 1; /* past the key's closing quote */
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                q++;
+            }
+            if (*q == ':') {
+                q++;
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                    q++;
+                }
+                return q;
+            }
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/* Extract a string field's value into out (bounded). Returns 1 on success. */
+static inline int json_extract_string(const char* body, const char* key,
+                                      char* out, size_t out_sz) {
+    const char* v = json_value_after(body, key);
+    if (out_sz > 0) {
+        out[0] = '\0';
+    }
+    if (v == NULL || *v != '"') {
+        return 0;
+    }
+    v++; /* opening quote of the value */
+    size_t i = 0;
+    while (*v != '\0' && *v != '"') {
+        char c = *v;
+        if (c == '\\' && v[1] != '\0') {
+            v++;
+            c = *v; /* copy the escaped char literally (ids/states have none) */
+        }
+        if (i + 1 < out_sz) {
+            out[i++] = c;
+        }
+        v++;
+    }
+    if (i < out_sz) {
+        out[i] = '\0';
+    }
+    return (*v == '"');
+}
+
 /* -------------------------------------------------------------------------- */
 /* Opaque handle definitions                                                  */
 /* -------------------------------------------------------------------------- */
@@ -22,6 +114,10 @@ struct fsdk_client {
 
 struct fsdk_server {
     char* agones_addr;    /* Local Agones sidecar gRPC address (copied).       */
+    char* match_id;       /* This box's bound match id (the admission gate checks
+                           * a joining token's match_id against it). NULL until
+                           * fsdk_server_get_binding populates it (Agones - TODO);
+                           * NULL means validate_player skips the binding check.  */
     /* TODO(server identity): hold the short-lived, scoped server token minted
      * at allocation time, read from the environment - NEVER baked in. */
 };
@@ -78,14 +174,20 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
 /* Internal token verification. Implemented in token.c.                       */
 /* -------------------------------------------------------------------------- */
 
-/* Verify a FID-signed match token (a JWT): signature against FID's published
- * JWKS, expiry, audience, and that it binds to expected_match_id (NULL skips
- * the binding check). On FSDK_OK, *out_info is populated.
- *
- * SCAFFOLD: returns FSDK_NOT_IMPLEMENTED. A real JWT/JWKS verifier gets linked
- * in a follow-on. */
+/* Verify a platform-signed (auth-efga) match token (a JWT): RS256 signature (via
+ * the host-installed verifier seam, keyed by the header `kid`), algorithm pinning,
+ * iss/aud, exp/nbf, and that it binds to expected_match_id (NULL skips the binding
+ * check). On FSDK_OK, *out_info is populated (foundry_id=sub, match_id, expires_at=exp).
+ * Fails closed (FSDK_NOT_IMPLEMENTED) when no verifier is installed. */
 fsdk_result fsdk_token_verify(const char* match_token,
                               const char* expected_match_id,
                               fsdk_player_info* out_info);
+
+/* Dispatch a raw RS256 signature check to the host-installed verifier
+ * (fsdk_set_jwt_verifier). Implemented in fsdk.c. FSDK_NOT_IMPLEMENTED if none. */
+fsdk_result fsdk_dispatch_jwt_verify(const char* kid,
+                                     const char* signing_input,
+                                     const unsigned char* signature,
+                                     size_t signature_len);
 
 #endif /* FOUNDRY_FSDK_INTERNAL_H */
