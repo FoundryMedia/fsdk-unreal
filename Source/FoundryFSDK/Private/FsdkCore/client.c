@@ -148,11 +148,16 @@ void fsdk_client_destroy(fsdk_client* client) {
     if (client == NULL) {
         return;
     }
-    /* Best-effort scrub of the in-memory player token before freeing. */
+    /* Best-effort scrub of the in-memory tokens before freeing (access + refresh). */
     if (client->player_token != NULL) {
         memset(client->player_token, 0, strlen(client->player_token));
         free(client->player_token);
     }
+    if (client->refresh_token != NULL) {
+        memset(client->refresh_token, 0, strlen(client->refresh_token));
+        free(client->refresh_token);
+    }
+    free(client->auth_base_url);
     free(client->base_url);
     free(client);
 }

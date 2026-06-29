@@ -18,6 +18,7 @@
 #include "FoundryFSDKSubsystem.h"
 
 #include "foundry/fsdk.h"
+#include "FoundryFSDKLauncherHandoff.h"
 
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
@@ -309,3 +310,270 @@ void UFoundryFSDKSubsystem::CancelMatch()
 		}
 	});
 }
+
+// ── FID auth ────────────────────────────────────────────────────────────────
+
+TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> UFoundryFSDKSubsystem::EnsureClient()
+{
+	if (!Core.IsValid() || Core->Client == nullptr)
+	{
+		InitializeClient(TEXT("https://api.foundryplatform.app"));
+	}
+	return Core;
+}
+
+void UFoundryFSDKSubsystem::ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName,
+                                             const FString& FoundryId)
+{
+	if (Result == EFoundryFsdkResult::Ok)
+	{
+		bIsLoggedIn = true;
+		CachedDisplayName = DisplayName;
+		CachedFoundryId = FoundryId;
+	}
+	OnLoginComplete.Broadcast(Result, DisplayName);
+}
+
+#if FOUNDRY_FSDK_FID_AUTH
+
+void UFoundryFSDKSubsystem::Login(const FString& EmailOrUsername, const FString& Password, bool bRememberMe)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnLoginComplete.Broadcast(EFoundryFsdkResult::Internal, FString());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	const FString Eou = EmailOrUsername;     // deep copies for the worker
+	const FString Pw = Password;             // player's own password; transient, never logged
+	const int RememberInt = bRememberMe ? 1 : 0;
+
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, Eou, Pw, RememberInt]()
+	{
+		fsdk_result R;
+		FString DisplayName, FoundryId;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			const FTCHARToUTF8 EouUtf8(*Eou);
+			const FTCHARToUTF8 PwUtf8(*Pw);
+			R = fsdk_login(CoreRef->Client, EouUtf8.Get(), PwUtf8.Get(), RememberInt);
+			if (R == FSDK_OK)
+			{
+				fsdk_session S;
+				if (fsdk_current_session(CoreRef->Client, &S) == FSDK_OK)
+				{
+					DisplayName = UTF8_TO_TCHAR(S.display_name);
+					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+				}
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::Refresh()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnLoginComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		fsdk_result R;
+		FString DisplayName, FoundryId;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			R = fsdk_refresh(CoreRef->Client);
+			if (R == FSDK_OK)
+			{
+				fsdk_session S;
+				if (fsdk_current_session(CoreRef->Client, &S) == FSDK_OK)
+				{
+					DisplayName = UTF8_TO_TCHAR(S.display_name);
+					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+				}
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::TryResumeSession()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnLoginComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		fsdk_result R;
+		FString DisplayName, FoundryId;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			R = fsdk_try_resume(CoreRef->Client);
+			if (R == FSDK_OK)
+			{
+				fsdk_session S;
+				if (fsdk_current_session(CoreRef->Client, &S) == FSDK_OK)
+				{
+					DisplayName = UTF8_TO_TCHAR(S.display_name);
+					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+				}
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::Logout()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core; // nothing to revoke if no client
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		bIsLoggedIn = false;
+		CachedDisplayName.Empty();
+		CachedFoundryId.Empty();
+		OnLoggedOut.Broadcast();
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			fsdk_logout(CoreRef->Client);
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->bIsLoggedIn = false;
+				Self->CachedDisplayName.Empty();
+				Self->CachedFoundryId.Empty();
+				Self->OnLoggedOut.Broadcast();
+			}
+		});
+	});
+}
+
+#else // !FOUNDRY_FSDK_FID_AUTH - default (launcher) build: inert stubs, no login machinery
+
+void UFoundryFSDKSubsystem::Login(const FString& /*EmailOrUsername*/, const FString& /*Password*/, bool /*bRememberMe*/)
+{
+	// FID-embedded auth is not compiled in this build; the default path is the
+	// launcher handoff (AutoLoginFromLauncher). No fsdk_login machinery shipped.
+	ApplyLoginResult(EFoundryFsdkResult::NotImplemented, FString(), FString());
+}
+
+void UFoundryFSDKSubsystem::Refresh()
+{
+	ApplyLoginResult(EFoundryFsdkResult::NotImplemented, FString(), FString());
+}
+
+void UFoundryFSDKSubsystem::TryResumeSession()
+{
+	ApplyLoginResult(EFoundryFsdkResult::NotImplemented, FString(), FString());
+}
+
+void UFoundryFSDKSubsystem::Logout()
+{
+	OnLoggedOut.Broadcast();
+}
+
+#endif // FOUNDRY_FSDK_FID_AUTH
+
+void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
+{
+	// DEFAULT sign-in: read a scoped match token from the launcher session daemon
+	// (FOUNDRY_IPC) on a worker, then authenticate on the game thread. No handoff ->
+	// fail fast (NotAuthenticated); the menu surfaces "sign in through the launcher".
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis]()
+	{
+		FString Token;
+		const bool bGot = FoundryFSDKReadLauncherToken(Token) && !Token.IsEmpty();
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, bGot, Token]()
+		{
+			UFoundryFSDKSubsystem* Self = WeakThis.Get();
+			if (Self == nullptr)
+			{
+				return;
+			}
+			if (bGot)
+			{
+				Self->SetPlayerToken(Token); // sets logged-in + broadcasts OnLoginComplete(Ok)
+			}
+			else
+			{
+				Self->ApplyLoginResult(EFoundryFsdkResult::NotAuthenticated, FString(), FString());
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
+{
+	// BYO identity: instant (no network); set the token + authenticated under the lock.
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnLoginComplete.Broadcast(EFoundryFsdkResult::Internal, FString());
+		return;
+	}
+	fsdk_result R;
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		const FTCHARToUTF8 TokenUtf8(*PlayerToken);
+		R = fsdk_set_player_token(CoreRef->Client, TokenUtf8.Get());
+	}
+	// No FID identity for BYO; clear the cached names.
+	ApplyLoginResult(ToBlueprintResult(R), FString(), FString());
+}
+
+#if FOUNDRY_FSDK_FID_AUTH
+void UFoundryFSDKSubsystem::SetAuthBaseUrl(const FString& AuthBaseUrl)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		return;
+	}
+	FScopeLock Lock(&CoreRef->CS);
+	const FTCHARToUTF8 BaseUtf8(*AuthBaseUrl);
+	fsdk_set_auth_base(CoreRef->Client, BaseUtf8.Get());
+}
+#else // !FOUNDRY_FSDK_FID_AUTH
+void UFoundryFSDKSubsystem::SetAuthBaseUrl(const FString& /*AuthBaseUrl*/) {}
+#endif // FOUNDRY_FSDK_FID_AUTH

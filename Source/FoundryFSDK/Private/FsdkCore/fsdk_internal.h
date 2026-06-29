@@ -107,9 +107,13 @@ static inline int json_extract_string(const char* body, const char* key,
 /* -------------------------------------------------------------------------- */
 
 struct fsdk_client {
-    char* base_url;       /* Copied at create.                                 */
-    char* player_token;   /* In-memory only; PLAYER's FID token. Never persisted. */
+    char* base_url;       /* api base (FMMS), copied at create.                 */
+    char* auth_base_url;  /* auth host override for FID login (NULL -> default).*/
+    char* player_token;   /* In-memory only; PLAYER's FID access token. Never persisted. */
+    char* refresh_token;  /* In-memory only; PERSISTED via the secret store (keyring). */
     int   authenticated;  /* 0 = not authenticated, 1 = authenticated.         */
+    char  foundry_id[64]; /* Logged-in player's FID (set by login/refresh).     */
+    char  display_name[128]; /* Display name (may be empty).                    */
 };
 
 struct fsdk_server {
@@ -169,6 +173,16 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
                                const char* body_json,
                                char** out_body,
                                long* out_status);
+
+/* -------------------------------------------------------------------------- */
+/* Internal secret-store dispatch (routes through fsdk_set_secret_store).      */
+/* Implemented in fsdk.c. Return 0 on success, non-zero if no store/op failed. */
+/* -------------------------------------------------------------------------- */
+
+int fsdk_secret_save(const char* key, const char* value);
+/* On success sets *out_value to a malloc()'d copy the caller frees with free(). */
+int fsdk_secret_load(const char* key, char** out_value);
+int fsdk_secret_delete(const char* key);
 
 /* -------------------------------------------------------------------------- */
 /* Internal token verification. Implemented in token.c.                       */

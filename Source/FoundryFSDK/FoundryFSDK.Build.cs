@@ -19,6 +19,16 @@ public class FoundryFSDK : ModuleRules
 		// fsdk-core (snprintf/strtol/etc.) so a strict editor build doesn't fail.
 		PrivateDefinitions.Add("_CRT_SECURE_NO_WARNINGS=1");
 
+		// FID-embedded in-game auth gate (default OFF). When OFF, the default client
+		// binary carries NO credential-login path - auth comes only from the launcher
+		// session-daemon handoff (UFoundryFSDKSubsystem::AutoLoginFromLauncher), and a
+		// missing launcher session fails fast. A game distributed OUTSIDE the launcher
+		// opts in by building with the env var FOUNDRY_FSDK_FID_AUTH=1. PUBLIC (not
+		// Private): it gates the PUBLIC subsystem header, so consumers (Conquest) must
+		// see the same value or UHT/link would disagree - see unreal-plugin-conventions.
+		bool bFidAuth = System.Environment.GetEnvironmentVariable("FOUNDRY_FSDK_FID_AUTH") == "1";
+		PublicDefinitions.Add("FOUNDRY_FSDK_FID_AUTH=" + (bFidAuth ? "1" : "0"));
+
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
 			"Core",
@@ -31,11 +41,18 @@ public class FoundryFSDK : ModuleRules
 			"HTTP", // engine HTTP stack backs the fsdk-core transport seam (TLS)
 		});
 
+		// Windows Credential Manager (CredWrite/Read/Delete) backs the secret-store
+		// seam for refresh-token persistence (FoundryFSDKKeyring.cpp).
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PublicSystemLibraries.Add("Advapi32.lib");
+		}
+
 		// --- fsdk-core (vendored C ABI, compiled in-module) -----------------
 		// Sources live under Private/FsdkCore and are compiled by UBT as C. The
 		// public ABI header is Private/FsdkCore/include/foundry/fsdk.h; the .c
 		// files include "fsdk_internal.h" from Private/FsdkCore. The CLIENT TUs
-		// (fsdk.c / transport.c / client.c) compile for every target; the SERVER
+		// (fsdk.c / transport.c / client.c / auth.c) compile for every target; the SERVER
 		// TUs (server.c / token.c) are present in the tree but their bodies are
 		// wrapped in #if FOUNDRY_FSDK_SERVER, so on any non-server target they
 		// compile to EMPTY translation units - no server/token-verify code (and no

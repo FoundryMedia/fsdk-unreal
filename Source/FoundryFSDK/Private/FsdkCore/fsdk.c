@@ -110,6 +110,49 @@ fsdk_result fsdk_dispatch_jwt_verify(const char* kid,
 }
 
 /* -------------------------------------------------------------------------- */
+/* Secret store (host-provided keyring, optional)                             */
+/* -------------------------------------------------------------------------- */
+
+static fsdk_secret_save_fn   g_secret_save = NULL;
+static fsdk_secret_load_fn   g_secret_load = NULL;
+static fsdk_secret_delete_fn g_secret_delete = NULL;
+static void*                 g_secret_user_data = NULL;
+
+void fsdk_set_secret_store(fsdk_secret_save_fn save,
+                           fsdk_secret_load_fn load,
+                           fsdk_secret_delete_fn del,
+                           void* user_data) {
+    g_secret_save = save;
+    g_secret_load = load;
+    g_secret_delete = del;
+    g_secret_user_data = user_data;
+}
+
+int fsdk_secret_save(const char* key, const char* value) {
+    if (g_secret_save == NULL || key == NULL || value == NULL) {
+        return -1; /* no store installed -> not persisted (session-only). */
+    }
+    return g_secret_save(key, value, g_secret_user_data);
+}
+
+int fsdk_secret_load(const char* key, char** out_value) {
+    if (out_value != NULL) {
+        *out_value = NULL;
+    }
+    if (g_secret_load == NULL || key == NULL || out_value == NULL) {
+        return -1;
+    }
+    return g_secret_load(key, out_value, g_secret_user_data);
+}
+
+int fsdk_secret_delete(const char* key) {
+    if (g_secret_delete == NULL || key == NULL) {
+        return -1;
+    }
+    return g_secret_delete(key, g_secret_user_data);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Memory helpers                                                             */
 /* -------------------------------------------------------------------------- */
 
