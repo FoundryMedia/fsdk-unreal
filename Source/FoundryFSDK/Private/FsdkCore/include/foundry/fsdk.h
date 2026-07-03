@@ -253,8 +253,17 @@ void fsdk_client_destroy(fsdk_client* client);
 /* Authenticate the SDK with the PLAYER'S OWN FID session token. The token is
  * provided by the game (obtained through the platform's normal sign-in); the
  * SDK does NOT store it beyond the in-memory client lifetime and never persists
- * it. This is the only credential the client SDK ever holds. */
+ * it. This is the only credential the client SDK ever holds. On success the
+ * identity snapshot (foundryId/displayName from /v1/me/user) is cached for
+ * fsdk_current_session. */
 fsdk_result fsdk_authenticate(fsdk_client* client, const char* player_token);
+
+/* Re-fetch the identity snapshot (GET /v1/me/user with the stored token) and
+ * cache it for fsdk_current_session. Best-effort identity for tokens set via
+ * fsdk_set_player_token (e.g. the launcher handoff): a failure leaves the
+ * authenticated state untouched - a BYO token that FID doesn't recognize simply
+ * has no platform display name. FSDK_ERR_NOT_AUTHENTICATED if no token is set. */
+fsdk_result fsdk_refresh_session(fsdk_client* client);
 
 /* -------------------------------------------------------------------------- */
 /* CLIENT FID auth (optional - for games whose players are Foundry accounts)  */
@@ -366,6 +375,22 @@ fsdk_result fsdk_server_validate_player(fsdk_server* server,
  * object string. *out_json is heap-allocated by the SDK and must be freed by the
  * caller with fsdk_string_free. */
 fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json);
+
+/* Check whether the platform asked this server to DRAIN (wind down gracefully:
+ * stop admitting players, call fsdk_server_shutdown once the session empties).
+ * The platform stamps the fcg/drain annotation on this GameServer; this reads it
+ * through the local sidecar. Latching: once seen, *out_draining stays 1 forever
+ * (a transient sidecar failure never un-drains). Call on the same cadence as
+ * fsdk_server_health. On a read failure *out_draining still reports the latched
+ * value and the error is returned. */
+fsdk_result fsdk_server_check_drain(fsdk_server* server, int* out_draining);
+
+/* Whether this GameServer has been ALLOCATED (a match was placed on it). Pure
+ * latch read - no sidecar call; the latch is fed by the /gameserver reads the
+ * host already makes (check_drain on the health cadence, get_binding at boot /
+ * first join). Latched: once 1, stays 1. Use to gate idle-empty auto-shutdown -
+ * a WARM Ready replica is always empty and must never idle-exit. */
+fsdk_result fsdk_server_allocated(fsdk_server* server, int* out_allocated);
 
 /* Signal the orchestrator that this server is shutting down
  * (-> Agones SDK Shutdown()). */

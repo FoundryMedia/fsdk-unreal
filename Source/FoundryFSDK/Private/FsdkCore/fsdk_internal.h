@@ -122,6 +122,16 @@ struct fsdk_server {
                            * a joining token's match_id against it). NULL until
                            * fsdk_server_get_binding populates it (Agones - TODO);
                            * NULL means validate_player skips the binding check.  */
+    int sidecar_contacted; /* 1 once ANY sidecar HTTP call completed. The boot-race
+                            * retry loop (server.c) only runs while this is 0 - a
+                            * post-boot transport failure fails fast, never stalls. */
+    int draining;          /* 1 once the platform's fcg/drain annotation was seen
+                            * (fsdk_server_check_drain). Latched - never cleared.  */
+    int allocated;         /* 1 once this GameServer was seen in state Allocated
+                            * (a match was placed on it). Latched by the /gameserver
+                            * reads (check_drain / get_binding). Drives the game's
+                            * idle-empty auto-shutdown - a WARM Ready replica is
+                            * always empty and must never idle-exit.               */
     /* TODO(server identity): hold the short-lived, scoped server token minted
      * at allocation time, read from the environment - NEVER baked in. */
 };
@@ -173,6 +183,13 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
                                const char* body_json,
                                char** out_body,
                                long* out_status);
+
+/* Agones sidecar first-contact retry tuning (defined in server.c). The sidecar's
+ * HTTP gateway races the game server boot; until the sidecar has answered once,
+ * transport-level failures retry at interval_ms up to max_attempts (~30s total,
+ * like Agones's own SDKs). Internal-only: tests shrink these for speed. */
+extern unsigned int fsdk_agones_retry_interval_ms; /* default 1000 */
+extern int          fsdk_agones_retry_max_attempts; /* default 30  */
 
 /* -------------------------------------------------------------------------- */
 /* Internal secret-store dispatch (routes through fsdk_set_secret_store).      */

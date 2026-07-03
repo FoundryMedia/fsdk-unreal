@@ -162,6 +162,34 @@ void fsdk_client_destroy(fsdk_client* client) {
     free(client);
 }
 
+/* Player-scoped "who am I" probe against FID (GET /v1/me/user with the stored
+ * token). On 2xx the identity snapshot (foundryId/displayName) is cached on the
+ * client for fsdk_current_session. Does NOT touch client->authenticated - the
+ * caller decides what a failure means (fsdk_authenticate fails closed; a
+ * best-effort fsdk_refresh_session leaves the session as it was). */
+static fsdk_result me_probe(fsdk_client* client) {
+    if (client->player_token == NULL) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_GET, FSDK_PATH_ME,
+                                      client->player_token, NULL, &resp, &status);
+    if (r != FSDK_OK) {
+        return r;
+    }
+    if (status >= 200 && status < 300) {
+        /* The response is authoritative: a missing key clears the cached field. */
+        const char* data = json_data_object(resp != NULL ? resp : "");
+        json_extract_string(data, "foundryId", client->foundry_id, sizeof(client->foundry_id));
+        json_extract_string(data, "displayName", client->display_name, sizeof(client->display_name));
+        fsdk_string_free(resp);
+        return FSDK_OK;
+    }
+    fsdk_string_free(resp);
+    return http_status_to_result(status);
+}
+
 fsdk_result fsdk_authenticate(fsdk_client* client, const char* player_token) {
     if (client == NULL || player_token == NULL) {
         return FSDK_ERR_INVALID_ARG;
@@ -183,21 +211,26 @@ fsdk_result fsdk_authenticate(fsdk_client* client, const char* player_token) {
     /* Validate the token against FID with a player-scoped "who am I" probe. The
      * SDK does NOT inspect the JWT locally - the platform is authoritative.
      *   GET {base_url}/v1/me/user   (Authorization: Bearer <player_token>)
-     * 200 -> authenticated; 401/403 -> rejected. */
-    long status = 0;
-    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_GET, FSDK_PATH_ME,
-                                      client->player_token, NULL, NULL, &status);
-    if (r != FSDK_OK) {
-        /* No transport (NOT_IMPLEMENTED) or transport failure - fail closed. */
-        return r;
-    }
-    if (status >= 200 && status < 300) {
+     * 200 -> authenticated (and the identity snapshot is cached for
+     * fsdk_current_session); 401/403 -> rejected. */
+    fsdk_result r = me_probe(client);
+    if (r == FSDK_OK) {
         client->authenticated = 1;
         fsdk_log(FSDK_LOG_INFO, "fsdk authenticate ok");
         return FSDK_OK;
     }
-    fsdk_log(FSDK_LOG_WARN, "fsdk authenticate rejected by FID");
-    return http_status_to_result(status);
+    if (r == FSDK_ERR_UNAUTHORIZED || r == FSDK_ERR_PROTOCOL || r == FSDK_ERR_NO_MATCH) {
+        fsdk_log(FSDK_LOG_WARN, "fsdk authenticate rejected by FID");
+    }
+    /* Else: no transport (NOT_IMPLEMENTED) or transport failure - fail closed. */
+    return r;
+}
+
+fsdk_result fsdk_refresh_session(fsdk_client* client) {
+    if (client == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    return me_probe(client);
 }
 
 fsdk_result fsdk_request_match(fsdk_client* client,

@@ -545,7 +545,12 @@ void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
 
 void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
 {
-	// BYO identity: instant (no network); set the token + authenticated under the lock.
+	// BYO identity: set the token + authenticated under the lock (no network), then
+	// BEST-EFFORT fetch the platform identity snapshot on a worker so the login
+	// broadcast carries the player's real display name (the launcher-handoff path
+	// used to broadcast an empty name -> games showed a placeholder). A token FID
+	// doesn't recognize (true BYO) just fails the probe and broadcasts Ok with an
+	// empty name - exactly the old behavior.
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
@@ -558,8 +563,36 @@ void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
 		const FTCHARToUTF8 TokenUtf8(*PlayerToken);
 		R = fsdk_set_player_token(CoreRef->Client, TokenUtf8.Get());
 	}
-	// No FID identity for BYO; clear the cached names.
-	ApplyLoginResult(ToBlueprintResult(R), FString(), FString());
+	if (R != FSDK_OK)
+	{
+		ApplyLoginResult(ToBlueprintResult(R), FString(), FString());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		FString DisplayName, FoundryId;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			if (fsdk_refresh_session(CoreRef->Client) == FSDK_OK)
+			{
+				fsdk_session S;
+				if (fsdk_current_session(CoreRef->Client, &S) == FSDK_OK)
+				{
+					DisplayName = UTF8_TO_TCHAR(S.display_name);
+					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+				}
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, DisplayName, FoundryId]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->ApplyLoginResult(EFoundryFsdkResult::Ok, DisplayName, FoundryId);
+			}
+		});
+	});
 }
 
 #if FOUNDRY_FSDK_FID_AUTH

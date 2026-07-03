@@ -47,6 +47,21 @@ public:
 	void Health();
 
 	/**
+	 * True once the platform asked this server to DRAIN (a customer/operator clicked Drain: the
+	 * fcg/drain annotation is stamped on this GameServer). Latched - once true, stays true. The
+	 * game should stop admitting players and call Shutdown once the session empties; the platform
+	 * hard-stops a non-compliant server after a grace window. Poll on the Health cadence.
+	 */
+	bool IsDrainRequested();
+
+	/**
+	 * True once a match has been PLACED on this server (Agones state Allocated). Pure latch read -
+	 * fed by the same sidecar polls as IsDrainRequested. Gates idle-empty auto-shutdown: a warm
+	 * Ready replica is always empty and must never idle-exit.
+	 */
+	bool IsAllocated();
+
+	/**
 	 * Validate a joining player's match token (the admission gate). Returns true to
 	 * ADMIT (fills OutFoundryId / OutMatchId with the verified identity); false to
 	 * DROP (bad signature, expired, wrong audience/match, or no verifier).
