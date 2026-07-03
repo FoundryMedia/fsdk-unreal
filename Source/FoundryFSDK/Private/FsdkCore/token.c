@@ -19,13 +19,6 @@
  * Fails closed - an unverifiable token (no verifier, bad signature, bad shape) is
  * a REJECTED token.
  */
-/* VENDORED + GATED: server-only translation unit. On a non-server target
- * (Game/Client/Editor - the shipped player binary) FOUNDRY_FSDK_SERVER is undefined
- * and this whole file compiles to an EMPTY TU, so no token-verify code ever enters
- * the client. The gate is set in FoundryFSDK.Build.cs for TargetType.Server only.
- * See .claude/rules/fsdk-security.md. */
-#if defined(FOUNDRY_FSDK_SERVER) && FOUNDRY_FSDK_SERVER
-
 #include "fsdk_internal.h"
 
 #include <stddef.h>
@@ -251,7 +244,3 @@ fsdk_result fsdk_token_verify(const char* match_token,
     fsdk_log(FSDK_LOG_DEBUG, "fsdk_token_verify: token accepted");
     return FSDK_OK;
 }
-
-#else /* !FOUNDRY_FSDK_SERVER */
-typedef int fsdk_token_tu_not_empty; /* gated out of non-server targets; avoids ISO C empty-TU warning */
-#endif

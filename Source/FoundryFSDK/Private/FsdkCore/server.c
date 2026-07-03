@@ -18,29 +18,110 @@
  * REST gateway, not the gRPC SDK: functionally equivalent for ready/health/
  * shutdown/get-binding and far lighter for a C core (no gRPC/protobuf C++ dep).
  */
-/* VENDORED + GATED: server-only translation unit. On a non-server target
- * (Game/Client/Editor - the shipped player binary) FOUNDRY_FSDK_SERVER is undefined
- * and this whole file compiles to an EMPTY TU, so no server/token code or OpenSSL
- * ever enters the client. The gate is set in FoundryFSDK.Build.cs for
- * TargetType.Server only. See .claude/rules/fsdk-security.md. */
-#if defined(FOUNDRY_FSDK_SERVER) && FOUNDRY_FSDK_SERVER
+/* Expose nanosleep (POSIX.1b) even under a strict -std C compile: the boot-race retry
+ * loop needs a sub-second sleep and this is the core's only time dependency. Must
+ * precede every libc include in this TU. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 199309L
+#endif
 
 #include "fsdk_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
+
 /* Default Agones SDK sidecar REST gateway (the gRPC SDK is :9357; the HTTP gateway is :9358). */
 #define FSDK_AGONES_DEFAULT_ADDR "http://127.0.0.1:9358"
+
+/* First-contact retry: the sidecar's HTTP gateway RACES the game server boot - a fast
+ * server can be up in <1s, before :9358 listens (seen live: UE server boot 0.8s ->
+ * POST /ready connection refused -> GameServer stuck Scheduled forever). Like Agones's
+ * own SDKs, retry the connection with a fixed backoff until the sidecar answers ONCE;
+ * after first contact every call is one-shot again (a health tick has its own cadence
+ * and a mid-match call must never stall the caller for the retry budget). */
+unsigned int fsdk_agones_retry_interval_ms = 1000u;
+int          fsdk_agones_retry_max_attempts = 30; /* ~30s total at 1s apart */
+
+/* Millisecond sleep for the boot-race retry loop. */
+static void fsdk_sleep_ms(unsigned int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
 
 /* fsdk_strdup + json_extract_string (used for the flat fcg/match-id annotation) are shared
  * via fsdk_internal.h. */
 
+/* Latch interesting facts from a /gameserver body wherever we happen to read one (get_binding,
+ * check_drain): the Allocated state. The flat reader finds the FIRST "state" key - the sidecar's
+ * GameServer JSON carries it only under status (our fleets define no label/annotation named
+ * "state"), so the flat scan is safe here. Latched: once Allocated, stays Allocated (Agones never
+ * moves a GameServer back to Ready; the pod is recycled instead). */
+static void latch_gameserver_facts(fsdk_server* server, const char* body) {
+    if (body == NULL || server->allocated) {
+        return;
+    }
+    char state[32];
+    if (json_extract_string(body, "state", state, sizeof state) && strcmp(state, "Allocated") == 0) {
+        server->allocated = 1;
+        fsdk_log(FSDK_LOG_INFO, "fsdk: GameServer is Allocated (match placed on this server)");
+    }
+}
+
+/* One sidecar HTTP call with the first-contact retry loop. Retries ONLY transport-level
+ * failures (FSDK_ERR_NETWORK / FSDK_ERR_TIMEOUT - connection refused/hung) and ONLY
+ * while the sidecar has never answered. A completed HTTP response (any status) marks
+ * contact and is returned as-is; FSDK_NOT_IMPLEMENTED (no transport installed) and
+ * other errors fail immediately - retrying cannot help them. */
+static fsdk_result agones_request(fsdk_server* server, fsdk_http_method method,
+                                  const char* path, const char* req_body,
+                                  char** out_body, long* out_status) {
+    int attempt = 0;
+    for (;;) {
+        fsdk_result r = fsdk_http_request(server->agones_addr, method, path, NULL,
+                                          req_body, out_body, out_status);
+        if (r == FSDK_OK) {
+            server->sidecar_contacted = 1;
+            return FSDK_OK;
+        }
+        if (server->sidecar_contacted ||
+            (r != FSDK_ERR_NETWORK && r != FSDK_ERR_TIMEOUT)) {
+            return r;
+        }
+        attempt++;
+        if (attempt >= fsdk_agones_retry_max_attempts) {
+            fsdk_log(FSDK_LOG_WARN, "fsdk agones: sidecar unreachable after retries");
+            return r;
+        }
+        if (attempt == 1) {
+            fsdk_log(FSDK_LOG_INFO, "fsdk agones: sidecar not up yet (boot race) - retrying");
+        }
+        if (out_body != NULL && *out_body != NULL) {
+            fsdk_string_free(*out_body);
+            *out_body = NULL;
+        }
+        fsdk_sleep_ms(fsdk_agones_retry_interval_ms);
+    }
+}
+
 /* POST {} to an Agones sidecar path through the host http transport; 2xx => FSDK_OK. */
 static fsdk_result agones_post(fsdk_server* server, const char* path) {
     long status = 0;
-    fsdk_result r = fsdk_http_request(server->agones_addr, FSDK_HTTP_POST, path,
-                                      NULL, "{}", NULL, &status);
+    fsdk_result r = agones_request(server, FSDK_HTTP_POST, path, "{}", NULL, &status);
     if (r != FSDK_OK) {
         fsdk_log(FSDK_LOG_WARN, "fsdk agones: sidecar call failed (no/failed http transport)");
         return FSDK_ERR_AGONES;
@@ -164,8 +245,8 @@ fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json) {
      * end-to-end the key may be absent (then match_id stays NULL and validate_player skips binding). */
     char* body = NULL;
     long status = 0;
-    fsdk_result r = fsdk_http_request(server->agones_addr, FSDK_HTTP_GET, "/gameserver",
-                                      NULL, NULL, &body, &status);
+    fsdk_result r = agones_request(server, FSDK_HTTP_GET, "/gameserver",
+                                   NULL, &body, &status);
     if (r != FSDK_OK || status < 200 || status >= 300) {
         fsdk_string_free(body);
         fsdk_log(FSDK_LOG_WARN, "fsdk get_binding: sidecar /gameserver failed");
@@ -179,8 +260,52 @@ fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json) {
             server->match_id = fsdk_strdup(mid);
             fsdk_log(FSDK_LOG_INFO, "fsdk get_binding: latched match binding");
         }
+        latch_gameserver_facts(server, body);
     }
     *out_json = body; /* caller frees via fsdk_string_free */
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_server_check_drain(fsdk_server* server, int* out_draining) {
+    if (server == NULL || out_draining == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_draining = server->draining;
+    if (server->draining) {
+        return FSDK_OK; /* latched - no further sidecar reads needed */
+    }
+
+    /* The platform (node agent) merge-patches fcg/drain=true onto this GameServer when a
+     * customer/operator asks for a graceful wind-down. Read our own object via the sidecar and
+     * latch the flag; the flat json reader is fine here (annotations are a flat string map). */
+    char* body = NULL;
+    long status = 0;
+    fsdk_result r = agones_request(server, FSDK_HTTP_GET, "/gameserver", NULL, &body, &status);
+    if (r != FSDK_OK || status < 200 || status >= 300) {
+        fsdk_string_free(body);
+        fsdk_log(FSDK_LOG_WARN, "fsdk check_drain: sidecar /gameserver failed");
+        return FSDK_ERR_AGONES;
+    }
+    if (body != NULL) {
+        char val[16];
+        if (json_extract_string(body, "fcg/drain", val, sizeof val) && strcmp(val, "true") == 0) {
+            server->draining = 1;
+            *out_draining = 1;
+            fsdk_log(FSDK_LOG_INFO, "fsdk check_drain: DRAIN requested by the platform");
+        }
+        latch_gameserver_facts(server, body);
+    }
+    fsdk_string_free(body);
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_server_allocated(fsdk_server* server, int* out_allocated) {
+    if (server == NULL || out_allocated == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    /* Pure latch read - no sidecar call. The latch is fed by the /gameserver reads the host
+     * already makes on the health cadence (check_drain) and at boot (get_binding). */
+    *out_allocated = server->allocated;
     return FSDK_OK;
 }
 
@@ -193,7 +318,3 @@ fsdk_result fsdk_server_shutdown(fsdk_server* server) {
              r == FSDK_OK ? "fsdk server shutdown (Agones Shutdown ok)" : "fsdk server shutdown FAILED");
     return r;
 }
-
-#else /* !FOUNDRY_FSDK_SERVER */
-typedef int fsdk_server_tu_not_empty; /* gated out of non-server targets; avoids ISO C empty-TU warning */
-#endif

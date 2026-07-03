@@ -107,6 +107,29 @@ void FFoundryFSDKServer::Health()
 	}
 }
 
+bool FFoundryFSDKServer::IsDrainRequested()
+{
+	if (State == nullptr || State->Server == nullptr)
+	{
+		return false;
+	}
+	int Draining = 0;
+	// A read failure still reports the latched value (never un-drains); ignore the result code.
+	(void)fsdk_server_check_drain(State->Server, &Draining);
+	return Draining != 0;
+}
+
+bool FFoundryFSDKServer::IsAllocated()
+{
+	if (State == nullptr || State->Server == nullptr)
+	{
+		return false;
+	}
+	int Allocated = 0;
+	(void)fsdk_server_allocated(State->Server, &Allocated);
+	return Allocated != 0;
+}
+
 bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId)
 {
 	OutFoundryId.Reset();
