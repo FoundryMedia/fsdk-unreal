@@ -213,6 +213,32 @@ typedef fsdk_result (*fsdk_jwt_verify_fn)(const char* kid,
 void fsdk_set_jwt_verifier(fsdk_jwt_verify_fn verifier, void* user_data);
 
 /* -------------------------------------------------------------------------- */
+/* Secret store (host-provided keyring, optional)                             */
+/* -------------------------------------------------------------------------- */
+
+/* Host-provided persistent secret store (OS keyring / Windows Credential Manager
+ * / macOS Keychain). The core uses it to persist ONLY the long-lived FID refresh
+ * token across runs, so a player need not re-enter a password every launch. The
+ * access token and the password are NEVER handed to this store. With NO store
+ * installed, login still works for the session but nothing persists (no resume).
+ * Callbacks return 0 on success, non-zero on failure/not-found.
+ *
+ *   save : persist value (NUL-terminated) under key (NUL-terminated).
+ *   load : on success set *out_value to a malloc()'d, NUL-terminated copy the
+ *          core frees with free(); return non-zero when the key is absent.
+ *   del  : delete the entry for key (absent is fine).
+ *   user_data : passed back verbatim from fsdk_set_secret_store. */
+typedef int (*fsdk_secret_save_fn)(const char* key, const char* value, void* user_data);
+typedef int (*fsdk_secret_load_fn)(const char* key, char** out_value, void* user_data);
+typedef int (*fsdk_secret_delete_fn)(const char* key, void* user_data);
+
+/* Install a process-wide secret store (pass NULLs to remove). Set once at startup. */
+void fsdk_set_secret_store(fsdk_secret_save_fn save,
+                           fsdk_secret_load_fn load,
+                           fsdk_secret_delete_fn del,
+                           void* user_data);
+
+/* -------------------------------------------------------------------------- */
 /* CLIENT API (ships inside the game client - assume reverse-engineered)      */
 /* -------------------------------------------------------------------------- */
 
@@ -227,8 +253,64 @@ void fsdk_client_destroy(fsdk_client* client);
 /* Authenticate the SDK with the PLAYER'S OWN FID session token. The token is
  * provided by the game (obtained through the platform's normal sign-in); the
  * SDK does NOT store it beyond the in-memory client lifetime and never persists
- * it. This is the only credential the client SDK ever holds. */
+ * it. This is the only credential the client SDK ever holds. On success the
+ * identity snapshot (foundryId/displayName from /v1/me/user) is cached for
+ * fsdk_current_session. */
 fsdk_result fsdk_authenticate(fsdk_client* client, const char* player_token);
+
+/* Re-fetch the identity snapshot (GET /v1/me/user with the stored token) and
+ * cache it for fsdk_current_session. Best-effort identity for tokens set via
+ * fsdk_set_player_token (e.g. the launcher handoff): a failure leaves the
+ * authenticated state untouched - a BYO token that FID doesn't recognize simply
+ * has no platform display name. FSDK_ERR_NOT_AUTHENTICATED if no token is set. */
+fsdk_result fsdk_refresh_session(fsdk_client* client);
+
+/* -------------------------------------------------------------------------- */
+/* CLIENT FID auth (optional - for games whose players are Foundry accounts)  */
+/* -------------------------------------------------------------------------- */
+/* These obtain the player token FOR the game via the player's Foundry login, so
+ * the game need not source a token elsewhere. The access token becomes the
+ * client's credential (exactly as if passed to fsdk_authenticate); the refresh
+ * token is persisted via the installed secret store (host keyring) and rotated.
+ * A game that brings its own identity skips these and calls fsdk_set_player_token.
+ *
+ * The auth endpoints live on a SEPARATE host (auth-efga) from the FMMS api base;
+ * fsdk_set_auth_base overrides it (default https://auth.foundryplatform.app). */
+
+/* Logged-in player identity snapshot (for UI). No privileged data. */
+typedef struct fsdk_session {
+    char foundry_id[64];     /* Player's FID, NUL-terminated.                  */
+    char display_name[128];  /* Display name (may be empty), NUL-terminated.   */
+} fsdk_session;
+
+/* Override the auth host (e.g. a local auth-efga for dev). auth_base is copied. */
+void fsdk_set_auth_base(fsdk_client* client, const char* auth_base);
+
+/* Log in with the player's Foundry credentials (email or username + password).
+ * On success the access token authenticates the client and the rotated refresh
+ * token is saved via the secret store. The password is used only to build the
+ * request body and is never stored or logged. remember -> rememberMe. */
+fsdk_result fsdk_login(fsdk_client* client, const char* email_or_username,
+                       const char* password, int remember);
+
+/* Refresh the session using the stored/in-memory refresh token (rotates it and
+ * re-saves the NEW token). FSDK_ERR_NOT_AUTHENTICATED if no refresh token. */
+fsdk_result fsdk_refresh(fsdk_client* client);
+
+/* Resume a session from the persisted refresh token (load -> refresh), with no
+ * password. FSDK_ERR_NOT_AUTHENTICATED if nothing was stored. */
+fsdk_result fsdk_try_resume(fsdk_client* client);
+
+/* Revoke the session server-side (best-effort) and clear the persisted +
+ * in-memory tokens. */
+fsdk_result fsdk_logout(fsdk_client* client);
+
+/* Set the player token directly (BYO identity): authenticate WITHOUT the FID
+ * login or the /v1/me/user probe - the caller's backend already vouched. */
+fsdk_result fsdk_set_player_token(fsdk_client* client, const char* player_token);
+
+/* Snapshot the logged-in identity (foundry_id/display_name) for UI. */
+fsdk_result fsdk_current_session(fsdk_client* client, fsdk_session* out);
 
 /* Request a match in a named queue with opaque, queue-specific attributes
  * encoded as a JSON object string (attrs_json may be NULL for none). On success
@@ -293,6 +375,22 @@ fsdk_result fsdk_server_validate_player(fsdk_server* server,
  * object string. *out_json is heap-allocated by the SDK and must be freed by the
  * caller with fsdk_string_free. */
 fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json);
+
+/* Check whether the platform asked this server to DRAIN (wind down gracefully:
+ * stop admitting players, call fsdk_server_shutdown once the session empties).
+ * The platform stamps the fcg/drain annotation on this GameServer; this reads it
+ * through the local sidecar. Latching: once seen, *out_draining stays 1 forever
+ * (a transient sidecar failure never un-drains). Call on the same cadence as
+ * fsdk_server_health. On a read failure *out_draining still reports the latched
+ * value and the error is returned. */
+fsdk_result fsdk_server_check_drain(fsdk_server* server, int* out_draining);
+
+/* Whether this GameServer has been ALLOCATED (a match was placed on it). Pure
+ * latch read - no sidecar call; the latch is fed by the /gameserver reads the
+ * host already makes (check_drain on the health cadence, get_binding at boot /
+ * first join). Latched: once 1, stays 1. Use to gate idle-empty auto-shutdown -
+ * a WARM Ready replica is always empty and must never idle-exit. */
+fsdk_result fsdk_server_allocated(fsdk_server* server, int* out_allocated);
 
 /* Signal the orchestrator that this server is shutting down
  * (-> Agones SDK Shutdown()). */

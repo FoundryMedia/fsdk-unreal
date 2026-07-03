@@ -67,6 +67,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryFsdkResultEvent, EFoundryFsd
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkStatusEvent, EFoundryFsdkResult, Result, EFoundryMatchStatus, Status);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFoundryFsdkResult, Result, FFoundryConnection, Connection);
 
+// Auth completion delegates - broadcast on the GAME THREAD.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryLoginEvent, EFoundryFsdkResult, Result, const FString&, DisplayName);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FFoundryLoggedOutEvent);
+
 /**
  * FoundryFSDK game-client facade.
  *
@@ -130,6 +134,72 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void CancelMatch();
 
+	// ── Auto-login (DEFAULT: the Foundry launcher's session daemon) ─────────────
+	// The game gets a short-lived matchmaking token from the launcher's session
+	// daemon over the local FOUNDRY_IPC handoff - no in-game credentials, nothing
+	// long-lived stored in the game. No launcher session -> fail fast (no form).
+
+	/**
+	 * Auto-authenticate from the launcher handoff (FOUNDRY_IPC). Async: broadcasts
+	 * OnLoginComplete (Ok on success; NotAuthenticated when there's no launcher
+	 * session, which the caller surfaces as "sign in through the Foundry launcher").
+	 * The default sign-in for launcher-distributed games (e.g. Conquest).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void AutoLoginFromLauncher();
+
+	/**
+	 * Set the player token directly (the launcher handoff / BYO identity): authenticate
+	 * WITHOUT a login or the /v1/me/user probe - the caller already vouched. Synchronous.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void SetPlayerToken(const FString& PlayerToken);
+
+	// ── FID-embedded in-game auth (OPT-IN build: FOUNDRY_FSDK_FID_AUTH=1) ────────
+	// Declared ALWAYS (UHT forbids a UFUNCTION inside a non-editor #if), but their
+	// BODIES + the underlying fsdk_login/keyring machinery compile ONLY when
+	// FOUNDRY_FSDK_FID_AUTH=1. In the default (launcher) build these are inert stubs
+	// (NotImplemented) and NO credential-login code ships - auth comes from the
+	// launcher handoff (AutoLoginFromLauncher). See FoundryFSDKSubsystem.cpp.
+
+	/** Log in with Foundry credentials (email/username + password). Async: OnLoginComplete. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void Login(const FString& EmailOrUsername, const FString& Password, bool bRememberMe);
+
+	/** Refresh the session from the stored/in-memory refresh token (rotates it). Async: OnLoginComplete. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void Refresh();
+
+	/** Resume a session from the persisted refresh token (no password). Async: OnLoginComplete. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void TryResumeSession();
+
+	/** Revoke the session server-side and clear the persisted + in-memory tokens. Async: OnLoggedOut. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void Logout();
+
+	/** Override the auth host (dev; default https://auth.foundryplatform.app). Synchronous. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
+	void SetAuthBaseUrl(const FString& AuthBaseUrl);
+
+	/** Cached login state (game-thread snapshot - never blocks on the network). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
+	bool IsLoggedIn() const { return bIsLoggedIn; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
+	FString GetDisplayName() const { return CachedDisplayName; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
+	FString GetFoundryId() const { return CachedFoundryId; }
+
+	/** Login established/refreshed (DisplayName empty for BYO). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Auth")
+	FFoundryLoginEvent OnLoginComplete;
+
+	/** Session cleared. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Auth")
+	FFoundryLoggedOutEvent OnLoggedOut;
+
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|FSDK")
 	FFoundryFsdkResultEvent OnAuthenticateComplete;
 
@@ -143,6 +213,19 @@ public:
 	FFoundryFsdkConnectionEvent OnGetConnectionComplete;
 
 private:
+	/** Ensure a client exists (lazily create one bound to the default api base). */
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> EnsureClient();
+
+	/** Apply a session result on the game thread: cache identity + broadcast OnLoginComplete. */
+	void ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName, const FString& FoundryId);
+
 	/** Ref-counted fsdk-core handles + serialization lock (owned). */
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> Core;
+
+	// Game-thread-only login snapshot (read by the BlueprintPure getters without a
+	// lock, so they never block on an in-flight network call). Updated in the
+	// game-thread completion of Login/Refresh/TryResume/SetPlayerToken/Logout.
+	bool bIsLoggedIn = false;
+	FString CachedDisplayName;
+	FString CachedFoundryId;
 };
