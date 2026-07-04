@@ -39,6 +39,9 @@ public class FoundryFSDK : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"HTTP", // engine HTTP stack backs the fsdk-core transport seam (TLS)
+			"InputCore", // FKey/EKeys for the developer-console keybinds
+			"Slate",     // the curated console/overlay/netgraph widgets
+			"SlateCore",
 		});
 
 		// Windows Credential Manager (CredWrite/Read/Delete) backs the secret-store
