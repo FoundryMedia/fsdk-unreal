@@ -63,7 +63,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void Cancel();
 
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Foundry|FMMS")
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
 	EFMMSPhase GetPhase() const { return Phase; }
 
 	/** Bind in UMG/Blueprint to surface progress + errors to the player. */
