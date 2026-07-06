@@ -61,6 +61,12 @@ public class FoundryFSDK : ModuleRules
 		// compile to EMPTY translation units - no server/token-verify code (and no
 		// OpenSSL) ever enters the shipped player binary. See the gate below and
 		// .claude/rules/fsdk-security.md.
+		// NOTE (vendoring divergence): that #if in server.c/token.c is applied to
+		// this VENDORED copy only - upstream fsdk-core/src/{server,token}.c do NOT
+		// carry it (their standalone CMake lib + CTest suite need the code always
+		// compiled). After any re-vendor from fsdk-core, RE-APPLY the gate to
+		// server.c + token.c, or ship them ungated and the boundary silently regresses
+		// to fail-closed-at-runtime (server/token code back in the player binary).
 		string FsdkCore = Path.Combine(ModuleDirectory, "Private", "FsdkCore");
 		PrivateIncludePaths.Add(Path.Combine(FsdkCore, "include")); // <foundry/fsdk.h>
 		PrivateIncludePaths.Add(FsdkCore);                          // "fsdk_internal.h"

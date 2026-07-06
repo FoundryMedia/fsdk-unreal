@@ -110,16 +110,27 @@ fsdk-unreal/
     Private/FoundryFSDKSubsystem.cpp           # async wrapper over the C ABI
     Private/FoundryFSDKModule.cpp              # installs the transport + log sink at startup
     Private/FoundryFSDKTransport.{h,cpp}       # FHttpModule-backed fsdk_http_fn (TLS)
-    Private/FsdkCore/                          # vendored fsdk-core CLIENT sources (compiled as C by UBT)
+    Private/FsdkCore/                          # vendored fsdk-core sources (compiled as C by UBT)
       include/foundry/fsdk.h                   #   the C ABI (source of truth)
-      fsdk.c / transport.c / client.c          #   client-only — no server/token-verify code
+      fsdk.c / transport.c / client.c / auth.c #   client TUs — compile for every target
+      server.c / token.c                       #   server TUs — #if FOUNDRY_FSDK_SERVER (empty TU off-server)
   LICENSE                                       # Apache-2.0
 ```
 
-The vendored `FsdkCore/` is a copy of the **client** translation units from the
-`fsdk-core` repo — the server/Agones/token-verification code is deliberately
-absent from the player binary. To refresh it, re-copy those files from `fsdk-core`
-and keep the C ABI in lockstep with `fsdk-core/SECURITY.md`.
+The vendored `FsdkCore/` is a copy of the `fsdk-core` translation units. The
+server/Agones/token-verification units (`server.c`, `token.c`) are present in the
+tree but their **entire bodies are gated behind `#if FOUNDRY_FSDK_SERVER`**, which
+`FoundryFSDK.Build.cs` defines **only** for `Target.Type == Server`. On a client /
+editor / player build they compile to empty translation units, so that code — and
+UE's OpenSSL — is genuinely **absent from the player binary**, not merely
+unreachable. (No client TU references any `fsdk_server_*` / `fsdk_token_verify`
+symbol, so the exclusion is link-safe.)
+
+To refresh the vendored core, re-copy the files from `fsdk-core` **and re-apply the
+`#if FOUNDRY_FSDK_SERVER` gate to `server.c` + `token.c`** — upstream `fsdk-core`
+does not carry that gate (its standalone CMake lib + CTest suite need the code
+always compiled), so a plain re-copy would silently regress the boundary. Keep the
+C ABI in lockstep with `fsdk-core/SECURITY.md`.
 
 ## Multi-engine context
 

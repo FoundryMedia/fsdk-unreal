@@ -19,6 +19,23 @@
  * Fails closed - an unverifiable token (no verifier, bad signature, bad shape) is
  * a REJECTED token.
  */
+/* ============================ SERVER-ONLY GATE =============================
+ * Match-token verification runs ONLY on the trusted dedicated server. This whole
+ * TU compiles to an EMPTY TU on any non-server target (FOUNDRY_FSDK_SERVER
+ * undefined or 0), so fsdk_token_verify + the JWT/base64url/claim machinery is
+ * genuinely ABSENT from the shipped player binary. The client never installs a
+ * verifier and never calls this - keeping the code out entirely is the honest
+ * boundary, not just fail-closed-at-runtime. Build.cs defines FOUNDRY_FSDK_SERVER=1
+ * only for Target.Type == Server (the same gate as server.c, so both are present
+ * together on the server and absent together on the client).
+ *
+ * VENDORING DIVERGENCE: applied to the fsdk-unreal VENDORED copy only; upstream
+ * fsdk-core/src/token.c does NOT carry it (its CTest suite needs this code always
+ * compiled). RE-APPLY after any re-vendor from fsdk-core. See
+ * .claude/rules/fsdk-security.md + .claude/rules/unreal-plugin-conventions.md.
+ * ========================================================================== */
+#if defined(FOUNDRY_FSDK_SERVER) && FOUNDRY_FSDK_SERVER
+
 #include "fsdk_internal.h"
 
 #include <stddef.h>
@@ -244,3 +261,9 @@ fsdk_result fsdk_token_verify(const char* match_token,
     fsdk_log(FSDK_LOG_DEBUG, "fsdk_token_verify: token accepted");
     return FSDK_OK;
 }
+
+#else /* !FOUNDRY_FSDK_SERVER */
+/* Non-server target: match-token verification is excluded from the binary. A lone
+ * typedef keeps this a non-empty translation unit (ISO C forbids an empty TU). */
+typedef int fsdk_token_tu_not_empty;
+#endif /* FOUNDRY_FSDK_SERVER */
