@@ -18,6 +18,24 @@
  * REST gateway, not the gRPC SDK: functionally equivalent for ready/health/
  * shutdown/get-binding and far lighter for a C core (no gRPC/protobuf C++ dep).
  */
+/* ============================ SERVER-ONLY GATE =============================
+ * This whole translation unit compiles to an EMPTY TU on any non-server target
+ * (FOUNDRY_FSDK_SERVER undefined or 0), so the match-token verify + Agones server
+ * code is genuinely ABSENT from the shipped player/client/editor binary - not
+ * merely dead. Build.cs defines FOUNDRY_FSDK_SERVER=1 only for Target.Type ==
+ * Server; the sole caller (FoundryFSDKServer.cpp) is itself #if UE_SERVER, and no
+ * client TU references any fsdk_server_* / fsdk_token_verify symbol, so excluding
+ * this TU breaks nothing on a client build.
+ *
+ * VENDORING DIVERGENCE: this gate is applied to the fsdk-unreal VENDORED copy only.
+ * Upstream fsdk-core/src/server.c does NOT carry it (its standalone CMake lib +
+ * CTest suite need this code always compiled). After any re-vendor from fsdk-core,
+ * RE-APPLY this gate - or adopt it upstream together with a build-time
+ * FOUNDRY_FSDK_SERVER=1 for the standalone lib/tests.
+ * See .claude/rules/fsdk-security.md + .claude/rules/unreal-plugin-conventions.md.
+ * ========================================================================== */
+#if defined(FOUNDRY_FSDK_SERVER) && FOUNDRY_FSDK_SERVER
+
 /* Expose nanosleep (POSIX.1b) even under a strict -std C compile: the boot-race retry
  * loop needs a sub-second sleep and this is the core's only time dependency. Must
  * precede every libc include in this TU. */
@@ -318,3 +336,9 @@ fsdk_result fsdk_server_shutdown(fsdk_server* server) {
              r == FSDK_OK ? "fsdk server shutdown (Agones Shutdown ok)" : "fsdk server shutdown FAILED");
     return r;
 }
+
+#else /* !FOUNDRY_FSDK_SERVER */
+/* Non-server target: the server SDK is excluded from the binary. A lone typedef
+ * keeps this a non-empty translation unit (ISO C forbids an empty TU). */
+typedef int fsdk_server_tu_not_empty;
+#endif /* FOUNDRY_FSDK_SERVER */
