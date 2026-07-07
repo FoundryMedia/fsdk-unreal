@@ -19,14 +19,18 @@ public class FoundryFSDK : ModuleRules
 		// fsdk-core (snprintf/strtol/etc.) so a strict editor build doesn't fail.
 		PrivateDefinitions.Add("_CRT_SECURE_NO_WARNINGS=1");
 
-		// FID-embedded in-game auth gate (default OFF). When OFF, the default client
-		// binary carries NO credential-login path - auth comes only from the launcher
+		// FID-embedded in-game auth gate. ON for every NON-SHIPPING build (dev
+		// workflow: PIE/standalone runs without the launcher use the dev console's
+		// masked `foundry login`); OFF in Shipping, so the SHIPPED client binary
+		// carries NO credential-login path - auth comes only from the launcher
 		// session-daemon handoff (UFoundryFSDKSubsystem::AutoLoginFromLauncher), and a
 		// missing launcher session fails fast. A game distributed OUTSIDE the launcher
-		// opts in by building with the env var FOUNDRY_FSDK_FID_AUTH=1. PUBLIC (not
-		// Private): it gates the PUBLIC subsystem header, so consumers (Conquest) must
-		// see the same value or UHT/link would disagree - see unreal-plugin-conventions.
-		bool bFidAuth = System.Environment.GetEnvironmentVariable("FOUNDRY_FSDK_FID_AUTH") == "1";
+		// opts its Shipping build in with the env var FOUNDRY_FSDK_FID_AUTH=1. PUBLIC
+		// (not Private): it gates the PUBLIC subsystem header, so consumers (Conquest)
+		// must see the same value or UHT/link would disagree - see
+		// unreal-plugin-conventions.
+		bool bFidAuth = System.Environment.GetEnvironmentVariable("FOUNDRY_FSDK_FID_AUTH") == "1"
+			|| Target.Configuration != UnrealTargetConfiguration.Shipping;
 		PublicDefinitions.Add("FOUNDRY_FSDK_FID_AUTH=" + (bFidAuth ? "1" : "0"));
 
 		PublicDependencyModuleNames.AddRange(new string[]

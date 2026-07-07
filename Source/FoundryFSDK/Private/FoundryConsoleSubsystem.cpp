@@ -18,6 +18,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Misc/App.h"
 #include "Misc/CommandLine.h"
+#include "Misc/ConfigCacheIni.h" // GConfig-backed persisted command history
 #include "Misc/Parse.h"
 #include "Rendering/DrawElements.h"
 #include "Styling/CoreStyle.h"
@@ -277,6 +278,18 @@ public:
 		RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateSP(this, &SFoundryConsole::FocusInputDeferred));
 	}
 
+	/** Masked password capture (`foundry login`): dots in the box, no history/tab. */
+	void SetPasswordMode(bool bOn)
+	{
+		if (InputBox.IsValid())
+		{
+			InputBox->SetIsPassword(bOn);
+			InputBox->SetHintText(FText::FromString(bOn
+				? TEXT("Password (input hidden) - Enter to submit, Esc to cancel")
+				: TEXT("Type 'help' for commands")));
+		}
+	}
+
 private:
 	EActiveTimerReturnType FocusInputDeferred(double, float)
 	{
@@ -307,6 +320,20 @@ private:
 	FReply HandleInputKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent)
 	{
 		const FKey Key = KeyEvent.GetKey();
+		if (UFoundryConsoleSubsystem* Sub = Owner.Get(); Sub != nullptr && Sub->IsAwaitingPassword())
+		{
+			if (Key == EKeys::Escape)
+			{
+				InputBox->SetText(FText::GetEmpty());
+				Sub->CancelPendingLogin();
+				return FReply::Handled();
+			}
+			if (Key == EKeys::Up || Key == EKeys::Down || Key == EKeys::Tab)
+			{
+				return FReply::Handled(); // no history recall / completion over a password
+			}
+			return FReply::Unhandled();
+		}
 		if (Key == EKeys::Up)
 		{
 			NavigateHistory(-1);
@@ -636,6 +663,7 @@ void UFoundryConsoleSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	OverlayKey = EKeys::F9;
 
 	RegisterBuiltins();
+	LoadPersistedHistory();
 
 	// Mirror the SDK's own log categories into the scrollback; games add theirs
 	// via CaptureLogCategory / the `log` command.
@@ -730,6 +758,7 @@ void UFoundryConsoleSubsystem::CloseConsole()
 		return;
 	}
 	bConsoleOpen = false;
+	CancelPendingLogin(); // an interrupted masked prompt never survives a close
 	if (ConsoleWidget.IsValid())
 	{
 		UGameInstance* GI = GetGameInstance();
@@ -738,6 +767,56 @@ void UFoundryConsoleSubsystem::CloseConsole()
 			GI->GetGameViewportClient()->RemoveViewportWidgetContent(ConsoleWidget.ToSharedRef());
 		}
 	}
+}
+
+void UFoundryConsoleSubsystem::CancelPendingLogin()
+{
+	if (!PendingLoginEmail.IsEmpty())
+	{
+		PendingLoginEmail.Reset();
+		SetWidgetPasswordMode(false);
+		Print(TEXT("login cancelled."));
+	}
+}
+
+void UFoundryConsoleSubsystem::SetWidgetPasswordMode(bool bOn)
+{
+	if (ConsoleWidget.IsValid())
+	{
+		ConsoleWidget->SetPasswordMode(bOn);
+	}
+}
+
+// ── History persistence (shell-style recall across runs) ────────────────────────
+
+void UFoundryConsoleSubsystem::LoadPersistedHistory()
+{
+	if (GConfig == nullptr)
+	{
+		return;
+	}
+	TArray<FString> Persisted;
+	GConfig->GetArray(TEXT("FoundryConsole"), TEXT("History"), Persisted, GGameUserSettingsIni);
+	if (Persisted.Num() > MaxPersistedHistoryLines)
+	{
+		Persisted.RemoveAt(0, Persisted.Num() - MaxPersistedHistoryLines);
+	}
+	History = MoveTemp(Persisted);
+}
+
+void UFoundryConsoleSubsystem::SavePersistedHistory() const
+{
+	if (GConfig == nullptr)
+	{
+		return;
+	}
+	TArray<FString> Tail = History;
+	if (Tail.Num() > MaxPersistedHistoryLines)
+	{
+		Tail.RemoveAt(0, Tail.Num() - MaxPersistedHistoryLines);
+	}
+	GConfig->SetArray(TEXT("FoundryConsole"), TEXT("History"), Tail, GGameUserSettingsIni);
+	GConfig->Flush(false, GGameUserSettingsIni);
 }
 
 void UFoundryConsoleSubsystem::SetStatsOverlayVisible(bool bVisible)
@@ -862,6 +941,30 @@ FText UFoundryConsoleSubsystem::GetScrollbackText() const
 
 void UFoundryConsoleSubsystem::SubmitLine(const FString& RawLine)
 {
+	if (!PendingLoginEmail.IsEmpty())
+	{
+		// Masked password line: dispatched straight to login — never echoed, never
+		// in history/scrollback, never held as state. Untrimmed (passwords may
+		// legitimately carry spaces); an all-whitespace line cancels.
+		const FString Email = PendingLoginEmail;
+		PendingLoginEmail.Reset();
+		SetWidgetPasswordMode(false);
+		if (RawLine.TrimStartAndEnd().IsEmpty())
+		{
+			Print(TEXT("login cancelled."));
+			return;
+		}
+		UGameInstance* GI = GetGameInstance();
+		UFoundryFSDKSubsystem* Fsdk = GI ? GI->GetSubsystem<UFoundryFSDKSubsystem>() : nullptr;
+		if (Fsdk == nullptr)
+		{
+			Print(TEXT("FSDK unavailable."));
+			return;
+		}
+		Print(FString::Printf(TEXT("signing in as %s..."), *Email));
+		Fsdk->Login(Email, RawLine, /*bRememberMe=*/true);
+		return;
+	}
 	const FString Line = RawLine.TrimStartAndEnd();
 	if (Line.IsEmpty())
 	{
@@ -878,6 +981,7 @@ void UFoundryConsoleSubsystem::SubmitLine(const FString& RawLine)
 		{
 			History.RemoveAt(0);
 		}
+		SavePersistedHistory();
 	}
 	const FString Response = Execute(Line);
 	if (!Response.IsEmpty())
@@ -1261,12 +1365,21 @@ void UFoundryConsoleSubsystem::RegisterBuiltins()
 				Id.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (%s)"), *Id));
 		}) });
 
-	FoundryCommands.Add(TEXT("login"), { TEXT("<email> <password> sign in with a Foundry account"), EFoundryConsoleAccess::SignedOut,
+	FoundryCommands.Add(TEXT("login"), { TEXT("<email> sign in (password prompted, input hidden)"), EFoundryConsoleAccess::SignedOut,
 		FFoundryConsoleHandler::CreateLambda([this](const TArray<FString>& Args) -> FString
 		{
-			if (Args.Num() < 2)
+#if !FOUNDRY_FSDK_FID_AUTH
+			(void)Args;
+			return TEXT("in-game login is not compiled into this build - sign in via the Foundry launcher.");
+#else
+			if (Args.Num() > 1)
 			{
-				return TEXT("usage: foundry login <email> <password>");
+				// An inline password was VISIBLE while typed - refuse it outright.
+				return TEXT("password must not be typed inline - use: foundry login <email> (a hidden prompt follows)");
+			}
+			if (Args.Num() != 1 || Args[0].IsEmpty())
+			{
+				return TEXT("usage: foundry login <email>   (password prompted, input hidden)");
 			}
 			UGameInstance* GI = GetGameInstance();
 			UFoundryFSDKSubsystem* Fsdk = GI ? GI->GetSubsystem<UFoundryFSDKSubsystem>() : nullptr;
@@ -1274,8 +1387,10 @@ void UFoundryConsoleSubsystem::RegisterBuiltins()
 			{
 				return TEXT("FSDK unavailable.");
 			}
-			Fsdk->Login(Args[0], Args[1], /*bRememberMe=*/true);
-			return FString::Printf(TEXT("signing in as %s..."), *Args[0]);
+			PendingLoginEmail = Args[0];
+			SetWidgetPasswordMode(true);
+			return FString::Printf(TEXT("password for %s: (input hidden - Enter to submit, Esc to cancel)"), *Args[0]);
+#endif
 		}) });
 
 	FoundryCommands.Add(TEXT("resume"), { TEXT("resume the saved session (no password)"), EFoundryConsoleAccess::SignedOut,

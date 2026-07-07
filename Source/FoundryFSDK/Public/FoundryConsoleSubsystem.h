@@ -163,6 +163,12 @@ public:
 	 *  names when the completion is ambiguous. Access-filtered like `help`. */
 	FString CompleteLine(const FString& Current, TArray<FString>& OutCandidates) const;
 
+	/** True while `foundry login <email>` is awaiting the masked password line. */
+	bool IsAwaitingPassword() const { return !PendingLoginEmail.IsEmpty(); }
+
+	/** Abort a pending masked-password capture (widget Esc / console close). */
+	void CancelPendingLogin();
+
 private:
 	struct FCommandEntry
 	{
@@ -186,6 +192,9 @@ private:
 	void CloseConsole();
 	void RemoveNetGraph();
 	void RemoveStatsOverlay();
+	void SetWidgetPasswordMode(bool bOn);
+	void LoadPersistedHistory();
+	void SavePersistedHistory() const;
 
 	bool DrainCapturedLogs(float DeltaTime);
 
@@ -207,6 +216,10 @@ private:
 	TArray<FString> History;
 	uint32 ScrollbackSerial = 0;
 
+	/** Non-empty = the next submitted line is that account's password (masked input,
+	 *  never echoed, never stored). The password itself is never held as state. */
+	FString PendingLoginEmail;
+
 	TSharedPtr<FFoundryConsoleLogCapture> LogCapture; // shared: deleter is type-erased (fwd-decl safe)
 	FTSTicker::FDelegateHandle LogDrainTicker;
 
@@ -218,4 +231,7 @@ private:
 
 	static constexpr int32 MaxScrollbackLines = 400;
 	static constexpr int32 MaxHistoryLines = 64;
+	/** Shell-style recall across RUNS: the newest N history lines persist to the
+	 *  game-user-settings ini (lines are sanitized at submit — no credentials). */
+	static constexpr int32 MaxPersistedHistoryLines = 25;
 };

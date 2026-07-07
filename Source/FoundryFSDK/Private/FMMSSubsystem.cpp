@@ -223,9 +223,10 @@ void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnect
 		Fail(TEXT("No local player controller to travel."));
 		return;
 	}
-	SetPhase(EFMMSPhase::Traveling,
-	         FString::Printf(TEXT("Joining %s:%d..."), *Connection.Ip, Connection.Port));
-	// The URL carries the match token - do NOT log it.
+	// Deliberately NO endpoint in the user-facing message: the server IP must never
+	// hit screens, streams, or captured logs (DDoS surface - see fsdk-security).
+	SetPhase(EFMMSPhase::Traveling, TEXT("Match found - joining server..."));
+	// The URL carries the match token AND the endpoint - do NOT log it.
 	const FString Url = FString::Printf(TEXT("%s:%d?token=%s"),
 	                                    *Connection.Ip, Connection.Port, *Connection.MatchToken);
 	PC->ClientTravel(Url, TRAVEL_Absolute);
