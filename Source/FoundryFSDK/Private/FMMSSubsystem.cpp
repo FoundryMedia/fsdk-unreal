@@ -143,6 +143,13 @@ void UFMMSSubsystem::HandleRequest(EFoundryFsdkResult Result)
 	{
 		return;
 	}
+	if (Result == EFoundryFsdkResult::Unavailable)
+	{
+		// The server rejected the search up front (503): no capacity for this queue. Stop here with a
+		// human message rather than searching forever - a match could never form right now.
+		Fail(TEXT("No game servers are available for this queue right now. Please try again shortly."));
+		return;
+	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
 		Fail(FString::Printf(TEXT("Match request failed (%d)."), (int32)Result));

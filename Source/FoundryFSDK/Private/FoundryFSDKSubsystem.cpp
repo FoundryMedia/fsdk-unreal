@@ -85,6 +85,7 @@ namespace
 			case FSDK_ERR_TOKEN_INVALID:     return EFoundryFsdkResult::Protocol;
 			case FSDK_ERR_TOKEN_EXPIRED:     return EFoundryFsdkResult::Unauthorized;
 			case FSDK_ERR_NO_MATCH:          return EFoundryFsdkResult::NoMatch;
+			case FSDK_ERR_UNAVAILABLE:       return EFoundryFsdkResult::Unavailable;
 			case FSDK_ERR_AGONES:            return EFoundryFsdkResult::Internal;
 			case FSDK_ERR_INTERNAL:          return EFoundryFsdkResult::Internal;
 			default:                         return EFoundryFsdkResult::Unknown;

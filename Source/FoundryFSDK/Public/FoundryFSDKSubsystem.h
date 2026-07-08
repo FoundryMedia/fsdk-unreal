@@ -40,6 +40,7 @@ enum class EFoundryFsdkResult : uint8
 	Protocol         UMETA(DisplayName = "Protocol Error"),
 	NoMatch          UMETA(DisplayName = "No Match / Not Ready"),
 	NotImplemented   UMETA(DisplayName = "Not Implemented"),
+	Unavailable      UMETA(DisplayName = "No Servers Available"),
 	Internal         UMETA(DisplayName = "Internal Error"),
 	Unknown          UMETA(DisplayName = "Unknown")
 };

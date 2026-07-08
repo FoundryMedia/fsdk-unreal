@@ -58,7 +58,8 @@ typedef enum fsdk_result {
     FSDK_ERR_TOKEN_EXPIRED = 9,  /* Match token signature OK but expired.      */
     FSDK_ERR_NO_MATCH = 10,      /* Ticket has no connection yet / cancelled.  */
     FSDK_ERR_AGONES = 11,        /* Agones SDK lifecycle call failed.          */
-    FSDK_ERR_INTERNAL = 12       /* Unexpected internal error.                 */
+    FSDK_ERR_INTERNAL = 12,      /* Unexpected internal error.                 */
+    FSDK_ERR_UNAVAILABLE = 13    /* No server capacity for the queue (503).    */
 } fsdk_result;
 
 /* Returns a static human-readable string for a result code (for logging). */

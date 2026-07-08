@@ -41,6 +41,11 @@ static fsdk_result http_status_to_result(long status) {
     if (status == 408 || status == 504) {
         return FSDK_ERR_TIMEOUT;
     }
+    if (status == 503) {
+        /* No server capacity for the queue - the search can never succeed right now, so the caller
+         * should stop searching and surface "no servers, try later" rather than poll forever. */
+        return FSDK_ERR_UNAVAILABLE;
+    }
     return FSDK_ERR_PROTOCOL;
 }
 
