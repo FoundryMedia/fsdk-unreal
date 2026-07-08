@@ -34,12 +34,28 @@ void UFMMSSubsystem::BindOnce(UFoundryFSDKSubsystem* Sdk)
 	bBound = true;
 }
 
+bool UFMMSSubsystem::ThrottleFindMatch()
+{
+	const double NowSec = FPlatformTime::Seconds();
+	if (NowSec - LastFindMatchSeconds < FindMatchMinIntervalSeconds)
+	{
+		UE_LOG(LogFMMS, Warning, TEXT("FindMatch ignored - too soon after the last attempt (anti-spam)."));
+		return false;
+	}
+	LastFindMatchSeconds = NowSec;
+	return true;
+}
+
 void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJson,
                                const FString& PlayerToken, const FString& ApiBaseUrl)
 {
 	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
 	{
 		UE_LOG(LogFMMS, Warning, TEXT("FindMatch ignored - flow already in progress (phase %d)"), (int32)Phase);
+		return;
+	}
+	if (!ThrottleFindMatch())
+	{
 		return;
 	}
 	if (Queue.IsEmpty())
@@ -76,6 +92,10 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
 	{
 		UE_LOG(LogFMMS, Warning, TEXT("FindMatchAuthenticated ignored - flow already in progress (phase %d)"), (int32)Phase);
+		return;
+	}
+	if (!ThrottleFindMatch())
+	{
 		return;
 	}
 	if (Queue.IsEmpty())

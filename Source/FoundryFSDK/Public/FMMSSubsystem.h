@@ -83,12 +83,19 @@ private:
 	void Fail(const FString& Message);
 	UFoundryFSDKSubsystem* Fsdk() const;
 	void BindOnce(UFoundryFSDKSubsystem* Sdk);
+	/** Anti-spam: true if enough time has passed since the last attempt (and stamps it); else false. */
+	bool ThrottleFindMatch();
 
 	EFMMSPhase Phase = EFMMSPhase::Idle;
 	FString PendingQueue;
 	FString PendingAttributes;
 	FTimerHandle PollTimer;
 	bool bBound = false;
+	// Wall-clock of the last accepted FindMatch — throttles rapid re-clicks (a fast failure, e.g.
+	// "no servers", returns to Idle/Failed, from which a re-click would otherwise submit again).
+	double LastFindMatchSeconds = 0.0;
 
 	static constexpr float PollIntervalSeconds = 2.0f;
+	/** Minimum seconds between FindMatch attempts; sooner re-clicks are ignored (anti-spam). */
+	static constexpr double FindMatchMinIntervalSeconds = 2.0;
 };
