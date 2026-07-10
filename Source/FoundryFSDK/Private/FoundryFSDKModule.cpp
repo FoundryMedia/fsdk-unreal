@@ -18,6 +18,7 @@ public:
 	{
 		FoundryFSDKInstallLogSink();
 		FoundryFSDKInstallHttpTransport();
+		FoundryFSDKInstallWsTransport(); // FRC chat frames (fsdk_set_ws_transport)
 		FoundryFSDKInstallSecretStore();
 	}
 

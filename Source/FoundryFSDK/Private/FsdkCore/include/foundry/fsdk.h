@@ -79,6 +79,10 @@ typedef struct fsdk_server fsdk_server;
  * to a connection). Opaque; lifetime is bound to its client. */
 typedef struct fsdk_ticket fsdk_ticket;
 
+/* Chat session handle (client-side; FRC rooms over the realtime WebSocket).
+ * Opaque; lifetime is bound to its client. */
+typedef struct fsdk_chat fsdk_chat;
+
 /* -------------------------------------------------------------------------- */
 /* Value types (POD, caller-owned storage)                                    */
 /* -------------------------------------------------------------------------- */
@@ -240,6 +244,37 @@ void fsdk_set_secret_store(fsdk_secret_save_fn save,
                            void* user_data);
 
 /* -------------------------------------------------------------------------- */
+/* WebSocket transport (host-provided, required for chat)                     */
+/* -------------------------------------------------------------------------- */
+
+/* Host-provided WebSocket transport, mirroring the HTTP seam: the core stays
+ * zero-dependency and vendorable; the engine binding backs this with its own
+ * WS stack (UE: FWebSocketsModule). The host OWNS the socket:
+ *
+ *   connect : open a WS to url (wss://...). On success set *out_handle to an
+ *             opaque host handle and return FSDK_OK. The connection MAY still
+ *             be in-flight - the host feeds core state via the callbacks below.
+ *   send    : send one TEXT frame (NUL-terminated UTF-8 JSON). Map transport
+ *             failure to FSDK_ERR_NETWORK.
+ *   close   : close + release the handle (idempotent, never fails).
+ *
+ * The host MUST deliver every inbound TEXT frame to fsdk_chat_on_ws_text and
+ * call fsdk_chat_on_ws_closed when the socket drops. Delivery thread is the
+ * host's choice; the chat handle is not thread-safe - feed it from one thread.
+ * TLS is enforced by the host (wss). Never log frame payloads (they carry the
+ * session token in the auth frame). */
+typedef fsdk_result (*fsdk_ws_connect_fn)(const char* url, void** out_handle, void* user_data);
+typedef fsdk_result (*fsdk_ws_send_fn)(void* handle, const char* text, void* user_data);
+typedef void (*fsdk_ws_close_fn)(void* handle, void* user_data);
+
+/* Install a process-wide WS transport (pass NULLs to remove). Set once at startup.
+ * With NO transport installed, chat calls return FSDK_NOT_IMPLEMENTED. */
+void fsdk_set_ws_transport(fsdk_ws_connect_fn connect_fn,
+                           fsdk_ws_send_fn send_fn,
+                           fsdk_ws_close_fn close_fn,
+                           void* user_data);
+
+/* -------------------------------------------------------------------------- */
 /* CLIENT API (ships inside the game client - assume reverse-engineered)      */
 /* -------------------------------------------------------------------------- */
 
@@ -339,6 +374,71 @@ fsdk_result fsdk_cancel_match(fsdk_client* client, fsdk_ticket* ticket);
 
 /* Destroy a ticket and free its resources. Safe to call with NULL. */
 void fsdk_ticket_destroy(fsdk_ticket* ticket);
+
+/* -------------------------------------------------------------------------- */
+/* CLIENT CHAT API (FRC rooms over the realtime WebSocket)                    */
+/* -------------------------------------------------------------------------- */
+/* Game chat rides the platform's control plane: every message is authorized,
+ * rate-limited, and logged SERVER-side (this SDK ships to attacker-controlled
+ * machines - nothing here is trusted). The client holds only the player's own
+ * session token; the server enforces room membership. Requires BOTH the HTTP
+ * transport (room resolve) and the WS transport (frames).
+ *
+ * Flow: fsdk_chat_create -> fsdk_chat_set_message_callback ->
+ *       fsdk_chat_join_global("mygame") -> [host pumps fsdk_chat_on_ws_text /
+ *       on_ws_closed; game calls fsdk_chat_tick(now_ms) each frame] ->
+ *       fsdk_chat_send("gg"). On socket drop the host/game re-joins (the
+ *       server's history endpoint is the resync path). */
+
+/* Longest accepted message body (server caps at 500 chars; +NUL headroom). */
+#define FSDK_CHAT_BODY_MAX 512
+
+/* One room message, as fanned out by the platform. POD snapshot - copy what
+ * you keep; the pointer is only valid inside the callback. */
+typedef struct fsdk_chat_message {
+    long long id;                        /* Server-assigned message id.        */
+    char room_id[64];                    /* Room UUID, NUL-terminated.         */
+    char from_subject[136];              /* Sender (ns-scoped subject).        */
+    char from_foundry_id[64];            /* Sender's FID; empty if opaque.     */
+    char display_name[128];              /* Resolved name; empty if unknown.   */
+    char body[FSDK_CHAT_BODY_MAX];       /* Message text, NUL-terminated.      */
+} fsdk_chat_message;
+
+/* Invoked for every room.message frame (including the caller's own echo). */
+typedef void (*fsdk_chat_message_fn)(const fsdk_chat_message* message, void* user_data);
+
+/* Create a chat session bound to an authenticated client (borrows its token +
+ * base url; the client must outlive the chat). On success *out_chat is owned
+ * by the caller (fsdk_chat_destroy). */
+fsdk_result fsdk_chat_create(fsdk_client* client, fsdk_chat** out_chat);
+
+/* Destroy the chat session (closes the socket via the WS seam). NULL-safe. */
+void fsdk_chat_destroy(fsdk_chat* chat);
+
+/* Install the message callback (pass NULL to remove). */
+void fsdk_chat_set_message_callback(fsdk_chat* chat, fsdk_chat_message_fn cb, void* user_data);
+
+/* Join a game's GLOBAL room: resolves the room over HTTP (server-authorized),
+ * opens the realtime socket, authenticates with the player token, and
+ * subscribes. Asynchronous past the resolve - fsdk_chat_ready() flips once the
+ * server confirms the subscription. Requires an authenticated client. */
+fsdk_result fsdk_chat_join_global(fsdk_chat* chat, const char* game_slug);
+
+/* Send to the joined room. FSDK_ERR_UNAVAILABLE until fsdk_chat_ready();
+ * FSDK_ERR_INVALID_ARG for an empty/oversized body. The echo arrives via the
+ * message callback like everyone else's copy. */
+fsdk_result fsdk_chat_send(fsdk_chat* chat, const char* body);
+
+/* Drive the keepalive: call each frame/tick with a monotonic millisecond clock;
+ * the core pings the socket every ~25s (the platform edge idles out at 60s). */
+fsdk_result fsdk_chat_tick(fsdk_chat* chat, long long now_ms);
+
+/* Host WS transport feeds: every inbound TEXT frame / the socket dropping. */
+void fsdk_chat_on_ws_text(fsdk_chat* chat, const char* text);
+void fsdk_chat_on_ws_closed(fsdk_chat* chat);
+
+/* Whether the room subscription is live (auth.ok + room.sub.ok both seen). */
+int fsdk_chat_ready(const fsdk_chat* chat);
 
 /* -------------------------------------------------------------------------- */
 /* SERVER API (runs in the dedicated server - our trusted box)               */

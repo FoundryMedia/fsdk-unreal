@@ -43,6 +43,7 @@ public class FoundryFSDK : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"HTTP", // engine HTTP stack backs the fsdk-core transport seam (TLS)
+			"WebSockets", // engine WS stack backs the fsdk-core WS seam (FRC chat)
 			"InputCore", // FKey/EKeys for the developer-console keybinds
 			"Slate",     // the curated console/overlay/netgraph widgets
 			"SlateCore",

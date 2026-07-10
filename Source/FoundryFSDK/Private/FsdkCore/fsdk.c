@@ -154,6 +154,55 @@ int fsdk_secret_delete(const char* key) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* WebSocket transport (host-provided, required for chat)                     */
+/* -------------------------------------------------------------------------- */
+
+static fsdk_ws_connect_fn g_ws_connect = NULL;
+static fsdk_ws_send_fn    g_ws_send = NULL;
+static fsdk_ws_close_fn   g_ws_close = NULL;
+static void*              g_ws_user_data = NULL;
+
+void fsdk_set_ws_transport(fsdk_ws_connect_fn connect_fn,
+                           fsdk_ws_send_fn send_fn,
+                           fsdk_ws_close_fn close_fn,
+                           void* user_data) {
+    g_ws_connect = connect_fn;
+    g_ws_send = send_fn;
+    g_ws_close = close_fn;
+    g_ws_user_data = user_data;
+}
+
+fsdk_result fsdk_dispatch_ws_connect(const char* url, void** out_handle) {
+    if (out_handle != NULL) {
+        *out_handle = NULL;
+    }
+    if (g_ws_connect == NULL) {
+        fsdk_log(FSDK_LOG_DEBUG, "fsdk: no ws transport installed");
+        return FSDK_NOT_IMPLEMENTED;
+    }
+    if (url == NULL || out_handle == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    return g_ws_connect(url, out_handle, g_ws_user_data);
+}
+
+fsdk_result fsdk_dispatch_ws_send(void* handle, const char* text) {
+    if (g_ws_send == NULL) {
+        return FSDK_NOT_IMPLEMENTED;
+    }
+    if (handle == NULL || text == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    return g_ws_send(handle, text, g_ws_user_data);
+}
+
+void fsdk_dispatch_ws_close(void* handle) {
+    if (g_ws_close != NULL && handle != NULL) {
+        g_ws_close(handle, g_ws_user_data);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Memory helpers                                                             */
 /* -------------------------------------------------------------------------- */
 

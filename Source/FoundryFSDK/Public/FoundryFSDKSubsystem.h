@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "FoundryFSDKSubsystem.generated.h"
 
@@ -72,6 +73,11 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFound
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryLoginEvent, EFoundryFsdkResult, Result, const FString&, DisplayName);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FFoundryLoggedOutEvent);
 
+// Chat delegates - broadcast on the GAME THREAD.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryChatMessageEvent,
+	const FString&, DisplayName, const FString&, FoundryId, const FString&, Body);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryChatStateEvent, bool, bReady);
+
 /**
  * FoundryFSDK game-client facade.
  *
@@ -134,6 +140,50 @@ public:
 	/** Cancel the active ticket (best-effort, fire-and-forget). */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void CancelMatch();
+
+	// ── FRC chat (the game's GLOBAL room over the platform realtime socket) ─────
+	// Server-authoritative end to end: the player token only ever grants ROOM
+	// operations (fid pins player sockets room-only), membership + rate limits +
+	// logging are enforced server-side. Requires an authenticated session
+	// (AutoLoginFromLauncher). One chat session per game instance.
+
+	/**
+	 * Join this game's GLOBAL chat room by game slug (e.g. "conquest"): resolves
+	 * the room, opens the realtime socket, authenticates, subscribes. Async:
+	 * OnChatStateChanged(true) fires when the subscription is live; a dropped
+	 * socket fires OnChatStateChanged(false) and the subsystem auto-rejoins with
+	 * backoff until LeaveChat().
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void JoinGlobalChat(const FString& GameSlug);
+
+	/**
+	 * Send to the joined room (500-char server cap). The echo arrives via
+	 * OnChatMessage like everyone else's copy. Async: OnChatSendComplete fires
+	 * with the result (Unavailable until the room subscription is live).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void SendChat(const FString& Body);
+
+	/** Leave the room + close the socket (stops the auto-rejoin). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void LeaveChat();
+
+	/** Whether the room subscription is live (game-thread snapshot). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|Chat")
+	bool IsChatReady() const { return bChatReady; }
+
+	/** Every room message (including the caller's own echo). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryChatMessageEvent OnChatMessage;
+
+	/** Room subscription went live (true) / dropped (false; auto-rejoin runs). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryChatStateEvent OnChatStateChanged;
+
+	/** One SendChat finished (Ok, Unavailable before ready, InvalidArg, ...). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryFsdkResultEvent OnChatSendComplete;
 
 	// ── Auto-login (DEFAULT: the Foundry launcher's session daemon) ─────────────
 	// The game gets a short-lived matchmaking token from the launcher's session
@@ -220,6 +270,13 @@ private:
 	/** Apply a session result on the game thread: cache identity + broadcast OnLoginComplete. */
 	void ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName, const FString& FoundryId);
 
+	/** Game thread (the chat driver tick): drain inbound WS frames into the chat
+	 *  handle, run the keepalive, detect ready flips, drive the auto-rejoin. */
+	bool ChatDriverTick(float DeltaSeconds);
+
+	/** Kick one (re)join attempt on a worker (guarded by bChatJoinInFlight). */
+	void StartChatJoin();
+
 	/** Ref-counted fsdk-core handles + serialization lock (owned). */
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> Core;
 
@@ -229,4 +286,15 @@ private:
 	bool bIsLoggedIn = false;
 	FString CachedDisplayName;
 	FString CachedFoundryId;
+
+	// ── Chat state ──
+	// The fsdk_chat handle lives inside FFsdkCoreState (same lock as the client -
+	// the chat borrows the client's token). These mirrors are game-thread-only.
+	bool bChatReady = false;
+	bool bChatDesired = false;      // JoinGlobalChat sets, LeaveChat clears
+	bool bChatJoinInFlight = false; // one join worker at a time
+	FString ChatGameSlug;           // the slug the auto-rejoin re-joins
+	double NextChatRejoinTime = 0;  // backoff gate (FPlatformTime::Seconds)
+	int32 ChatRejoinStrikes = 0;    // exponential backoff ladder
+	FTSTicker::FDelegateHandle ChatTickHandle;
 };

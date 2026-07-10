@@ -19,9 +19,11 @@
 
 #include "foundry/fsdk.h"
 #include "FoundryFSDKLauncherHandoff.h"
+#include "FoundryFSDKTransport.h"
 
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/ScopeLock.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDK, Log, All);
@@ -37,10 +39,35 @@ struct FFsdkCoreState
 {
 	fsdk_client* Client = nullptr;
 	fsdk_ticket* ActiveTicket = nullptr;
+	fsdk_chat* Chat = nullptr;
 	FCriticalSection CS;
+
+	// ── Chat WS handoff ──
+	// The WS sink (game thread) appends here under this LIGHT lock (never held
+	// across any network call - the driver tick must never stall behind a worker's
+	// blocking join); the driver tick drains it into the chat handle.
+	FCriticalSection ChatQueueCS;
+	TArray<FString> ChatInbound;
+	bool bChatClosed = false;
+
+	/** Message copies staged by the C message callback. GAME-THREAD-ONLY: the
+	 *  callback fires only inside the driver tick's fsdk_chat_on_ws_text drain,
+	 *  and the tick broadcasts + clears these AFTER releasing the core lock
+	 *  (broadcasting into Blueprint while holding it invites re-entry). */
+	struct FChatMsgCopy
+	{
+		FString DisplayName;
+		FString FoundryId;
+		FString Body;
+	};
+	TArray<FChatMsgCopy> ChatMessages;
 
 	~FFsdkCoreState()
 	{
+		if (Chat != nullptr)
+		{
+			fsdk_chat_destroy(Chat); // borrows Client - must go first
+		}
 		if (ActiveTicket != nullptr)
 		{
 			fsdk_ticket_destroy(ActiveTicket);
@@ -51,6 +78,27 @@ struct FFsdkCoreState
 		}
 	}
 };
+
+extern "C"
+{
+	/** fsdk_chat_message_fn: stage a POD-copy for the driver tick to broadcast
+	 *  once it releases the core lock. UserData is the owning FFsdkCoreState -
+	 *  guaranteed alive: this only ever fires inside the tick's drain, which
+	 *  holds a ref. */
+	static void FoundryFSDKChatMessageThunk(const fsdk_chat_message* Message, void* UserData)
+	{
+		FFsdkCoreState* State = static_cast<FFsdkCoreState*>(UserData);
+		if (State == nullptr || Message == nullptr)
+		{
+			return;
+		}
+		FFsdkCoreState::FChatMsgCopy Copy;
+		Copy.DisplayName = UTF8_TO_TCHAR(Message->display_name);
+		Copy.FoundryId = UTF8_TO_TCHAR(Message->from_foundry_id);
+		Copy.Body = UTF8_TO_TCHAR(Message->body);
+		State->ChatMessages.Add(MoveTemp(Copy));
+	}
+}
 
 namespace
 {
@@ -102,6 +150,15 @@ void UFoundryFSDKSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UFoundryFSDKSubsystem::Deinitialize()
 {
+	// Chat first: stop the driver tick + detach the WS sink BEFORE the core state
+	// can go away (the sink holds only a weak ref, but a live tick must not race
+	// the teardown).
+	if (ChatTickHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ChatTickHandle);
+		ChatTickHandle.Reset();
+	}
+	FoundryFSDKClearWsSink();
 	// Drop the subsystem's reference. Any worker mid-call holds its own ref, so
 	// the handles stay alive until that call returns, then free on the last release.
 	Core.Reset();
@@ -310,6 +367,256 @@ void UFoundryFSDKSubsystem::CancelMatch()
 			CoreRef->ActiveTicket = nullptr;
 		}
 	});
+}
+
+// ── FRC chat ────────────────────────────────────────────────────────────────
+//
+// One chat session per game instance, driven from the GAME THREAD by a 0.25s
+// FTSTicker: it drains the WS sink's inbound frames into the chat handle, runs
+// the ~25s keepalive, watches fsdk_chat_ready for state flips, and re-joins
+// with backoff after a drop. The core lock is only ever TRY-locked here — a
+// worker mid-join (blocking room-resolve HTTP) must never stall the game
+// thread; undrained frames simply carry to the next tick in order.
+
+void UFoundryFSDKSubsystem::JoinGlobalChat(const FString& GameSlug)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || GameSlug.IsEmpty())
+	{
+		OnChatStateChanged.Broadcast(false);
+		return;
+	}
+	bChatDesired = true;
+	ChatGameSlug = GameSlug;
+	ChatRejoinStrikes = 0;
+	NextChatRejoinTime = 0.0;
+	if (!ChatTickHandle.IsValid())
+	{
+		ChatTickHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UFoundryFSDKSubsystem::ChatDriverTick), 0.25f);
+	}
+	StartChatJoin();
+}
+
+void UFoundryFSDKSubsystem::StartChatJoin()
+{
+	if (bChatJoinInFlight)
+	{
+		return;
+	}
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		return;
+	}
+	bChatJoinInFlight = true;
+
+	// Route inbound frames/drops into the core state's queue BEFORE the join can
+	// open the socket. Weak ref: a torn-down state just drops frames.
+	TWeakPtr<FFsdkCoreState, ESPMode::ThreadSafe> WeakCore(CoreRef);
+	FoundryFSDKSetWsSink(
+		[WeakCore](const FString& Text)
+		{
+			if (TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> State = WeakCore.Pin())
+			{
+				FScopeLock QLock(&State->ChatQueueCS);
+				State->ChatInbound.Add(Text);
+			}
+		},
+		[WeakCore]()
+		{
+			if (TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> State = WeakCore.Pin())
+			{
+				FScopeLock QLock(&State->ChatQueueCS);
+				State->bChatClosed = true;
+			}
+		});
+
+	const FString Slug = ChatGameSlug;
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, Slug, WeakThis]()
+	{
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			if (CoreRef->Chat == nullptr)
+			{
+				Result = fsdk_chat_create(CoreRef->Client, &CoreRef->Chat);
+				if (Result == FSDK_OK)
+				{
+					fsdk_chat_set_message_callback(CoreRef->Chat,
+						&FoundryFSDKChatMessageThunk, CoreRef.Get());
+				}
+			}
+			else
+			{
+				Result = FSDK_OK;
+			}
+			if (Result == FSDK_OK)
+			{
+				Result = fsdk_chat_join_global(CoreRef->Chat, TCHAR_TO_UTF8(*Slug));
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			UFoundryFSDKSubsystem* Self = WeakThis.Get();
+			if (Self == nullptr)
+			{
+				return;
+			}
+			Self->bChatJoinInFlight = false;
+			if (Result != FSDK_OK)
+			{
+				// Ready never flipped — schedule the next attempt on the ladder.
+				Self->ChatRejoinStrikes = FMath::Min(Self->ChatRejoinStrikes + 1, 5);
+				Self->NextChatRejoinTime =
+					FPlatformTime::Seconds() + static_cast<double>(1 << Self->ChatRejoinStrikes);
+				UE_LOG(LogFoundryFSDK, Warning, TEXT("Chat join failed: %s (retrying)"),
+					UTF8_TO_TCHAR(fsdk_result_str(Result)));
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::SendChat(const FString& Body)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Chat == nullptr)
+	{
+		OnChatSendComplete.Broadcast(EFoundryFsdkResult::Unavailable);
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, Body, WeakThis]()
+	{
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = CoreRef->Chat != nullptr
+				? fsdk_chat_send(CoreRef->Chat, TCHAR_TO_UTF8(*Body))
+				: FSDK_ERR_UNAVAILABLE;
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnChatSendComplete.Broadcast(ToBlueprintResult(Result));
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::LeaveChat()
+{
+	bChatDesired = false;
+	bChatJoinInFlight = false;
+	if (ChatTickHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ChatTickHandle);
+		ChatTickHandle.Reset();
+	}
+	FoundryFSDKClearWsSink();
+	if (bChatReady)
+	{
+		bChatReady = false;
+		OnChatStateChanged.Broadcast(false);
+	}
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return;
+	}
+	Async(EAsyncExecution::Thread, [CoreRef]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->Chat != nullptr)
+		{
+			fsdk_chat_destroy(CoreRef->Chat); // closes the socket via the WS seam
+			CoreRef->Chat = nullptr;
+		}
+	});
+}
+
+bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return true;
+	}
+	TArray<FString> Frames;
+	bool bDropped = false;
+	{
+		FScopeLock QLock(&CoreRef->ChatQueueCS);
+		Frames = MoveTemp(CoreRef->ChatInbound);
+		CoreRef->ChatInbound.Reset();
+		bDropped = CoreRef->bChatClosed;
+		CoreRef->bChatClosed = false;
+	}
+
+	bool bReadyNow = bChatReady;
+	if (CoreRef->CS.TryLock())
+	{
+		if (CoreRef->Chat != nullptr)
+		{
+			for (const FString& Frame : Frames)
+			{
+				fsdk_chat_on_ws_text(CoreRef->Chat, TCHAR_TO_UTF8(*Frame));
+			}
+			if (bDropped)
+			{
+				fsdk_chat_on_ws_closed(CoreRef->Chat);
+			}
+			fsdk_chat_tick(CoreRef->Chat,
+				static_cast<long long>(FPlatformTime::Seconds() * 1000.0));
+			bReadyNow = fsdk_chat_ready(CoreRef->Chat) != 0;
+		}
+		CoreRef->CS.Unlock();
+	}
+	else if (!Frames.IsEmpty() || bDropped)
+	{
+		// A worker holds the core (join in flight): requeue IN ORDER for next tick.
+		FScopeLock QLock(&CoreRef->ChatQueueCS);
+		Frames.Append(MoveTemp(CoreRef->ChatInbound));
+		CoreRef->ChatInbound = MoveTemp(Frames);
+		CoreRef->bChatClosed |= bDropped;
+		return true;
+	}
+
+	// Broadcast staged messages AFTER the core lock is released.
+	if (!CoreRef->ChatMessages.IsEmpty())
+	{
+		TArray<FFsdkCoreState::FChatMsgCopy> Msgs = MoveTemp(CoreRef->ChatMessages);
+		CoreRef->ChatMessages.Reset();
+		for (const FFsdkCoreState::FChatMsgCopy& Msg : Msgs)
+		{
+			OnChatMessage.Broadcast(Msg.DisplayName, Msg.FoundryId, Msg.Body);
+		}
+	}
+
+	if (bReadyNow != bChatReady)
+	{
+		bChatReady = bReadyNow;
+		OnChatStateChanged.Broadcast(bChatReady);
+		if (bChatReady)
+		{
+			ChatRejoinStrikes = 0;
+		}
+		else if (bChatDesired)
+		{
+			ChatRejoinStrikes = FMath::Min(ChatRejoinStrikes + 1, 5);
+			NextChatRejoinTime =
+				FPlatformTime::Seconds() + static_cast<double>(1 << ChatRejoinStrikes);
+		}
+	}
+
+	// Auto-rejoin while the game still wants the room.
+	if (bChatDesired && !bChatReady && !bChatJoinInFlight
+		&& FPlatformTime::Seconds() >= NextChatRejoinTime)
+	{
+		StartChatJoin();
+	}
+	return true; // keep ticking
 }
 
 // ── FID auth ────────────────────────────────────────────────────────────────

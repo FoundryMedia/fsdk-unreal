@@ -21,14 +21,18 @@
 
 #include "foundry/fsdk.h"
 
+#include "Async/Async.h"
 #include "HttpModule.h"
 #include "HttpManager.h"
+#include "IWebSocket.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeBool.h"
 #include "Logging/LogMacros.h"
+#include "Misc/ScopeLock.h"
+#include "WebSocketsModule.h"
 
 #include <cstdlib>
 
@@ -179,6 +183,233 @@ extern "C"
 	}
 } // extern "C"
 
+// ── WS bridge (fsdk_set_ws_transport - FRC chat) ────────────────────────────
+//
+// The core opens/uses the socket through three C callbacks that may fire on a
+// WORKER thread (fsdk_chat_join_global runs its blocking room-resolve there).
+// ALL IWebSocket interaction is marshaled to the GAME thread (UE's WebSockets
+// events fire there anyway); outbound frames sent before OnConnected queue in
+// order. Inbound frames go to the registered SINK (the subsystem's queue) on
+// the game thread — the sink must be cheap and non-reentrant; frames arriving
+// before a sink exists buffer in order. SINGLE active session by design (a new
+// connect supersedes the old socket's delivery). Frame payloads are NEVER
+// logged (the auth frame carries the session token).
+
+namespace
+{
+	/** One host-owned socket (the core's opaque WS handle). Socket + queues are
+	 *  game-thread-only; the wrapper is ref-counted so late game-thread tasks
+	 *  can't touch a freed wrapper after close. */
+	struct FFsdkWsSocket
+	{
+		FString Url;
+		TSharedPtr<IWebSocket> Socket; // game thread only
+		TArray<FString> PendingSends;  // queued until OnConnected (game thread)
+		bool bOpen = false;            // game thread only
+		bool bClosedDelivered = false; // game thread only (once-only close signal)
+	};
+	using FFsdkWsSocketRef = TSharedPtr<FFsdkWsSocket, ESPMode::ThreadSafe>;
+
+	FCriticalSection GFsdkWsLock;
+	FFsdkWsSocketRef GFsdkWsActive;                  // the single live session
+	TFunction<void(const FString&)> GFsdkWsOnText;   // sink (subsystem-registered)
+	TFunction<void()> GFsdkWsOnClosed;
+	TArray<FString> GFsdkWsPreSinkBuffer;            // inbound before a sink exists
+	bool GFsdkWsPendingClosed = false;
+
+	/** Game thread: route one inbound frame to the sink (or buffer it). Ignores
+	 *  frames from a superseded socket. */
+	void FsdkWsDeliverText(const FFsdkWsSocketRef& Wrapper, const FString& Text)
+	{
+		FScopeLock Lock(&GFsdkWsLock);
+		if (GFsdkWsActive != Wrapper)
+		{
+			return; // stale socket (superseded by a newer connect)
+		}
+		if (GFsdkWsOnText)
+		{
+			GFsdkWsOnText(Text);
+		}
+		else
+		{
+			GFsdkWsPreSinkBuffer.Add(Text);
+		}
+	}
+
+	/** Game thread: signal the drop once (skipped entirely for a deliberate
+	 *  core-initiated close — the core already knows). */
+	void FsdkWsDeliverClosed(const FFsdkWsSocketRef& Wrapper)
+	{
+		if (Wrapper->bClosedDelivered)
+		{
+			return;
+		}
+		Wrapper->bClosedDelivered = true;
+		FScopeLock Lock(&GFsdkWsLock);
+		if (GFsdkWsActive != Wrapper)
+		{
+			return;
+		}
+		if (GFsdkWsOnClosed)
+		{
+			GFsdkWsOnClosed();
+		}
+		else
+		{
+			GFsdkWsPendingClosed = true;
+		}
+	}
+}
+
+extern "C"
+{
+	/** fsdk_ws_connect_fn: hand back a wrapper immediately; the real socket is
+	 *  created + connected on the game thread (connection may still be in-flight
+	 *  per the seam contract — the core learns outcomes via the feed calls). */
+	static fsdk_result FoundryFSDKWsConnect(const char* Url, void** OutHandle, void* /*UserData*/)
+	{
+		if (Url == nullptr || OutHandle == nullptr)
+		{
+			return FSDK_ERR_INVALID_ARG;
+		}
+		*OutHandle = nullptr;
+
+		FFsdkWsSocketRef Wrapper = MakeShared<FFsdkWsSocket, ESPMode::ThreadSafe>();
+		Wrapper->Url = UTF8_TO_TCHAR(Url);
+		{
+			FScopeLock Lock(&GFsdkWsLock);
+			GFsdkWsActive = Wrapper; // supersede: older sockets stop delivering
+			GFsdkWsPreSinkBuffer.Reset();
+			GFsdkWsPendingClosed = false;
+		}
+
+		AsyncTask(ENamedThreads::GameThread, [Wrapper]()
+		{
+			TSharedPtr<IWebSocket> Socket =
+				FWebSocketsModule::Get().CreateWebSocket(Wrapper->Url, FString());
+			if (!Socket.IsValid())
+			{
+				FsdkWsDeliverClosed(Wrapper);
+				return;
+			}
+			Wrapper->Socket = Socket;
+			Socket->OnConnected().AddLambda([Wrapper]()
+			{
+				Wrapper->bOpen = true;
+				for (const FString& Frame : Wrapper->PendingSends)
+				{
+					Wrapper->Socket->Send(Frame);
+				}
+				Wrapper->PendingSends.Reset();
+			});
+			Socket->OnConnectionError().AddLambda([Wrapper](const FString& /*Error*/)
+			{
+				FsdkWsDeliverClosed(Wrapper);
+			});
+			Socket->OnClosed().AddLambda([Wrapper](int32 /*Code*/, const FString& /*Reason*/, bool /*bClean*/)
+			{
+				FsdkWsDeliverClosed(Wrapper);
+			});
+			Socket->OnMessage().AddLambda([Wrapper](const FString& Message)
+			{
+				FsdkWsDeliverText(Wrapper, Message);
+			});
+			Socket->Connect();
+		});
+
+		// The core's opaque handle: a heap holder of the shared ref (released in close).
+		*OutHandle = new FFsdkWsSocketRef(Wrapper);
+		return FSDK_OK;
+	}
+
+	/** fsdk_ws_send_fn: marshal one TEXT frame to the game thread; frames sent
+	 *  before the socket opens queue in order. Transport failures surface as a
+	 *  close (the seam has no sync failure channel once connect returned). */
+	static fsdk_result FoundryFSDKWsSend(void* Handle, const char* Text, void* /*UserData*/)
+	{
+		if (Handle == nullptr || Text == nullptr)
+		{
+			return FSDK_ERR_INVALID_ARG;
+		}
+		FFsdkWsSocketRef Wrapper = *static_cast<FFsdkWsSocketRef*>(Handle);
+		FString Frame = UTF8_TO_TCHAR(Text);
+		AsyncTask(ENamedThreads::GameThread, [Wrapper, Frame = MoveTemp(Frame)]()
+		{
+			if (Wrapper->bOpen && Wrapper->Socket.IsValid())
+			{
+				Wrapper->Socket->Send(Frame);
+			}
+			else
+			{
+				Wrapper->PendingSends.Add(Frame);
+			}
+		});
+		return FSDK_OK;
+	}
+
+	/** fsdk_ws_close_fn: deliberate close — release the core's handle now, close
+	 *  the socket on the game thread, and never echo the drop back to the sink. */
+	static void FoundryFSDKWsClose(void* Handle, void* /*UserData*/)
+	{
+		if (Handle == nullptr)
+		{
+			return;
+		}
+		FFsdkWsSocketRef* Holder = static_cast<FFsdkWsSocketRef*>(Handle);
+		FFsdkWsSocketRef Wrapper = *Holder;
+		delete Holder;
+		AsyncTask(ENamedThreads::GameThread, [Wrapper]()
+		{
+			Wrapper->bClosedDelivered = true; // core asked — no closed echo
+			if (Wrapper->Socket.IsValid())
+			{
+				Wrapper->Socket->Close();
+				Wrapper->Socket.Reset();
+			}
+			FScopeLock Lock(&GFsdkWsLock);
+			if (GFsdkWsActive == Wrapper)
+			{
+				GFsdkWsActive.Reset();
+			}
+		});
+	}
+} // extern "C"
+
+void FoundryFSDKInstallWsTransport()
+{
+	fsdk_set_ws_transport(&FoundryFSDKWsConnect, &FoundryFSDKWsSend, &FoundryFSDKWsClose, nullptr);
+}
+
+void FoundryFSDKSetWsSink(TFunction<void(const FString&)> OnText, TFunction<void()> OnClosed)
+{
+	FScopeLock Lock(&GFsdkWsLock);
+	GFsdkWsOnText = MoveTemp(OnText);
+	GFsdkWsOnClosed = MoveTemp(OnClosed);
+	// Flush anything that raced ahead of registration, in arrival order.
+	if (GFsdkWsOnText)
+	{
+		for (const FString& Frame : GFsdkWsPreSinkBuffer)
+		{
+			GFsdkWsOnText(Frame);
+		}
+	}
+	GFsdkWsPreSinkBuffer.Reset();
+	if (GFsdkWsPendingClosed && GFsdkWsOnClosed)
+	{
+		GFsdkWsPendingClosed = false;
+		GFsdkWsOnClosed();
+	}
+}
+
+void FoundryFSDKClearWsSink()
+{
+	FScopeLock Lock(&GFsdkWsLock);
+	GFsdkWsOnText = nullptr;
+	GFsdkWsOnClosed = nullptr;
+	GFsdkWsPreSinkBuffer.Reset();
+	GFsdkWsPendingClosed = false;
+}
+
 void FoundryFSDKInstallHttpTransport()
 {
 	fsdk_set_http_transport(&FoundryFSDKHttpTransport, nullptr);
@@ -192,5 +423,6 @@ void FoundryFSDKInstallLogSink()
 void FoundryFSDKShutdownBridges()
 {
 	fsdk_set_http_transport(nullptr, nullptr);
+	fsdk_set_ws_transport(nullptr, nullptr, nullptr, nullptr);
 	fsdk_set_log_sink(nullptr, nullptr);
 }

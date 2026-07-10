@@ -252,16 +252,21 @@ fsdk_result fsdk_request_match(fsdk_client* client,
 
     /* POST {base_url}/v1/fmms/tickets with { "queueId", "attributes" }. fid's
      * TicketRequest.attributes is a raw JSON STRING field, so attrs_json is
-     * embedded as a JSON string value (escaped), or null when absent. */
+     * embedded as a JSON string value (escaped), or null when absent. The queue
+     * key is caller-supplied and OPAQUE to the SDK (fid resolves queue UUID, name,
+     * or FRN "frn:fmms:<org>:queue/<game>/<mode>") - escape it too, never splice
+     * a raw string into the JSON. */
     char body[1280];
+    char queue_escaped[320];
+    json_escape(queue, queue_escaped, sizeof(queue_escaped));
     if (attrs_json != NULL && attrs_json[0] != '\0') {
         char attrs_escaped[768];
         json_escape(attrs_json, attrs_escaped, sizeof(attrs_escaped));
         snprintf(body, sizeof(body),
-                 "{\"queueId\":\"%s\",\"attributes\":\"%s\"}", queue, attrs_escaped);
+                 "{\"queueId\":\"%s\",\"attributes\":\"%s\"}", queue_escaped, attrs_escaped);
     } else {
         snprintf(body, sizeof(body),
-                 "{\"queueId\":\"%s\",\"attributes\":null}", queue);
+                 "{\"queueId\":\"%s\",\"attributes\":null}", queue_escaped);
     }
 
     char* resp = NULL;

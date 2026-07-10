@@ -202,6 +202,31 @@ int fsdk_secret_load(const char* key, char** out_value);
 int fsdk_secret_delete(const char* key);
 
 /* -------------------------------------------------------------------------- */
+/* Internal WS dispatch (routes through fsdk_set_ws_transport).                */
+/* Implemented in fsdk.c. FSDK_NOT_IMPLEMENTED when no transport installed.    */
+/* -------------------------------------------------------------------------- */
+
+fsdk_result fsdk_dispatch_ws_connect(const char* url, void** out_handle);
+fsdk_result fsdk_dispatch_ws_send(void* handle, const char* text);
+void fsdk_dispatch_ws_close(void* handle);
+
+/* Chat keepalive cadence (defined in chat.c; the platform edge idles at 60s).
+ * Internal-only: tests shrink it. */
+extern long long fsdk_chat_ping_interval_ms; /* default 25000 */
+
+/* Chat session state (client-side FRC rooms). Lifetime bound to its client. */
+struct fsdk_chat {
+    fsdk_client* client;         /* Borrowed: token + base url (must outlive).  */
+    void*        ws_handle;      /* Host-owned socket handle (NULL when down).  */
+    int          ws_authed;      /* auth.ok seen on the current socket.         */
+    int          room_joined;    /* room.sub.ok seen for room_id.               */
+    char         room_id[64];    /* Target room UUID (set by join_global).      */
+    long long    last_ping_ms;   /* Host-clock stamp of the last ping sent.     */
+    fsdk_chat_message_fn on_message;
+    void*        on_message_user_data;
+};
+
+/* -------------------------------------------------------------------------- */
 /* Internal token verification. Implemented in token.c.                       */
 /* -------------------------------------------------------------------------- */
 
