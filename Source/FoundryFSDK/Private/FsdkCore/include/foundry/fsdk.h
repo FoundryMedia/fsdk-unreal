@@ -385,18 +385,33 @@ void fsdk_ticket_destroy(fsdk_ticket* ticket);
  * transport (room resolve) and the WS transport (frames).
  *
  * Flow: fsdk_chat_create -> fsdk_chat_set_message_callback ->
- *       fsdk_chat_join_global("mygame") -> [host pumps fsdk_chat_on_ws_text /
- *       on_ws_closed; game calls fsdk_chat_tick(now_ms) each frame] ->
- *       fsdk_chat_send("gg"). On socket drop the host/game re-joins (the
- *       server's history endpoint is the resync path). */
+ *       fsdk_chat_join_global("mygame") [-> fsdk_chat_join_party(partyId)] ->
+ *       [host pumps fsdk_chat_on_ws_text / on_ws_closed; game calls
+ *       fsdk_chat_tick(now_ms) each frame] -> fsdk_chat_send("gg") /
+ *       fsdk_chat_send_channel(FSDK_CHAT_CHANNEL_PARTY, "inv"). On socket drop
+ *       the host/game re-joins each channel (the server's history endpoint is
+ *       the resync path).
+ *
+ * MULTIPLEXED: every channel rides ONE realtime socket (one auth, one ping) -
+ * concurrent-chatter cost is per socket, so channels are subscriptions, never
+ * extra connections. */
 
 /* Longest accepted message body (server caps at 500 chars; +NUL headroom). */
 #define FSDK_CHAT_BODY_MAX 512
 
+/* A chat CHANNEL is a room subscription multiplexed over the one socket:
+ * GLOBAL = the game's all-players room; PARTY = the player's current party. */
 /* One room message, as fanned out by the platform. POD snapshot - copy what
  * you keep; the pointer is only valid inside the callback. */
+typedef enum fsdk_chat_channel {
+    FSDK_CHAT_CHANNEL_GLOBAL = 0,
+    FSDK_CHAT_CHANNEL_PARTY  = 1,
+    FSDK_CHAT_CHANNEL__COUNT = 2 /* internal bound - not a channel */
+} fsdk_chat_channel;
+
 typedef struct fsdk_chat_message {
     long long id;                        /* Server-assigned message id.        */
+    fsdk_chat_channel channel;           /* Which joined channel this is from. */
     char room_id[64];                    /* Room UUID, NUL-terminated.         */
     char from_subject[136];              /* Sender (ns-scoped subject).        */
     char from_foundry_id[64];            /* Sender's FID; empty if opaque.     */
@@ -424,10 +439,23 @@ void fsdk_chat_set_message_callback(fsdk_chat* chat, fsdk_chat_message_fn cb, vo
  * server confirms the subscription. Requires an authenticated client. */
 fsdk_result fsdk_chat_join_global(fsdk_chat* chat, const char* game_slug);
 
-/* Send to the joined room. FSDK_ERR_UNAVAILABLE until fsdk_chat_ready();
- * FSDK_ERR_INVALID_ARG for an empty/oversized body. The echo arrives via the
- * message callback like everyone else's copy. */
+/* Join the player's PARTY room on the SAME socket (multiplexed subscription).
+ * party_id comes from fsdk_social_my_party (or the host's own party system -
+ * the partyId seam is data-only). Same async shape as join_global:
+ * fsdk_chat_channel_ready(PARTY) flips on the server's confirmation. */
+fsdk_result fsdk_chat_join_party(fsdk_chat* chat, const char* party_id);
+
+/* Unsubscribe the party channel (player left/disbanded). The socket and the
+ * other channels stay up. NULL-safe; a no-op when not joined. */
+fsdk_result fsdk_chat_leave_party(fsdk_chat* chat);
+
+/* Send to the GLOBAL channel. FSDK_ERR_UNAVAILABLE until that channel is
+ * ready; FSDK_ERR_INVALID_ARG for an empty/oversized body. The echo arrives
+ * via the message callback like everyone else's copy. */
 fsdk_result fsdk_chat_send(fsdk_chat* chat, const char* body);
+
+/* Send to a specific joined channel (the multi-tab chat box). */
+fsdk_result fsdk_chat_send_channel(fsdk_chat* chat, fsdk_chat_channel channel, const char* body);
 
 /* Drive the keepalive: call each frame/tick with a monotonic millisecond clock;
  * the core pings the socket every ~25s (the platform edge idles out at 60s). */
@@ -437,8 +465,73 @@ fsdk_result fsdk_chat_tick(fsdk_chat* chat, long long now_ms);
 void fsdk_chat_on_ws_text(fsdk_chat* chat, const char* text);
 void fsdk_chat_on_ws_closed(fsdk_chat* chat);
 
-/* Whether the room subscription is live (auth.ok + room.sub.ok both seen). */
+/* Whether the GLOBAL channel is live (auth.ok + its room.sub.ok both seen). */
 int fsdk_chat_ready(const fsdk_chat* chat);
+
+/* Whether a specific channel's subscription is live. */
+int fsdk_chat_channel_ready(const fsdk_chat* chat, fsdk_chat_channel channel);
+
+/* -------------------------------------------------------------------------- */
+/* CLIENT SOCIAL API (in-game friends list, party discovery, whisper/DMs)     */
+/* -------------------------------------------------------------------------- */
+/* The deliberate, redacted in-game social surface (fid GameScope carve-out):
+ * a ROOT-namespace player token READS the friends list, its own party, and the
+ * whisper (DM) surface. Graph mutations (add/remove friend, block, party
+ * create/invite, presence) remain account-session-only - the launcher owns
+ * them; this SDK cannot reach them by design. Whisper is POLL-based (call
+ * fsdk_dm_* on your own cadence; player sessions never receive dm frames on
+ * the realtime socket). All calls are synchronous over the HTTP transport -
+ * drive them from a worker thread, never the game thread. */
+
+/* One friend, with EFFECTIVE presence (invisible/stale read as offline). */
+typedef struct fsdk_friend {
+    char foundry_id[64];      /* The friend's platform id.                    */
+    char display_name[128];   /* Resolved display name.                       */
+    char username[64];        /* Unique handle.                               */
+    char presence[16];        /* online|idle|away|dnd|offline                 */
+    char presence_game[128];  /* Running game title (empty when none).        */
+} fsdk_friend;
+
+/* Fetch the player's friends. Fills up to capacity entries; *out_count gets
+ * the number written. FSDK_ERR_UNAUTHORIZED on a rejected token. */
+fsdk_result fsdk_social_friends(fsdk_client* client,
+                                fsdk_friend* out, size_t capacity, size_t* out_count);
+
+/* The player's current party id, or an empty string when not in a party.
+ * This id is fsdk_chat_join_party's input (and the FMMS ticket partyId seam). */
+fsdk_result fsdk_social_my_party(fsdk_client* client, char* out_party_id, size_t out_sz);
+
+/* Longest accepted whisper body (server caps at 2000 chars; +NUL headroom). */
+#define FSDK_DM_BODY_MAX 2048
+
+/* One whisper conversation summary (newest activity first from the server). */
+typedef struct fsdk_dm_conversation {
+    char foundry_id[64];      /* The other side (a friend).                   */
+    char display_name[128];
+    char presence[16];
+    char last_body[256];      /* Preview of the newest message (truncated).   */
+    long long unread;         /* Unread count from them.                      */
+    int last_from_me;         /* 1 when the newest message is the caller's.   */
+} fsdk_dm_conversation;
+
+/* One whisper message, caller-oriented (from_me flips the bubble side). */
+typedef struct fsdk_dm_message {
+    long long id;
+    int from_me;
+    int unsent;               /* Retracted tombstone - body is empty.         */
+    char body[FSDK_DM_BODY_MAX];
+    char created_at[40];      /* ISO-8601 server stamp.                       */
+} fsdk_dm_message;
+
+/* Conversation list / one conversation's newest page (newest first) / send /
+ * mark that friend's messages read. friend_foundry_id must be the id of an
+ * ACCEPTED friend - anything else is a uniform FSDK_ERR_NO_MATCH (404). */
+fsdk_result fsdk_dm_conversations(fsdk_client* client,
+                                  fsdk_dm_conversation* out, size_t capacity, size_t* out_count);
+fsdk_result fsdk_dm_history(fsdk_client* client, const char* friend_foundry_id,
+                            fsdk_dm_message* out, size_t capacity, size_t* out_count);
+fsdk_result fsdk_dm_send(fsdk_client* client, const char* friend_foundry_id, const char* body);
+fsdk_result fsdk_dm_mark_read(fsdk_client* client, const char* friend_foundry_id);
 
 /* -------------------------------------------------------------------------- */
 /* SERVER API (runs in the dedicated server - our trusted box)               */

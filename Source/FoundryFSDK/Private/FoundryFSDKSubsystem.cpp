@@ -56,6 +56,7 @@ struct FFsdkCoreState
 	 *  (broadcasting into Blueprint while holding it invites re-entry). */
 	struct FChatMsgCopy
 	{
+		EFoundryChatChannel Channel = EFoundryChatChannel::Global;
 		FString DisplayName;
 		FString FoundryId;
 		FString Body;
@@ -93,6 +94,8 @@ extern "C"
 			return;
 		}
 		FFsdkCoreState::FChatMsgCopy Copy;
+		Copy.Channel = Message->channel == FSDK_CHAT_CHANNEL_PARTY
+			? EFoundryChatChannel::Party : EFoundryChatChannel::Global;
 		Copy.DisplayName = UTF8_TO_TCHAR(Message->display_name);
 		Copy.FoundryId = UTF8_TO_TCHAR(Message->from_foundry_id);
 		Copy.Body = UTF8_TO_TCHAR(Message->body);
@@ -478,7 +481,61 @@ void UFoundryFSDKSubsystem::StartChatJoin()
 	});
 }
 
-void UFoundryFSDKSubsystem::SendChat(const FString& Body)
+void UFoundryFSDKSubsystem::JoinPartyChat(const FString& PartyId)
+{
+	// The party channel is a SUBSCRIPTION on the global chat's socket - the
+	// join worker multiplexes it through the same handle (creating the handle
+	// if the game joined party chat first). No second connection ever.
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || PartyId.IsEmpty())
+	{
+		OnPartyChatStateChanged.Broadcast(false);
+		return;
+	}
+	if (!ChatTickHandle.IsValid())
+	{
+		ChatTickHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UFoundryFSDKSubsystem::ChatDriverTick), 0.25f);
+	}
+	Async(EAsyncExecution::Thread, [CoreRef, PartyId]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->Chat == nullptr)
+		{
+			if (fsdk_chat_create(CoreRef->Client, &CoreRef->Chat) != FSDK_OK)
+			{
+				return;
+			}
+			fsdk_chat_set_message_callback(CoreRef->Chat,
+				&FoundryFSDKChatMessageThunk, CoreRef.Get());
+		}
+		const fsdk_result Result = fsdk_chat_join_party(CoreRef->Chat, TCHAR_TO_UTF8(*PartyId));
+		if (Result != FSDK_OK)
+		{
+			UE_LOG(LogFoundryFSDK, Warning, TEXT("Party chat join failed: %s"),
+				UTF8_TO_TCHAR(fsdk_result_str(Result)));
+		}
+	});
+}
+
+void UFoundryFSDKSubsystem::LeavePartyChat()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return;
+	}
+	Async(EAsyncExecution::Thread, [CoreRef]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->Chat != nullptr)
+		{
+			(void)fsdk_chat_leave_party(CoreRef->Chat);
+		}
+	});
+}
+
+void UFoundryFSDKSubsystem::SendChatToChannel(EFoundryChatChannel Channel, const FString& Body)
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
 	if (!CoreRef.IsValid() || CoreRef->Chat == nullptr)
@@ -486,14 +543,16 @@ void UFoundryFSDKSubsystem::SendChat(const FString& Body)
 		OnChatSendComplete.Broadcast(EFoundryFsdkResult::Unavailable);
 		return;
 	}
+	const fsdk_chat_channel CoreChannel = Channel == EFoundryChatChannel::Party
+		? FSDK_CHAT_CHANNEL_PARTY : FSDK_CHAT_CHANNEL_GLOBAL;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, Body, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, CoreChannel, Body, WeakThis]()
 	{
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			Result = CoreRef->Chat != nullptr
-				? fsdk_chat_send(CoreRef->Chat, TCHAR_TO_UTF8(*Body))
+				? fsdk_chat_send_channel(CoreRef->Chat, CoreChannel, TCHAR_TO_UTF8(*Body))
 				: FSDK_ERR_UNAVAILABLE;
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
@@ -504,6 +563,11 @@ void UFoundryFSDKSubsystem::SendChat(const FString& Body)
 			}
 		});
 	});
+}
+
+void UFoundryFSDKSubsystem::SendChat(const FString& Body)
+{
+	SendChatToChannel(EFoundryChatChannel::Global, Body);
 }
 
 void UFoundryFSDKSubsystem::LeaveChat()
@@ -521,6 +585,11 @@ void UFoundryFSDKSubsystem::LeaveChat()
 		bChatReady = false;
 		OnChatStateChanged.Broadcast(false);
 	}
+	if (bPartyChatReady)
+	{
+		bPartyChatReady = false;
+		OnPartyChatStateChanged.Broadcast(false);
+	}
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
 	if (!CoreRef.IsValid())
 	{
@@ -534,6 +603,212 @@ void UFoundryFSDKSubsystem::LeaveChat()
 			fsdk_chat_destroy(CoreRef->Chat); // closes the socket via the WS seam
 			CoreRef->Chat = nullptr;
 		}
+	});
+}
+
+// ── In-game social (redacted reads + whisper over fid GameScope) ────────────
+// Same worker-thread shape as the matchmaking calls: the core ABI is blocking
+// HTTP, so every refresh runs off-thread and broadcasts back on the game
+// thread. The server enforces the redaction - these can only ever read the
+// friends list / own party and use the friends-only whisper surface.
+
+void UFoundryFSDKSubsystem::RefreshFriends()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnFriendsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		TArray<fsdk_friend> Buf;
+		Buf.SetNum(64); // server caps friends at 50
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_friends(CoreRef->Client, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryFriend> Friends;
+		Friends.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryFriend F;
+			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+			F.Username = UTF8_TO_TCHAR(Buf[i].username);
+			F.Presence = UTF8_TO_TCHAR(Buf[i].presence);
+			F.PresenceGame = UTF8_TO_TCHAR(Buf[i].presence_game);
+			Friends.Add(MoveTemp(F));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Friends = MoveTemp(Friends)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnFriendsUpdated.Broadcast(ToBlueprintResult(Result), Friends);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshParty()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnPartyUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		char PartyId[64] = {0};
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_my_party(CoreRef->Client, PartyId, sizeof(PartyId));
+		}
+		const FString Party = UTF8_TO_TCHAR(PartyId);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Party]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPartyUpdated.Broadcast(ToBlueprintResult(Result), Party);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshConversations()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnConversationsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		TArray<fsdk_dm_conversation> Buf;
+		Buf.SetNum(64);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_dm_conversations(CoreRef->Client, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryDmConversation> Conversations;
+		Conversations.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryDmConversation C;
+			C.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+			C.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+			C.Presence = UTF8_TO_TCHAR(Buf[i].presence);
+			C.LastBody = UTF8_TO_TCHAR(Buf[i].last_body);
+			C.Unread = static_cast<int64>(Buf[i].unread);
+			C.bLastFromMe = Buf[i].last_from_me != 0;
+			Conversations.Add(MoveTemp(C));
+		}
+		AsyncTask(ENamedThreads::GameThread,
+			[WeakThis, Result, Conversations = MoveTemp(Conversations)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnConversationsUpdated.Broadcast(ToBlueprintResult(Result), Conversations);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshWhisperHistory(const FString& FriendFoundryId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnWhisperHistoryUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FriendFoundryId, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId, WeakThis]()
+	{
+		// fsdk_dm_message carries a 2KB body buffer - heap, never the stack.
+		TArray<fsdk_dm_message> Buf;
+		Buf.SetNum(64);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_dm_history(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId),
+				Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryDmMessage> Messages;
+		Messages.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryDmMessage M;
+			M.Id = static_cast<int64>(Buf[i].id);
+			M.bFromMe = Buf[i].from_me != 0;
+			M.bUnsent = Buf[i].unsent != 0;
+			M.Body = UTF8_TO_TCHAR(Buf[i].body);
+			M.CreatedAt = UTF8_TO_TCHAR(Buf[i].created_at);
+			Messages.Add(MoveTemp(M));
+		}
+		AsyncTask(ENamedThreads::GameThread,
+			[WeakThis, Result, FriendFoundryId, Messages = MoveTemp(Messages)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnWhisperHistoryUpdated.Broadcast(
+					ToBlueprintResult(Result), FriendFoundryId, Messages);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::SendWhisper(const FString& FriendFoundryId, const FString& Body)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnWhisperSendComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated);
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId, Body, WeakThis]()
+	{
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_dm_send(CoreRef->Client,
+				TCHAR_TO_UTF8(*FriendFoundryId), TCHAR_TO_UTF8(*Body));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnWhisperSendComplete.Broadcast(ToBlueprintResult(Result));
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::MarkWhisperRead(const FString& FriendFoundryId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		return;
+	}
+	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		(void)fsdk_dm_mark_read(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId));
 	});
 }
 
@@ -555,6 +830,7 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 	}
 
 	bool bReadyNow = bChatReady;
+	bool bPartyReadyNow = bPartyChatReady;
 	if (CoreRef->CS.TryLock())
 	{
 		if (CoreRef->Chat != nullptr)
@@ -570,6 +846,8 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 			fsdk_chat_tick(CoreRef->Chat,
 				static_cast<long long>(FPlatformTime::Seconds() * 1000.0));
 			bReadyNow = fsdk_chat_ready(CoreRef->Chat) != 0;
+			bPartyReadyNow =
+				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_PARTY) != 0;
 		}
 		CoreRef->CS.Unlock();
 	}
@@ -590,8 +868,14 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 		CoreRef->ChatMessages.Reset();
 		for (const FFsdkCoreState::FChatMsgCopy& Msg : Msgs)
 		{
-			OnChatMessage.Broadcast(Msg.DisplayName, Msg.FoundryId, Msg.Body);
+			OnChatMessage.Broadcast(Msg.Channel, Msg.DisplayName, Msg.FoundryId, Msg.Body);
 		}
+	}
+
+	if (bPartyReadyNow != bPartyChatReady)
+	{
+		bPartyChatReady = bPartyReadyNow;
+		OnPartyChatStateChanged.Broadcast(bPartyChatReady);
 	}
 
 	if (bReadyNow != bChatReady)

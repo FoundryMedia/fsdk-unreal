@@ -73,10 +73,104 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFound
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryLoginEvent, EFoundryFsdkResult, Result, const FString&, DisplayName);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FFoundryLoggedOutEvent);
 
+/** Blueprint-facing chat channel, mirrors fsdk_chat_channel from the C ABI.
+ *  Every channel is a room subscription MULTIPLEXED over the one realtime
+ *  socket - adding a channel never adds a connection. */
+UENUM(BlueprintType)
+enum class EFoundryChatChannel : uint8
+{
+	Global UMETA(DisplayName = "Global"),
+	Party  UMETA(DisplayName = "Party")
+};
+
+/** One friend from the redacted in-game social read (fid GameScope). */
+USTRUCT(BlueprintType)
+struct FFoundryFriend
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString FoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString DisplayName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Username;
+
+	/** Effective presence: online|idle|away|dnd|offline (invisible reads offline). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Presence;
+
+	/** Running game title, empty when none ("In game: Conquest"). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString PresenceGame;
+};
+
+/** One whisper conversation summary (newest activity first). */
+USTRUCT(BlueprintType)
+struct FFoundryDmConversation
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString FoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString DisplayName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Presence;
+
+	/** Preview of the newest message (truncated server text). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString LastBody;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int64 Unread = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bLastFromMe = false;
+};
+
+/** One whisper message, caller-oriented (bFromMe flips the bubble side). */
+USTRUCT(BlueprintType)
+struct FFoundryDmMessage
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int64 Id = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bFromMe = false;
+
+	/** Retracted tombstone - body is empty; render an "unsent" quip. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bUnsent = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Body;
+
+	/** ISO-8601 server stamp. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString CreatedAt;
+};
+
 // Chat delegates - broadcast on the GAME THREAD.
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryChatMessageEvent,
-	const FString&, DisplayName, const FString&, FoundryId, const FString&, Body);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FFoundryChatMessageEvent,
+	EFoundryChatChannel, Channel, const FString&, DisplayName, const FString&, FoundryId, const FString&, Body);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryChatStateEvent, bool, bReady);
+
+// Social delegates - broadcast on the GAME THREAD.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendsEvent,
+	EFoundryFsdkResult, Result, const TArray<FFoundryFriend>&, Friends);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyEvent,
+	EFoundryFsdkResult, Result, const FString&, PartyId);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryConversationsEvent,
+	EFoundryFsdkResult, Result, const TArray<FFoundryDmConversation>&, Conversations);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryWhisperHistoryEvent,
+	EFoundryFsdkResult, Result, const FString&, FriendId, const TArray<FFoundryDmMessage>&, Messages);
 
 /**
  * FoundryFSDK game-client facade.
@@ -158,32 +252,109 @@ public:
 	void JoinGlobalChat(const FString& GameSlug);
 
 	/**
-	 * Send to the joined room (500-char server cap). The echo arrives via
+	 * Join the player's PARTY chat room on the SAME socket (multiplexed - no
+	 * second connection). PartyId comes from RefreshParty / OnPartyUpdated.
+	 * Async: OnPartyChatStateChanged(true) when the subscription is live. On a
+	 * socket drop the party subscription rides the global rejoin automatically.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void JoinPartyChat(const FString& PartyId);
+
+	/** Unsubscribe the party channel (left/disbanded). Socket + global stay up. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void LeavePartyChat();
+
+	/**
+	 * Send to the GLOBAL channel (500-char server cap). The echo arrives via
 	 * OnChatMessage like everyone else's copy. Async: OnChatSendComplete fires
 	 * with the result (Unavailable until the room subscription is live).
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
 	void SendChat(const FString& Body);
 
-	/** Leave the room + close the socket (stops the auto-rejoin). */
+	/** Send to a specific joined channel (the multi-tab chat box). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void SendChatToChannel(EFoundryChatChannel Channel, const FString& Body);
+
+	/** Leave every room + close the socket (stops the auto-rejoin). */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
 	void LeaveChat();
 
-	/** Whether the room subscription is live (game-thread snapshot). */
+	/** Whether the GLOBAL subscription is live (game-thread snapshot). */
 	UFUNCTION(BlueprintPure, Category = "Foundry|Chat")
 	bool IsChatReady() const { return bChatReady; }
+
+	/** Whether a channel's subscription is live (game-thread snapshot). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|Chat")
+	bool IsChatChannelReady(EFoundryChatChannel Channel) const
+	{
+		return Channel == EFoundryChatChannel::Party ? bPartyChatReady : bChatReady;
+	}
 
 	/** Every room message (including the caller's own echo). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
 	FFoundryChatMessageEvent OnChatMessage;
 
-	/** Room subscription went live (true) / dropped (false; auto-rejoin runs). */
+	/** GLOBAL subscription went live (true) / dropped (false; auto-rejoin runs). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
 	FFoundryChatStateEvent OnChatStateChanged;
+
+	/** PARTY subscription went live / dropped. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryChatStateEvent OnPartyChatStateChanged;
 
 	/** One SendChat finished (Ok, Unavailable before ready, InvalidArg, ...). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
 	FFoundryFsdkResultEvent OnChatSendComplete;
+
+	// ── In-game social (redacted READ surface + whisper; fid GameScope) ─────────
+	// The player token can LIST friends, discover its own party, and use the
+	// whisper (DM) surface - graph mutations (add/remove/block/invite/presence)
+	// are launcher/account territory and are server-rejected for game tokens.
+	// Whisper is POLL-based: refresh on your own cadence (tab-open + a timer);
+	// player sockets never receive dm push frames.
+
+	/** Fetch the friends list (name + presence). Async: OnFriendsUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshFriends();
+
+	/** Discover the player's current party (empty PartyId when none). Async:
+	 *  OnPartyUpdated - feed a non-empty PartyId to JoinPartyChat. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshParty();
+
+	/** Fetch whisper conversation summaries. Async: OnConversationsUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshConversations();
+
+	/** Fetch the newest page of one conversation (newest first). Async:
+	 *  OnWhisperHistoryUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshWhisperHistory(const FString& FriendFoundryId);
+
+	/** Whisper a friend (2000-char server cap; friends-only, server-enforced).
+	 *  Async: OnWhisperSendComplete. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void SendWhisper(const FString& FriendFoundryId, const FString& Body);
+
+	/** Mark everything that friend sent as read (fire-and-forget). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void MarkWhisperRead(const FString& FriendFoundryId);
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFriendsEvent OnFriendsUpdated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryPartyEvent OnPartyUpdated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryConversationsEvent OnConversationsUpdated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryWhisperHistoryEvent OnWhisperHistoryUpdated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFsdkResultEvent OnWhisperSendComplete;
 
 	// ── Auto-login (DEFAULT: the Foundry launcher's session daemon) ─────────────
 	// The game gets a short-lived matchmaking token from the launcher's session
@@ -291,6 +462,7 @@ private:
 	// The fsdk_chat handle lives inside FFsdkCoreState (same lock as the client -
 	// the chat borrows the client's token). These mirrors are game-thread-only.
 	bool bChatReady = false;
+	bool bPartyChatReady = false;   // PARTY channel mirror (same driver tick)
 	bool bChatDesired = false;      // JoinGlobalChat sets, LeaveChat clears
 	bool bChatJoinInFlight = false; // one join worker at a time
 	FString ChatGameSlug;           // the slug the auto-rejoin re-joins

@@ -102,6 +102,139 @@ static inline int json_extract_string(const char* body, const char* key,
     return (*v == '"');
 }
 
+/* Extract a number field into *out. Returns 1 on success. */
+static inline int fsdk_json_extract_ll(const char* body, const char* key, long long* out) {
+    const char* v = json_value_after(body, key);
+    char* end = NULL;
+    if (v == NULL || out == NULL) {
+        return 0;
+    }
+    *out = strtoll(v, &end, 10);
+    return end != v;
+}
+
+/* Extract a boolean field. Returns 1 on success. */
+static inline int fsdk_json_extract_bool(const char* body, const char* key, int* out) {
+    const char* v = json_value_after(body, key);
+    if (v == NULL || out == NULL) {
+        return 0;
+    }
+    if (strncmp(v, "true", 4) == 0) {
+        *out = 1;
+        return 1;
+    }
+    if (strncmp(v, "false", 5) == 0) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Escape a string into a JSON string literal body (no surrounding quotes).
+ * Returns 0 if the escaped form would overflow out. */
+static inline int fsdk_json_escape(const char* s, char* out, size_t out_sz) {
+    size_t o = 0;
+    size_t i;
+    if (s == NULL || out == NULL || out_sz == 0) {
+        return 0;
+    }
+    for (i = 0; s[i] != '\0'; i++) {
+        const char c = s[i];
+        const char* rep = NULL;
+        switch (c) {
+            case '"':  rep = "\\\""; break;
+            case '\\': rep = "\\\\"; break;
+            case '\n': rep = "\\n"; break;
+            case '\r': rep = "\\r"; break;
+            case '\t': rep = "\\t"; break;
+            default: break;
+        }
+        if (rep != NULL) {
+            if (o + 2 >= out_sz) {
+                return 0;
+            }
+            out[o++] = rep[0];
+            out[o++] = rep[1];
+        } else {
+            if (o + 1 >= out_sz) {
+                return 0;
+            }
+            out[o++] = c;
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+/* Top-level JSON-array iteration over a response body: find the '[' of the
+ * "data" array (or the body's first '['), then step object-by-object. Each
+ * object is COPIED (bounded) into the caller's buffer so the flat readers can
+ * run on a NUL-terminated slice. String-aware brace matching; not a validator
+ * (the platform emits well-formed JSON; a malformed body just ends the walk). */
+static inline const char* fsdk_json_array_start(const char* body) {
+    const char* v = json_value_after(body, "data");
+    if (v == NULL) {
+        v = body;
+    }
+    if (v == NULL) {
+        return NULL;
+    }
+    v = strchr(v, '[');
+    return v == NULL ? NULL : v + 1;
+}
+
+/* From cursor, copy the next {...} object into obj_buf and return the cursor
+ * just past it; NULL when the array is exhausted (or the object overflows). */
+static inline const char* fsdk_json_next_object(const char* cursor,
+                                                char* obj_buf, size_t obj_buf_sz) {
+    const char* p = cursor;
+    const char* start;
+    int depth = 0;
+    int in_string = 0;
+    size_t n;
+    if (p == NULL || obj_buf == NULL || obj_buf_sz == 0) {
+        return NULL;
+    }
+    while (*p != '\0' && *p != '{') {
+        if (*p == ']') {
+            return NULL; /* end of array */
+        }
+        p++;
+    }
+    if (*p == '\0') {
+        return NULL;
+    }
+    start = p;
+    for (; *p != '\0'; p++) {
+        const char c = *p;
+        if (in_string) {
+            if (c == '\\' && p[1] != '\0') {
+                p++;
+            } else if (c == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = 1;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                n = (size_t)(p - start) + 1;
+                if (n + 1 > obj_buf_sz) {
+                    return NULL; /* oversized object - stop the walk */
+                }
+                memcpy(obj_buf, start, n);
+                obj_buf[n] = '\0';
+                return p + 1;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Opaque handle definitions                                                  */
 /* -------------------------------------------------------------------------- */
@@ -214,13 +347,19 @@ void fsdk_dispatch_ws_close(void* handle);
  * Internal-only: tests shrink it. */
 extern long long fsdk_chat_ping_interval_ms; /* default 25000 */
 
-/* Chat session state (client-side FRC rooms). Lifetime bound to its client. */
+/* One multiplexed channel slot: a room subscription on the shared socket. */
+typedef struct fsdk_chat_room_slot {
+    char room_id[64];            /* Resolved room UUID; empty = channel unused. */
+    int  joined;                 /* room.sub.ok seen on the current socket.     */
+} fsdk_chat_room_slot;
+
+/* Chat session state (client-side FRC rooms). Lifetime bound to its client.
+ * ONE socket, N channel subscriptions (fsdk_chat_channel indexes rooms[]). */
 struct fsdk_chat {
     fsdk_client* client;         /* Borrowed: token + base url (must outlive).  */
     void*        ws_handle;      /* Host-owned socket handle (NULL when down).  */
     int          ws_authed;      /* auth.ok seen on the current socket.         */
-    int          room_joined;    /* room.sub.ok seen for room_id.               */
-    char         room_id[64];    /* Target room UUID (set by join_global).      */
+    fsdk_chat_room_slot rooms[FSDK_CHAT_CHANNEL__COUNT];
     long long    last_ping_ms;   /* Host-clock stamp of the last ping sent.     */
     fsdk_chat_message_fn on_message;
     void*        on_message_user_data;
