@@ -485,6 +485,67 @@ fsdk_result fsdk_social_redeem_code(fsdk_client* client, const char* code) {
 
 /* ---- parties ------------------------------------------------------------------ */
 
+/* Parse one PartyResponse object into a header; resolve the leader's display
+ * name by scanning the nested members array for the leader's foundryId. */
+static void parse_party_header(const char* obj, fsdk_party* out) {
+    long long max_size = 0;
+    const char* mcursor;
+    char mobj[512];
+    memset(out, 0, sizeof(*out));
+    (void)json_extract_string(obj, "id", out->id, sizeof(out->id));
+    (void)json_extract_string(obj, "leaderFoundryId", out->leader_foundry_id,
+                              sizeof(out->leader_foundry_id));
+    if (fsdk_json_extract_ll(obj, "maxSize", &max_size)) {
+        out->max_size = (int)max_size;
+    }
+    mcursor = json_value_after(obj, "members");
+    mcursor = mcursor != NULL ? strchr(mcursor, '[') : NULL;
+    mcursor = mcursor != NULL ? mcursor + 1 : NULL;
+    while ((mcursor = fsdk_json_next_object(mcursor, mobj, sizeof(mobj))) != NULL) {
+        char member_id[64];
+        (void)json_extract_string(mobj, "foundryId", member_id, sizeof(member_id));
+        if (strcmp(member_id, out->leader_foundry_id) == 0) {
+            (void)json_extract_string(mobj, "displayName", out->leader_display_name,
+                                      sizeof(out->leader_display_name));
+            return;
+        }
+    }
+}
+
+fsdk_result fsdk_social_party_invites(fsdk_client* client,
+                                      fsdk_party* out, size_t capacity, size_t* out_count) {
+    char* body = NULL;
+    const char* cursor;
+    char* obj;
+    fsdk_result rc;
+    size_t n = 0;
+
+    if (out == NULL || capacity == 0 || out_count == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_count = 0;
+    rc = social_get(client, SOCIAL_PARTIES_PATH "/invites", &body);
+    if (rc != FSDK_OK) {
+        return rc;
+    }
+    obj = (char*)malloc(SOCIAL_OBJ_BUF);
+    if (obj == NULL) {
+        fsdk_string_free(body);
+        return FSDK_ERR_INTERNAL;
+    }
+    cursor = fsdk_json_array_start(body);
+    while (n < capacity && (cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
+        parse_party_header(obj, &out[n]);
+        if (out[n].id[0] != '\0') {
+            n++;
+        }
+    }
+    free(obj);
+    fsdk_string_free(body);
+    *out_count = n;
+    return FSDK_OK;
+}
+
 fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
                                    fsdk_party_member* members, size_t capacity,
                                    size_t* out_count) {
@@ -510,15 +571,9 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
     }
     cursor = fsdk_json_array_start(body);
     if ((cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
-        long long max_size = 0;
         const char* mcursor;
         char mobj[512];
-        (void)json_extract_string(obj, "id", out_party->id, sizeof(out_party->id));
-        (void)json_extract_string(obj, "leaderFoundryId", out_party->leader_foundry_id,
-                                  sizeof(out_party->leader_foundry_id));
-        if (fsdk_json_extract_ll(obj, "maxSize", &max_size)) {
-            out_party->max_size = (int)max_size;
-        }
+        parse_party_header(obj, out_party);
         /* walk the nested members array inside the copied party object */
         mcursor = json_value_after(obj, "members");
         mcursor = mcursor != NULL ? strchr(mcursor, '[') : NULL;

@@ -193,6 +193,10 @@ struct FFoundryParty
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	FString LeaderFoundryId;
 
+	/** The leader's display name (the inviter, on invite rows). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString LeaderDisplayName;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	int32 MaxSize = 0;
 
@@ -205,6 +209,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendsEvent,
 	EFoundryFsdkResult, Result, const TArray<FFoundryFriend>&, Friends);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyEvent,
 	EFoundryFsdkResult, Result, const FFoundryParty&, Party);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyInvitesEvent,
+	EFoundryFsdkResult, Result, const TArray<FFoundryParty>&, Invites);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundrySocialActionEvent,
 	EFoundryFsdkResult, Result, const FString&, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendCodeEvent,
@@ -403,6 +409,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void RefreshParty();
 
+	/** Parties the player is INVITED to (LeaderDisplayName names the inviter).
+	 *  Async: OnPartyInvitesUpdated. Poll it with the social panel open. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshPartyInvites();
+
 	/** Create a party. Async: OnSocialActionComplete ("party.create"), then an
 	 *  automatic RefreshParty delivers the new party via OnPartyUpdated. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
@@ -452,6 +463,9 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryPartyEvent OnPartyUpdated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryPartyInvitesEvent OnPartyInvitesUpdated;
 
 	/** One social mutation finished; Action names it ("friend.request", ...). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")

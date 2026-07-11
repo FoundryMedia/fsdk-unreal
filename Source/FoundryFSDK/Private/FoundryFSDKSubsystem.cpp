@@ -695,6 +695,7 @@ void UFoundryFSDKSubsystem::RefreshParty()
 		{
 			Party.PartyId = UTF8_TO_TCHAR(Header.id);
 			Party.LeaderFoundryId = UTF8_TO_TCHAR(Header.leader_foundry_id);
+			Party.LeaderDisplayName = UTF8_TO_TCHAR(Header.leader_display_name);
 			Party.MaxSize = Header.max_size;
 			Party.Members.Reserve(static_cast<int32>(Count));
 			for (size_t i = 0; i < Count; i++)
@@ -712,6 +713,47 @@ void UFoundryFSDKSubsystem::RefreshParty()
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
 				Self->OnPartyUpdated.Broadcast(ToBlueprintResult(Result), Party);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshPartyInvites()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnPartyInvitesUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		TArray<fsdk_party> Buf;
+		Buf.SetNum(8);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_party_invites(CoreRef->Client, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryParty> Invites;
+		Invites.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryParty P;
+			P.PartyId = UTF8_TO_TCHAR(Buf[i].id);
+			P.LeaderFoundryId = UTF8_TO_TCHAR(Buf[i].leader_foundry_id);
+			P.LeaderDisplayName = UTF8_TO_TCHAR(Buf[i].leader_display_name);
+			P.MaxSize = Buf[i].max_size;
+			Invites.Add(MoveTemp(P));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Invites = MoveTemp(Invites)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPartyInvitesUpdated.Broadcast(ToBlueprintResult(Result), Invites);
 			}
 		});
 	});

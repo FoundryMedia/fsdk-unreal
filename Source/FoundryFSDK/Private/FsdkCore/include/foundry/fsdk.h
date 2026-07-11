@@ -535,6 +535,7 @@ typedef struct fsdk_party_member {
 typedef struct fsdk_party {
     char id[64];
     char leader_foundry_id[64];
+    char leader_display_name[128]; /* resolved from the member list */
     int  max_size;
 } fsdk_party;
 
@@ -546,6 +547,11 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
 /* Party lifecycle - create returns the new party's id (feed it straight to
  * fsdk_chat_join_party); invite is by username and requires an ACCEPTED
  * friendship (server-enforced). */
+/* Parties the player is INVITED to (accept/decline from the in-game panel).
+ * Header rows only; leader_display_name names the inviter. */
+fsdk_result fsdk_social_party_invites(fsdk_client* client,
+                                      fsdk_party* out, size_t capacity, size_t* out_count);
+
 fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, size_t out_sz);
 fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
                                      const char* username);
