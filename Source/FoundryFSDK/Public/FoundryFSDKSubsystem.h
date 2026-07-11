@@ -162,11 +162,53 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FFoundryChatMessageEvent,
 	EFoundryChatChannel, Channel, const FString&, DisplayName, const FString&, FoundryId, const FString&, Body);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryChatStateEvent, bool, bReady);
 
+/** One party member. State is "JOINED" or "INVITED" (pending accept). */
+USTRUCT(BlueprintType)
+struct FFoundryPartyMember
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString FoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString DisplayName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Username;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString State;
+};
+
+/** The player's current party (PartyId empty when not in one). */
+USTRUCT(BlueprintType)
+struct FFoundryParty
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString PartyId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString LeaderFoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int32 MaxSize = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	TArray<FFoundryPartyMember> Members;
+};
+
 // Social delegates - broadcast on the GAME THREAD.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendsEvent,
 	EFoundryFsdkResult, Result, const TArray<FFoundryFriend>&, Friends);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyEvent,
-	EFoundryFsdkResult, Result, const FString&, PartyId);
+	EFoundryFsdkResult, Result, const FFoundryParty&, Party);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundrySocialActionEvent,
+	EFoundryFsdkResult, Result, const FString&, Action);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendCodeEvent,
+	EFoundryFsdkResult, Result, const FString&, Code);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryConversationsEvent,
 	EFoundryFsdkResult, Result, const TArray<FFoundryDmConversation>&, Conversations);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryWhisperHistoryEvent,
@@ -307,21 +349,81 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
 	FFoundryFsdkResultEvent OnChatSendComplete;
 
-	// ── In-game social (redacted READ surface + whisper; fid GameScope) ─────────
-	// The player token can LIST friends, discover its own party, and use the
-	// whisper (DM) surface - graph mutations (add/remove/block/invite/presence)
-	// are launcher/account territory and are server-rejected for game tokens.
-	// Whisper is POLL-based: refresh on your own cadence (tab-open + a timer);
-	// player sockets never receive dm push frames.
+	// ── In-game social (full social session; fid GameScope 2026-07-11) ──────────
+	// The game session is a FULL social citizen: list/pending/add/accept/remove/
+	// block friends, share + redeem friend codes, run the party lifecycle, and
+	// use the whole whisper (DM) surface - every call server-authorized as the
+	// player. Still launcher/account territory (server-rejected for game
+	// tokens): presence SETTING and friend-code ROTATION. Whisper + all reads
+	// are POLL-based: refresh on your own cadence (tab-open + a timer with idle
+	// controls); player sockets never receive dm push frames.
 
 	/** Fetch the friends list (name + presence). Async: OnFriendsUpdated. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void RefreshFriends();
 
-	/** Discover the player's current party (empty PartyId when none). Async:
+	/** Fetch INCOMING friend requests (people awaiting your accept). Async:
+	 *  OnPendingUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshPendingRequests();
+
+	/** Send a friend request by unique username. Async: OnSocialActionComplete
+	 *  ("friend.request"; NoMatch = no such user, Protocol = throttled). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void SendFriendRequest(const FString& Username);
+
+	/** Accept an incoming request (RequesterFoundryId from OnPendingUpdated).
+	 *  Async: OnSocialActionComplete ("friend.accept"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void AcceptFriendRequest(const FString& RequesterFoundryId);
+
+	/** Remove a friend. Async: OnSocialActionComplete ("friend.remove"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RemoveFriend(const FString& FriendFoundryId);
+
+	/** Block / unblock a player. Async: OnSocialActionComplete
+	 *  ("friend.block" / "friend.unblock"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void BlockPlayer(const FString& FoundryId);
+
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void UnblockPlayer(const FString& FoundryId);
+
+	/** The player's own share code (FDY-XXXXXX). Async: OnFriendCodeReady. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void GetMyFriendCode();
+
+	/** Redeem a pasted code/link code for an INSTANT friendship. Async:
+	 *  OnSocialActionComplete ("code.redeem"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RedeemFriendCode(const FString& Code);
+
+	/** Snapshot the player's current party (empty PartyId when none). Async:
 	 *  OnPartyUpdated - feed a non-empty PartyId to JoinPartyChat. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void RefreshParty();
+
+	/** Create a party. Async: OnSocialActionComplete ("party.create"), then an
+	 *  automatic RefreshParty delivers the new party via OnPartyUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void CreateParty();
+
+	/** Invite a FRIEND by username to a party you lead. Async:
+	 *  OnSocialActionComplete ("party.invite"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void InviteToParty(const FString& PartyId, const FString& Username);
+
+	/** Accept / decline a party invite; leave a joined party. Async:
+	 *  OnSocialActionComplete ("party.accept"/"party.decline"/"party.leave"),
+	 *  each followed by an automatic RefreshParty. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void AcceptPartyInvite(const FString& PartyId);
+
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void DeclinePartyInvite(const FString& PartyId);
+
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void LeaveParty(const FString& PartyId);
 
 	/** Fetch whisper conversation summaries. Async: OnConversationsUpdated. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
@@ -344,8 +446,20 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryFriendsEvent OnFriendsUpdated;
 
+	/** Incoming friend requests (accept with AcceptFriendRequest). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFriendsEvent OnPendingUpdated;
+
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryPartyEvent OnPartyUpdated;
+
+	/** One social mutation finished; Action names it ("friend.request", ...). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundrySocialActionEvent OnSocialActionComplete;
+
+	/** GetMyFriendCode finished. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFriendCodeEvent OnFriendCodeReady;
 
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryConversationsEvent OnConversationsUpdated;
@@ -448,6 +562,12 @@ private:
 	/** Kick one (re)join attempt on a worker (guarded by bChatJoinInFlight). */
 	void StartChatJoin();
 
+	/** Run one social mutation on a worker and broadcast OnSocialActionComplete.
+	 *  Call returns an fsdk_result as int32 (the C ABI stays out of this header);
+	 *  bRefreshPartyOnOk chains a RefreshParty after party-shape changes. */
+	void RunSocialAction(const FString& Action, bool bRefreshPartyOnOk,
+		TFunction<int32(FFsdkCoreState&)> Call);
+
 	/** Ref-counted fsdk-core handles + serialization lock (owned). */
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> Core;
 
@@ -455,6 +575,7 @@ private:
 	// lock, so they never block on an in-flight network call). Updated in the
 	// game-thread completion of Login/Refresh/TryResume/SetPlayerToken/Logout.
 	bool bIsLoggedIn = false;
+	bool bLauncherSession = false; // token came from the daemon handoff (re-mintable)
 	FString CachedDisplayName;
 	FString CachedFoundryId;
 

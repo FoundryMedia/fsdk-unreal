@@ -474,14 +474,17 @@ int fsdk_chat_channel_ready(const fsdk_chat* chat, fsdk_chat_channel channel);
 /* -------------------------------------------------------------------------- */
 /* CLIENT SOCIAL API (in-game friends list, party discovery, whisper/DMs)     */
 /* -------------------------------------------------------------------------- */
-/* The deliberate, redacted in-game social surface (fid GameScope carve-out):
- * a ROOT-namespace player token READS the friends list, its own party, and the
- * whisper (DM) surface. Graph mutations (add/remove friend, block, party
- * create/invite, presence) remain account-session-only - the launcher owns
- * them; this SDK cannot reach them by design. Whisper is POLL-based (call
- * fsdk_dm_* on your own cadence; player sessions never receive dm frames on
- * the realtime socket). All calls are synchronous over the HTTP transport -
- * drive them from a worker thread, never the game thread. */
+/* The in-game social session (fid GameScope, 2026-07-11): a ROOT-namespace
+ * player token is a FULL social citizen - friends list/pending/add/accept/
+ * remove/block, friend codes (mine/redeem), parties (create/invite/accept/
+ * decline/leave), and the whole whisper (DM) surface, all server-authorized as
+ * the player's own foundryId. Still outside the game session: presence PUT
+ * (the launcher owns presence), friend-code ROTATE (the account-level kill
+ * switch), and everything non-social (billing/support/account). Whisper is
+ * POLL-based (call fsdk_dm_* on your own cadence; player sessions never
+ * receive dm frames on the realtime socket). All calls are synchronous over
+ * the HTTP transport - drive them from a worker thread, never the game
+ * thread. */
 
 /* One friend, with EFFECTIVE presence (invisible/stale read as offline). */
 typedef struct fsdk_friend {
@@ -497,9 +500,58 @@ typedef struct fsdk_friend {
 fsdk_result fsdk_social_friends(fsdk_client* client,
                                 fsdk_friend* out, size_t capacity, size_t* out_count);
 
+/* Incoming friend requests (people waiting on the player's accept). Same row
+ * shape as the friends list; presence_game is not populated for pendings. */
+fsdk_result fsdk_social_pending(fsdk_client* client,
+                                fsdk_friend* out, size_t capacity, size_t* out_count);
+
+/* Friend-graph mutations - server-authorized as the player themselves. A
+ * non-friend/unknown target is a uniform FSDK_ERR_NO_MATCH. */
+fsdk_result fsdk_social_friend_request(fsdk_client* client, const char* username);
+fsdk_result fsdk_social_friend_accept(fsdk_client* client, const char* requester_foundry_id);
+fsdk_result fsdk_social_friend_remove(fsdk_client* client, const char* friend_foundry_id);
+fsdk_result fsdk_social_friend_block(fsdk_client* client, const char* foundry_id);
+fsdk_result fsdk_social_friend_unblock(fsdk_client* client, const char* foundry_id);
+
+/* The player's own share code (FDY-XXXXXX; shareable in chat) / redeem one for
+ * an INSTANT friendship (the code is the owner's consent). Rotating the code
+ * stays a launcher/account op (the leak kill switch). */
+fsdk_result fsdk_social_friend_code(fsdk_client* client, char* out_code, size_t out_sz);
+fsdk_result fsdk_social_redeem_code(fsdk_client* client, const char* code);
+
 /* The player's current party id, or an empty string when not in a party.
  * This id is fsdk_chat_join_party's input (and the FMMS ticket partyId seam). */
 fsdk_result fsdk_social_my_party(fsdk_client* client, char* out_party_id, size_t out_sz);
+
+/* A party member, enriched with profile. state = "INVITED" | "JOINED". */
+typedef struct fsdk_party_member {
+    char foundry_id[64];
+    char display_name[128];
+    char username[64];
+    char state[12];
+} fsdk_party_member;
+
+/* The party header (id empty when the player is not in a party). */
+typedef struct fsdk_party {
+    char id[64];
+    char leader_foundry_id[64];
+    int  max_size;
+} fsdk_party;
+
+/* Full party snapshot: header + members. *out_count = members written. */
+fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
+                                   fsdk_party_member* members, size_t capacity,
+                                   size_t* out_count);
+
+/* Party lifecycle - create returns the new party's id (feed it straight to
+ * fsdk_chat_join_party); invite is by username and requires an ACCEPTED
+ * friendship (server-enforced). */
+fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, size_t out_sz);
+fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
+                                     const char* username);
+fsdk_result fsdk_social_party_accept(fsdk_client* client, const char* party_id);
+fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id);
+fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
 
 /* Longest accepted whisper body (server caps at 2000 chars; +NUL headroom). */
 #define FSDK_DM_BODY_MAX 2048

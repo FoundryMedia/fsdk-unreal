@@ -436,8 +436,9 @@ void UFoundryFSDKSubsystem::StartChatJoin()
 		});
 
 	const FString Slug = ChatGameSlug;
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, Slug, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, Slug, bCanReHandoff, WeakThis]()
 	{
 		fsdk_result Result;
 		{
@@ -458,6 +459,20 @@ void UFoundryFSDKSubsystem::StartChatJoin()
 			if (Result == FSDK_OK)
 			{
 				Result = fsdk_chat_join_global(CoreRef->Chat, TCHAR_TO_UTF8(*Slug));
+			}
+			if (Result == FSDK_ERR_UNAUTHORIZED && bCanReHandoff)
+			{
+				// The 15-min daemon token expired mid-session: transparently re-mint
+				// from the launcher and retry the join once. Worker thread - the
+				// pipe read is allowed to block here.
+				FString Fresh;
+				if (FoundryFSDKReadLauncherToken(Fresh) && !Fresh.IsEmpty())
+				{
+					if (fsdk_set_player_token(CoreRef->Client, TCHAR_TO_UTF8(*Fresh)) == FSDK_OK)
+					{
+						Result = fsdk_chat_join_global(CoreRef->Chat, TCHAR_TO_UTF8(*Slug));
+					}
+				}
 			}
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
@@ -659,26 +674,239 @@ void UFoundryFSDKSubsystem::RefreshParty()
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		OnPartyUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		OnPartyUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundryParty());
 		return;
 	}
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
-		char PartyId[64] = {0};
+		fsdk_party Header;
+		TArray<fsdk_party_member> Buf;
+		Buf.SetNum(16);
+		size_t Count = 0;
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_my_party(CoreRef->Client, PartyId, sizeof(PartyId));
+			Result = fsdk_social_party_info(CoreRef->Client, &Header, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
 		}
-		const FString Party = UTF8_TO_TCHAR(PartyId);
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Party]()
+		FFoundryParty Party;
+		if (Result == FSDK_OK)
+		{
+			Party.PartyId = UTF8_TO_TCHAR(Header.id);
+			Party.LeaderFoundryId = UTF8_TO_TCHAR(Header.leader_foundry_id);
+			Party.MaxSize = Header.max_size;
+			Party.Members.Reserve(static_cast<int32>(Count));
+			for (size_t i = 0; i < Count; i++)
+			{
+				FFoundryPartyMember M;
+				M.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+				M.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+				M.Username = UTF8_TO_TCHAR(Buf[i].username);
+				M.State = UTF8_TO_TCHAR(Buf[i].state);
+				Party.Members.Add(MoveTemp(M));
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Party = MoveTemp(Party)]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
 				Self->OnPartyUpdated.Broadcast(ToBlueprintResult(Result), Party);
 			}
 		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshPendingRequests()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnPendingUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		TArray<fsdk_friend> Buf;
+		Buf.SetNum(64);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_pending(CoreRef->Client, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryFriend> Pending;
+		Pending.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryFriend F;
+			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+			F.Username = UTF8_TO_TCHAR(Buf[i].username);
+			F.Presence = UTF8_TO_TCHAR(Buf[i].presence);
+			Pending.Add(MoveTemp(F));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Pending = MoveTemp(Pending)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPendingUpdated.Broadcast(ToBlueprintResult(Result), Pending);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RunSocialAction(const FString& Action, bool bRefreshPartyOnOk,
+	TFunction<int32(FFsdkCoreState&)> Call)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnSocialActionComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, Action);
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, Action, bRefreshPartyOnOk,
+		Call = MoveTemp(Call)]()
+	{
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = static_cast<fsdk_result>(Call(*CoreRef));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Action, bRefreshPartyOnOk]()
+		{
+			UFoundryFSDKSubsystem* Self = WeakThis.Get();
+			if (Self == nullptr)
+			{
+				return;
+			}
+			Self->OnSocialActionComplete.Broadcast(ToBlueprintResult(Result), Action);
+			if (bRefreshPartyOnOk && Result == FSDK_OK)
+			{
+				Self->RefreshParty();
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::SendFriendRequest(const FString& Username)
+{
+	RunSocialAction(TEXT("friend.request"), false, [Username](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_friend_request(State.Client, TCHAR_TO_UTF8(*Username));
+	});
+}
+
+void UFoundryFSDKSubsystem::AcceptFriendRequest(const FString& RequesterFoundryId)
+{
+	RunSocialAction(TEXT("friend.accept"), false, [RequesterFoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_friend_accept(State.Client, TCHAR_TO_UTF8(*RequesterFoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::RemoveFriend(const FString& FriendFoundryId)
+{
+	RunSocialAction(TEXT("friend.remove"), false, [FriendFoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_friend_remove(State.Client, TCHAR_TO_UTF8(*FriendFoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::BlockPlayer(const FString& FoundryId)
+{
+	RunSocialAction(TEXT("friend.block"), false, [FoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_friend_block(State.Client, TCHAR_TO_UTF8(*FoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::UnblockPlayer(const FString& FoundryId)
+{
+	RunSocialAction(TEXT("friend.unblock"), false, [FoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_friend_unblock(State.Client, TCHAR_TO_UTF8(*FoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::GetMyFriendCode()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnFriendCodeReady.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		char Code[24] = {0};
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_friend_code(CoreRef->Client, Code, sizeof(Code));
+		}
+		const FString CodeStr = UTF8_TO_TCHAR(Code);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, CodeStr]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnFriendCodeReady.Broadcast(ToBlueprintResult(Result), CodeStr);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::RedeemFriendCode(const FString& Code)
+{
+	RunSocialAction(TEXT("code.redeem"), false, [Code](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_redeem_code(State.Client, TCHAR_TO_UTF8(*Code));
+	});
+}
+
+void UFoundryFSDKSubsystem::CreateParty()
+{
+	RunSocialAction(TEXT("party.create"), true, [](FFsdkCoreState& State)
+	{
+		char PartyId[64];
+		return (int32)fsdk_social_party_create(State.Client, PartyId, sizeof(PartyId));
+	});
+}
+
+void UFoundryFSDKSubsystem::InviteToParty(const FString& PartyId, const FString& Username)
+{
+	RunSocialAction(TEXT("party.invite"), false, [PartyId, Username](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_invite(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*Username));
+	});
+}
+
+void UFoundryFSDKSubsystem::AcceptPartyInvite(const FString& PartyId)
+{
+	RunSocialAction(TEXT("party.accept"), true, [PartyId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_accept(State.Client, TCHAR_TO_UTF8(*PartyId));
+	});
+}
+
+void UFoundryFSDKSubsystem::DeclinePartyInvite(const FString& PartyId)
+{
+	RunSocialAction(TEXT("party.decline"), true, [PartyId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_decline(State.Client, TCHAR_TO_UTF8(*PartyId));
+	});
+}
+
+void UFoundryFSDKSubsystem::LeaveParty(const FString& PartyId)
+{
+	RunSocialAction(TEXT("party.leave"), true, [PartyId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_leave(State.Client, TCHAR_TO_UTF8(*PartyId));
 	});
 }
 
@@ -1125,6 +1353,10 @@ void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
 			}
 			if (bGot)
 			{
+				// A daemon-minted token is short-lived AND re-mintable: remember the
+				// source so long-lived surfaces (the chat socket) can transparently
+				// re-handoff when it expires mid-session.
+				Self->bLauncherSession = true;
 				Self->SetPlayerToken(Token); // sets logged-in + broadcasts OnLoginComplete(Ok)
 			}
 			else
