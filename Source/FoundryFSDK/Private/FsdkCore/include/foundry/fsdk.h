@@ -34,7 +34,7 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 #define FSDK_VERSION_MAJOR 0
-#define FSDK_VERSION_MINOR 1
+#define FSDK_VERSION_MINOR 2
 #define FSDK_VERSION_PATCH 0
 
 /* Returns a static, NUL-terminated semantic version string (e.g. "0.1.0").
@@ -610,8 +610,51 @@ void fsdk_server_destroy(fsdk_server* server);
 fsdk_result fsdk_server_ready(fsdk_server* server);
 
 /* Send a health ping to the orchestrator (-> Agones SDK Health()). Call on a
- * regular interval; missing pings cause the orchestrator to recycle the box. */
+ * regular interval; missing pings cause the orchestrator to recycle the box.
+ * Equivalent to fsdk_server_health_ex(server, -1): occupancy stays UNREPORTED,
+ * so the idle-empty policy can never trip (fail-safe toward keeping the
+ * server). Prefer fsdk_server_health_ex - reporting occupancy is what arms
+ * the default-ON idle protection (and is the CCU telemetry seam). */
 fsdk_result fsdk_server_health(fsdk_server* server);
+
+/* Health ping + occupancy report. player_count is the number of connected
+ * players right now (>= 0), or -1 for unknown/not reported (any negative is
+ * treated as -1). The core accumulates the wall-clock time this server has
+ * been ALLOCATED-but-empty across successive calls (measured between calls -
+ * no fixed tick is assumed) and, once it crosses the idle-policy threshold
+ * (fsdk_server_set_idle_policy; default ON, 300s, allocated-only), latches
+ * the ONE winding-down state shared with the platform's drain flag
+ * (fsdk_server_check_drain reports it; fsdk_server_should_exit keys off it).
+ * An unknown player_count never accumulates idle time, and a count > 0
+ * resets the accumulator. The core NEVER exits the process - the host owns
+ * process lifetime: poll fsdk_server_should_exit and exit yourself, calling
+ * fsdk_server_shutdown on the way out. Returns the health POST's result;
+ * the policy accounting runs regardless of transport failures. */
+fsdk_result fsdk_server_health_ex(fsdk_server* server, int player_count);
+
+/* Configure the idle-empty auto-drain policy (leak protection: an ALLOCATED
+ * server nobody is on burns money - ours on free tiers, the dev's on paid).
+ * The policy is ENABLED BY DEFAULT (idle_seconds 300, require_allocated 1):
+ * a game that reports occupancy via fsdk_server_health_ex is leak-proof with
+ * zero further code.
+ *   idle_seconds       continuous allocated-but-empty wall-clock before the
+ *                      server winds down; <= 0 DISABLES the policy.
+ *   require_allocated  non-zero (the default - keep it) means only an
+ *                      ALLOCATED server accumulates idle time. A warm Ready
+ *                      replica is always empty; idle-exiting it would churn
+ *                      the fleet forever.
+ * Calling this resets the idle accumulator. */
+fsdk_result fsdk_server_set_idle_policy(fsdk_server* server, int idle_seconds,
+                                        int require_allocated);
+
+/* Should the host exit now? *out_should_exit = 1 once the server is winding
+ * down (platform drain OR tripped idle policy) AND the last reported
+ * player_count was exactly 0. Unknown occupancy (never reported / -1) is
+ * NEVER "empty" - a host that reports no occupancy must keep doing its own
+ * emptiness check off fsdk_server_check_drain. On 1: stop the game loop,
+ * call fsdk_server_shutdown, and exit the process (the host owns process
+ * lifetime; the core never calls exit()). */
+fsdk_result fsdk_server_should_exit(fsdk_server* server, int* out_should_exit);
 
 /* Validate a connecting player's match token. This is the admission GATE: the
  * server calls it for each joining player BEFORE accepting their netcode
@@ -628,13 +671,15 @@ fsdk_result fsdk_server_validate_player(fsdk_server* server,
  * caller with fsdk_string_free. */
 fsdk_result fsdk_server_get_binding(fsdk_server* server, char** out_json);
 
-/* Check whether the platform asked this server to DRAIN (wind down gracefully:
- * stop admitting players, call fsdk_server_shutdown once the session empties).
- * The platform stamps the fcg/drain annotation on this GameServer; this reads it
- * through the local sidecar. Latching: once seen, *out_draining stays 1 forever
- * (a transient sidecar failure never un-drains). Call on the same cadence as
- * fsdk_server_health. On a read failure *out_draining still reports the latched
- * value and the error is returned. */
+/* Check whether this server is WINDING DOWN (stop admitting players, call
+ * fsdk_server_shutdown once the session empties). *out_draining reports the
+ * ONE latched winding-down state, fed from BOTH sources: the platform's
+ * fcg/drain annotation (a customer/operator drain - read here through the
+ * local sidecar) and the idle-empty policy tripping (fsdk_server_health_ex).
+ * Latching: once seen, *out_draining stays 1 forever (a transient sidecar
+ * failure never un-drains). Call on the same cadence as fsdk_server_health.
+ * On a read failure *out_draining still reports the latched value and the
+ * error is returned. */
 fsdk_result fsdk_server_check_drain(fsdk_server* server, int* out_draining);
 
 /* Whether this GameServer has been ALLOCATED (a match was placed on it). Pure

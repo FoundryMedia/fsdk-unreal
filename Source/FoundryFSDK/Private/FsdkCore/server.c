@@ -6,6 +6,12 @@
  *   - Read this server's match binding.
  *   - VALIDATE joining players' FID-signed match tokens (the admission gate);
  *     drop unauthenticated traffic.
+ *   - The IDLE-EMPTY auto-drain policy (default ON): an ALLOCATED server that
+ *     sits empty past a threshold winds itself down, so every game on the
+ *     platform is leak-proof by default - the game only reports occupancy
+ *     (fsdk_server_health_ex) and exits when fsdk_server_should_exit says so.
+ *     The core NEVER calls exit(): the host owns process lifetime, same seam
+ *     philosophy as the HTTP transport and JWT verifier.
  *
  * SECURITY: the server identity used for any FMMS callbacks is a SHORT-LIVED,
  * SCOPED token minted at allocation time and injected via the environment -
@@ -78,6 +84,23 @@ static void fsdk_sleep_ms(unsigned int ms) {
     ts.tv_sec  = (time_t)(ms / 1000u);
     ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
     nanosleep(&ts, NULL);
+#endif
+}
+
+/* Monotonic milliseconds for the idle-empty accumulator (GetTickCount64 /
+ * CLOCK_MONOTONIC - never jumps with wall-clock adjustments). Tests pin it via
+ * fsdk_test_now_ms so the policy is exercised without sleeping. */
+long long fsdk_test_now_ms = -1;
+static long long fsdk_now_ms(void) {
+    if (fsdk_test_now_ms >= 0) {
+        return fsdk_test_now_ms;
+    }
+#ifdef _WIN32
+    return (long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
 #endif
 }
 
@@ -171,6 +194,14 @@ fsdk_result fsdk_server_create(const char* agones_addr, fsdk_server** out_server
         return FSDK_ERR_INTERNAL;
     }
 
+    /* Idle-empty auto-drain policy: ON BY DEFAULT so a dev who writes no code
+     * still can't leak an allocated-but-empty server. The game arms it simply
+     * by reporting occupancy (fsdk_server_health_ex); unreported occupancy
+     * (-1) never idle-exits - fail-safe toward keeping the server. */
+    server->idle_seconds = FSDK_IDLE_DEFAULT_SECONDS;
+    server->idle_require_allocated = 1;
+    server->last_player_count = -1;
+
     /* TODO(server identity): read the short-lived, scoped server token from the
      * environment (injected at allocation time) - NEVER bake it in. */
     *out_server = server;
@@ -198,12 +229,74 @@ fsdk_result fsdk_server_ready(fsdk_server* server) {
 }
 
 fsdk_result fsdk_server_health(fsdk_server* server) {
+    /* Occupancy unreported (-1): plain health ping, the idle policy stays disarmed. */
+    return fsdk_server_health_ex(server, -1);
+}
+
+fsdk_result fsdk_server_health_ex(fsdk_server* server, int player_count) {
     if (server == NULL) {
         return FSDK_ERR_INVALID_ARG;
     }
+    if (player_count < -1) {
+        player_count = -1; /* any negative report = unknown */
+    }
+
+    /* Idle-empty accounting FIRST (independent of the sidecar transport): accumulate
+     * the wall-clock spent allocated-but-empty BETWEEN successive health calls - no
+     * fixed tick is assumed; the interval is whatever cadence the host actually calls
+     * at. Unknown occupancy (-1) never accumulates (fail-safe: keep the server); a
+     * non-empty report resets. Tripping latches the ONE winding-down state
+     * (server->draining, shared with the platform drain flag); the host polls
+     * fsdk_server_should_exit and owns the exit - the core never exits. */
+    long long now = fsdk_now_ms();
+    long long delta = (server->last_health_ms > 0 && now > server->last_health_ms)
+            ? now - server->last_health_ms : 0;
+    server->last_health_ms = now;
+    server->last_player_count = player_count;
+
+    int eligible = !server->draining
+            && server->idle_seconds > 0
+            && player_count == 0
+            && (!server->idle_require_allocated || server->allocated);
+    if (eligible) {
+        server->idle_empty_ms += delta;
+        if (server->idle_empty_ms >= (long long)server->idle_seconds * 1000) {
+            server->draining = 1;
+            fsdk_log(FSDK_LOG_WARN,
+                     "fsdk: idle-empty policy tripped - winding down (allocated but empty past threshold)");
+        }
+    } else {
+        server->idle_empty_ms = 0;
+    }
+
     /* Agones SDK Health() ping. Call on a fixed interval; the orchestrator recycles the box if
      * pings stop. */
     return agones_post(server, "/health");
+}
+
+fsdk_result fsdk_server_set_idle_policy(fsdk_server* server, int idle_seconds,
+                                        int require_allocated) {
+    if (server == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    server->idle_seconds = idle_seconds;
+    server->idle_require_allocated = (require_allocated != 0);
+    server->idle_empty_ms = 0; /* a policy change restarts the window */
+    fsdk_log(FSDK_LOG_INFO, idle_seconds > 0 ? "fsdk: idle-empty policy set"
+                                             : "fsdk: idle-empty policy DISABLED");
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_server_should_exit(fsdk_server* server, int* out_should_exit) {
+    if (server == NULL || out_should_exit == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    /* Winding down (platform drain OR idle trip) AND the last reported occupancy was
+     * exactly 0. -1 (never reported) is NOT empty - a host that reports no occupancy
+     * keeps doing its own emptiness check off check_drain. The core never exits the
+     * process; on 1 the host calls fsdk_server_shutdown and exits itself. */
+    *out_should_exit = (server->draining && server->last_player_count == 0) ? 1 : 0;
+    return FSDK_OK;
 }
 
 fsdk_result fsdk_server_validate_player(fsdk_server* server,
@@ -288,6 +381,8 @@ fsdk_result fsdk_server_check_drain(fsdk_server* server, int* out_draining) {
     if (server == NULL || out_draining == NULL) {
         return FSDK_ERR_INVALID_ARG;
     }
+    /* server->draining is the ONE winding-down latch: fed here by the platform's
+     * fcg/drain annotation AND by the idle-empty policy (fsdk_server_health_ex). */
     *out_draining = server->draining;
     if (server->draining) {
         return FSDK_OK; /* latched - no further sidecar reads needed */

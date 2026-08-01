@@ -262,12 +262,29 @@ struct fsdk_server {
                             * (fsdk_server_check_drain). Latched - never cleared.  */
     int allocated;         /* 1 once this GameServer was seen in state Allocated
                             * (a match was placed on it). Latched by the /gameserver
-                            * reads (check_drain / get_binding). Drives the game's
-                            * idle-empty auto-shutdown - a WARM Ready replica is
-                            * always empty and must never idle-exit.               */
+                            * reads (check_drain / get_binding). Gates the CORE's
+                            * idle-empty policy - a WARM Ready replica is always
+                            * empty and must never idle-exit.                      */
+
+    /* Idle-empty auto-drain policy (default ON - fsdk_server_set_idle_policy).
+     * The accumulator lives HERE so every game on the platform is leak-proof by
+     * default; the game only reports occupancy (fsdk_server_health_ex). */
+    int idle_seconds;           /* Threshold (s) of continuous allocated-but-empty
+                                 * wall-clock before winding down; <= 0 disables.
+                                 * Default FSDK_IDLE_DEFAULT_SECONDS.              */
+    int idle_require_allocated; /* Only an ALLOCATED server accumulates idle time
+                                 * (default 1 - warm Ready replicas never exit).   */
+    int last_player_count;      /* Last occupancy report from health_ex; -1 = never
+                                 * reported (then should_exit is never 1).         */
+    long long idle_empty_ms;    /* Accumulated continuous allocated-but-empty ms.  */
+    long long last_health_ms;   /* Monotonic stamp of the previous health_ex call;
+                                 * 0 = none yet (first call contributes no time).  */
     /* TODO(server identity): hold the short-lived, scoped server token minted
      * at allocation time, read from the environment - NEVER baked in. */
 };
+
+/* Idle-empty policy default: ON, 300s (see fsdk_server_set_idle_policy). */
+#define FSDK_IDLE_DEFAULT_SECONDS 300
 
 struct fsdk_ticket {
     char*             ticket_id; /* Server-assigned ticket id (copied).        */
@@ -323,6 +340,11 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
  * like Agones's own SDKs). Internal-only: tests shrink these for speed. */
 extern unsigned int fsdk_agones_retry_interval_ms; /* default 1000 */
 extern int          fsdk_agones_retry_max_attempts; /* default 30  */
+
+/* Test override for the server's monotonic clock, in ms (defined in server.c).
+ * -1 = use the real clock. Lets the idle-empty policy tests advance time
+ * deterministically instead of sleeping. Internal-only. */
+extern long long fsdk_test_now_ms; /* default -1 */
 
 /* -------------------------------------------------------------------------- */
 /* Internal secret-store dispatch (routes through fsdk_set_secret_store).      */

@@ -99,12 +99,34 @@ bool FFoundryFSDKServer::GetBindingAndReady()
 	return true;
 }
 
-void FFoundryFSDKServer::Health()
+void FFoundryFSDKServer::Health(int32 NumPlayers)
 {
 	if (State != nullptr && State->Server != nullptr)
 	{
-		fsdk_server_health(State->Server);
+		// Occupancy feeds the core's default-ON idle-empty auto-drain (and the CCU
+		// seam). Negative = unreported; the core then never idle-exits (fail-safe).
+		fsdk_server_health_ex(State->Server, NumPlayers < 0 ? -1 : static_cast<int>(NumPlayers));
 	}
+}
+
+void FFoundryFSDKServer::SetIdlePolicy(float IdleSeconds, bool bRequireAllocated)
+{
+	if (State != nullptr && State->Server != nullptr)
+	{
+		const int Seconds = (IdleSeconds > 0.0f) ? FMath::Max(1, FMath::RoundToInt(IdleSeconds)) : 0;
+		fsdk_server_set_idle_policy(State->Server, Seconds, bRequireAllocated ? 1 : 0);
+	}
+}
+
+bool FFoundryFSDKServer::ShouldExit()
+{
+	if (State == nullptr || State->Server == nullptr)
+	{
+		return false;
+	}
+	int OutShouldExit = 0;
+	(void)fsdk_server_should_exit(State->Server, &OutShouldExit);
+	return OutShouldExit != 0;
 }
 
 bool FFoundryFSDKServer::IsDrainRequested()

@@ -43,8 +43,34 @@ public:
 	 *  ValidatePlayer can enforce it), then signal Agones Ready. Returns Ready's ok. */
 	bool GetBindingAndReady();
 
-	/** Agones Health() ping; call on a fixed interval. */
-	void Health();
+	/**
+	 * Agones Health() ping + occupancy report; call on a fixed interval.
+	 * NumPlayers is the current connected player count. Reporting it is what ARMS
+	 * the SDK's default-ON idle-empty auto-drain (an ALLOCATED server that sits
+	 * empty past the policy window winds itself down - leak protection for every
+	 * game with zero extra code) and is the future CCU telemetry seam. -1 (the
+	 * default) = unreported, which keeps the idle policy disarmed (fail-safe:
+	 * an unknown occupancy never idle-exits the server).
+	 */
+	void Health(int32 NumPlayers = -1);
+
+	/**
+	 * Configure the idle-empty auto-drain policy. Default is ON: 300s,
+	 * allocated-only - call this only to override. IdleSeconds <= 0 disables it.
+	 * Keep bRequireAllocated true: a warm Ready replica is always empty and must
+	 * never idle-exit (the fleet would churn forever).
+	 */
+	void SetIdlePolicy(float IdleSeconds, bool bRequireAllocated = true);
+
+	/**
+	 * True once this server is winding down (platform drain OR the idle policy
+	 * tripping) AND the last reported occupancy was 0. Poll on the Health cadence;
+	 * on true, stop the match and request engine exit - the HOST owns process
+	 * lifetime (the SDK never exits the process); Agones Shutdown fires from your
+	 * teardown path (EndPlay -> Shutdown()). Never true while occupancy is
+	 * unreported (call Health(NumPlayers) to arm it).
+	 */
+	bool ShouldExit();
 
 	/**
 	 * True once the platform asked this server to DRAIN (a customer/operator clicked Drain: the
