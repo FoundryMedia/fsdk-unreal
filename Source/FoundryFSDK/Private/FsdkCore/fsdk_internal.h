@@ -247,7 +247,20 @@ struct fsdk_client {
     int   authenticated;  /* 0 = not authenticated, 1 = authenticated.         */
     char  foundry_id[64]; /* Logged-in player's FID (set by login/refresh).     */
     char  display_name[128]; /* Display name (may be empty).                    */
+
+    /* Measured-region cache for fsdk_request_match_auto: repeated FindMatch
+     * clicks must not re-ping every region. Refreshed when older than
+     * FSDK_REGION_CACHE_TTL_MS (or empty). POD - freed with the client. */
+    fsdk_region_info regions_cache[FSDK_MAX_REGIONS];
+    size_t           regions_cache_count;
+    long long        regions_cache_at_ms; /* mono stamp; 0 = never filled.     */
 };
+
+/* Region measurement tuning (client.c). Internal-only: tests shrink/pin these. */
+#define FSDK_REGION_CACHE_TTL_MS (5 * 60 * 1000)
+#define FSDK_REGION_PING_SAMPLES_DEFAULT 2
+/* Test override for the client's monotonic clock, ms. -1 = real clock. */
+extern long long fsdk_test_client_now_ms;
 
 struct fsdk_server {
     char* agones_addr;    /* Local Agones sidecar gRPC address (copied).       */

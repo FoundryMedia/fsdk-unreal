@@ -18,12 +18,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Monotonic clock for region-ping RTT measurement. GetTickCount64's ~16ms
+ * granularity would blur real ping differences, so Windows uses QPC. */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 /* Live fid routes (FMMS = Foundry Matchmaking Service). The session probe is the
  * fid-native /v1/me/user (the proxied /v1/me drops the bearer). connection/cancel
  * routes are designed and wired here, relay-ready; fid deploys them as a follow-on
  * (until then they return "not ready"). */
 #define FSDK_PATH_ME            "/v1/me/user"
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
+#define FSDK_PATH_REGIONS       "/v1/fmms/regions"
 
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
@@ -256,11 +268,12 @@ fsdk_result fsdk_request_match(fsdk_client* client,
      * key is caller-supplied and OPAQUE to the SDK (fid resolves queue UUID, name,
      * or FRN "frn:fmms:<org>:queue/<game>/<mode>") - escape it too, never splice
      * a raw string into the JSON. */
-    char body[1280];
+    char body[2560];
     char queue_escaped[320];
     json_escape(queue, queue_escaped, sizeof(queue_escaped));
     if (attrs_json != NULL && attrs_json[0] != '\0') {
-        char attrs_escaped[768];
+        /* Sized for the auto path: a 16-region latency map + caller attrs, escaped. */
+        char attrs_escaped[2048];
         json_escape(attrs_json, attrs_escaped, sizeof(attrs_escaped));
         snprintf(body, sizeof(body),
                  "{\"queueId\":\"%s\",\"attributes\":\"%s\"}", queue_escaped, attrs_escaped);
@@ -308,6 +321,249 @@ fsdk_result fsdk_request_match(fsdk_client* client,
     *out_ticket = ticket;
     fsdk_log(FSDK_LOG_INFO, "fsdk request_match accepted");
     return FSDK_OK;
+}
+
+/* --- Match-search regions (ping-based multi-region placement) ------------- */
+
+/* Test override (-1 = real clock) so cache-TTL behavior is testable without waiting. */
+long long fsdk_test_client_now_ms = -1;
+
+static long long client_now_ms(void) {
+    if (fsdk_test_client_now_ms >= 0) {
+        return fsdk_test_client_now_ms;
+    }
+#ifdef _WIN32
+    LARGE_INTEGER freq;
+    LARGE_INTEGER count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (long long)(count.QuadPart / (freq.QuadPart / 1000));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+#endif
+}
+
+fsdk_result fsdk_list_regions(fsdk_client* client,
+                              fsdk_region_info* out_regions,
+                              size_t max_regions,
+                              size_t* out_count) {
+    if (client == NULL || out_regions == NULL || out_count == NULL || max_regions == 0) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_count = 0;
+    if (!client->authenticated) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_GET, FSDK_PATH_REGIONS,
+                                      client->player_token, NULL, &resp, &status);
+    if (r != FSDK_OK) {
+        return r;
+    }
+    if (status < 200 || status >= 300) {
+        fsdk_string_free(resp);
+        return http_status_to_result(status);
+    }
+
+    size_t count = 0;
+    const char* cursor = fsdk_json_array_start(resp);
+    char obj[768];
+    while (count < max_regions
+           && (cursor = fsdk_json_next_object(cursor, obj, sizeof(obj))) != NULL) {
+        fsdk_region_info* region = &out_regions[count];
+        memset(region, 0, sizeof(*region));
+        region->latency_ms = -1;
+        if (!json_extract_string(obj, "code", region->code, sizeof(region->code))
+                || region->code[0] == '\0') {
+            continue; /* a region without a code is unaddressable - skip */
+        }
+        json_extract_string(obj, "displayName", region->display_name, sizeof(region->display_name));
+        json_extract_string(obj, "pingUrl", region->ping_url, sizeof(region->ping_url));
+        count++;
+    }
+    fsdk_string_free(resp);
+    *out_count = count;
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_measure_regions(fsdk_region_info* regions, size_t count, int samples) {
+    if (regions == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    if (samples <= 0) {
+        samples = FSDK_REGION_PING_SAMPLES_DEFAULT;
+    }
+    for (size_t i = 0; i < count; i++) {
+        fsdk_region_info* region = &regions[i];
+        region->latency_ms = -1;
+        if (region->ping_url[0] == '\0') {
+            continue;
+        }
+        /* Warmup: pays TLS/connection setup once so the timed samples measure the
+         * round trip, not the handshake. NO bearer token - the ping host is not
+         * the platform and must never see the player's session token. */
+        long status = 0;
+        if (fsdk_http_request(region->ping_url, FSDK_HTTP_GET, "",
+                              NULL, NULL, NULL, &status) != FSDK_OK) {
+            continue;
+        }
+        long best = -1;
+        for (int s = 0; s < samples; s++) {
+            long long t0 = client_now_ms();
+            fsdk_result r = fsdk_http_request(region->ping_url, FSDK_HTTP_GET, "",
+                                              NULL, NULL, NULL, &status);
+            long long elapsed = client_now_ms() - t0;
+            if (r != FSDK_OK) {
+                continue;
+            }
+            if (best < 0 || elapsed < best) {
+                best = (long)elapsed;
+            }
+        }
+        region->latency_ms = best;
+    }
+    return FSDK_OK;
+}
+
+/* True when a top-level-ish key already appears in the caller's attrs (flat
+ * objects in practice; a nested false-positive just means we defer to the
+ * caller's value - the safe direction). */
+static int attrs_has_key(const char* attrs_json, const char* key) {
+    return attrs_json != NULL && json_value_after(attrs_json, key) != NULL;
+}
+
+/* The measured-region cache: refresh via list+measure when empty or stale. */
+static void refresh_regions_cache(fsdk_client* client) {
+    long long now = client_now_ms();
+    if (client->regions_cache_count > 0
+            && client->regions_cache_at_ms != 0
+            && now - client->regions_cache_at_ms < FSDK_REGION_CACHE_TTL_MS) {
+        return;
+    }
+    size_t count = 0;
+    fsdk_region_info fresh[FSDK_MAX_REGIONS];
+    if (fsdk_list_regions(client, fresh, FSDK_MAX_REGIONS, &count) != FSDK_OK) {
+        return; /* keep whatever we had (possibly nothing) - degrade gracefully */
+    }
+    fsdk_measure_regions(fresh, count, FSDK_REGION_PING_SAMPLES_DEFAULT);
+    memcpy(client->regions_cache, fresh, sizeof(fresh));
+    client->regions_cache_count = count;
+    client->regions_cache_at_ms = now;
+}
+
+fsdk_result fsdk_request_match_auto(fsdk_client* client,
+                                    const char* queue,
+                                    const char* attrs_json,
+                                    fsdk_ticket** out_ticket) {
+    if (client == NULL || queue == NULL || out_ticket == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    if (!client->authenticated) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+
+    refresh_regions_cache(client);
+
+    /* The best (lowest measured latency) region, if anything was measurable. */
+    const fsdk_region_info* best = NULL;
+    for (size_t i = 0; i < client->regions_cache_count; i++) {
+        const fsdk_region_info* r = &client->regions_cache[i];
+        if (r->latency_ms >= 0 && (best == NULL || r->latency_ms < best->latency_ms)) {
+            best = r;
+        }
+    }
+    if (best == NULL) {
+        /* No region list / nothing pingable: a plain submit is strictly better
+         * than failing - the matchmaker then falls back to its own ordering. */
+        return fsdk_request_match(client, queue, attrs_json, out_ticket);
+    }
+
+    /* Merge {"region","latencyMs","latencies"} with the caller's attrs. Caller
+     * keys WIN (that is the pin-a-region override), so each part is added only
+     * when absent, and the caller's object body is spliced in LAST. */
+    char merged[2048];
+    size_t off = 0;
+    int wrote_any = 0;
+    merged[off++] = '{';
+    merged[off] = '\0';
+
+    char code_escaped[128];
+    if (!attrs_has_key(attrs_json, "region")
+            && fsdk_json_escape(best->code, code_escaped, sizeof(code_escaped))) {
+        off += (size_t)snprintf(merged + off, sizeof(merged) - off,
+                                "\"region\":\"%s\"", code_escaped);
+        wrote_any = 1;
+    }
+    if (!attrs_has_key(attrs_json, "latencyMs") && off + 32 < sizeof(merged)) {
+        off += (size_t)snprintf(merged + off, sizeof(merged) - off,
+                                "%s\"latencyMs\":%ld", wrote_any ? "," : "", best->latency_ms);
+        wrote_any = 1;
+    }
+    if (!attrs_has_key(attrs_json, "latencies")) {
+        int wrote_map = 0;
+        for (size_t i = 0; i < client->regions_cache_count; i++) {
+            const fsdk_region_info* r = &client->regions_cache[i];
+            if (r->latency_ms < 0
+                    || !fsdk_json_escape(r->code, code_escaped, sizeof(code_escaped))) {
+                continue;
+            }
+            if (off + strlen(code_escaped) + 32 >= sizeof(merged)) {
+                break; /* never overflow - a truncated map is still valid JSON */
+            }
+            off += (size_t)snprintf(merged + off, sizeof(merged) - off, "%s\"%s\":%ld",
+                                    wrote_map ? "," : (wrote_any ? ",\"latencies\":{" : "\"latencies\":{"),
+                                    code_escaped, r->latency_ms);
+            wrote_map = 1;
+        }
+        if (wrote_map && off + 1 < sizeof(merged)) {
+            merged[off++] = '}';
+            merged[off] = '\0';
+            wrote_any = 1;
+        }
+    }
+
+    /* Splice the caller's object body in (its keys land LAST - they win). */
+    if (attrs_json != NULL && attrs_json[0] != '\0') {
+        const char* open = strchr(attrs_json, '{');
+        const char* close = strrchr(attrs_json, '}');
+        if (open == NULL || close == NULL || close <= open) {
+            /* Not an object we can merge into - defer entirely to the caller. */
+            return fsdk_request_match(client, queue, attrs_json, out_ticket);
+        }
+        size_t inner_len = (size_t)(close - open) - 1;
+        /* Skip a pure-whitespace body ("{}") - nothing to splice. */
+        int inner_nonempty = 0;
+        for (size_t i = 0; i < inner_len; i++) {
+            const char c = open[1 + i];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                inner_nonempty = 1;
+                break;
+            }
+        }
+        if (inner_nonempty) {
+            if (off + inner_len + 3 >= sizeof(merged)) {
+                return fsdk_request_match(client, queue, attrs_json, out_ticket);
+            }
+            if (wrote_any) {
+                merged[off++] = ',';
+            }
+            memcpy(merged + off, open + 1, inner_len);
+            off += inner_len;
+            merged[off] = '\0';
+        }
+    }
+    if (off + 2 >= sizeof(merged)) {
+        return fsdk_request_match(client, queue, attrs_json, out_ticket);
+    }
+    merged[off++] = '}';
+    merged[off] = '\0';
+
+    fsdk_log(FSDK_LOG_INFO, "fsdk request_match_auto submitting with measured regions");
+    return fsdk_request_match(client, queue, merged, out_ticket);
 }
 
 fsdk_result fsdk_poll_match(fsdk_client* client,

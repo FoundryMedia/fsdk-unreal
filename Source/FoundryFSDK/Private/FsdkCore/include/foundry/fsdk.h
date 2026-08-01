@@ -348,6 +348,44 @@ fsdk_result fsdk_set_player_token(fsdk_client* client, const char* player_token)
 /* Snapshot the logged-in identity (foundry_id/display_name) for UI. */
 fsdk_result fsdk_current_session(fsdk_client* client, fsdk_session* out);
 
+/* -------------------------------------------------------------------------- */
+/* Match-search regions (ping-based multi-region placement)                   */
+/* -------------------------------------------------------------------------- */
+/* The platform hosts servers in several regions and cycles ALL of them by
+ * default: the client measures its own latency to each (only the client can),
+ * submits the map with its ticket, and the matchmaker places in the lowest-
+ * latency region that has capacity. Values are advisory ordering input only -
+ * the server treats them as untrusted and they never widen what a queue's
+ * region policy allows. */
+
+/* A region a match search may target (from GET /v1/fmms/regions). */
+typedef struct fsdk_region_info {
+    char code[64];          /* Region code the latency map is keyed by.        */
+    char display_name[128]; /* Human name, e.g. "US East (Ohio)". May be empty.*/
+    char ping_url[256];     /* Anonymous HTTPS probe; empty = not pingable.    */
+    long latency_ms;        /* Measured RTT; -1 until fsdk_measure_regions.    */
+} fsdk_region_info;
+
+/* Upper bound on regions a client considers per search (also the list cap). */
+#define FSDK_MAX_REGIONS 16
+
+/* Fetch the regions a match could land in right now. Fills out_regions (caller
+ * storage, max_regions entries, latency_ms initialized to -1) and *out_count.
+ * Requires a prior successful authenticate. */
+fsdk_result fsdk_list_regions(fsdk_client* client,
+                              fsdk_region_info* out_regions,
+                              size_t max_regions,
+                              size_t* out_count);
+
+/* Measure HTTP RTT to each region's ping_url through the host transport: one
+ * warmup request (TLS/connection setup) then `samples` timed requests, keeping
+ * the MINIMUM. NO bearer token is ever sent to a ping host (it is not the
+ * platform). A failed/unpingable region keeps latency_ms -1. samples <= 0 uses
+ * a sensible default. Blocking - call off the game thread. */
+fsdk_result fsdk_measure_regions(fsdk_region_info* regions,
+                                 size_t count,
+                                 int samples);
+
 /* Request a match in a named queue with opaque, queue-specific attributes
  * encoded as a JSON object string (attrs_json may be NULL for none). On success
  * *out_ticket is set and owned by the caller, who frees it with
@@ -356,6 +394,18 @@ fsdk_result fsdk_request_match(fsdk_client* client,
                                const char* queue,
                                const char* attrs_json,
                                fsdk_ticket** out_ticket);
+
+/* The DEFAULT match request: list the selectable regions, ping them (cached
+ * ~5 min per client), and submit with {"region": <best>, "latencyMs": <best>,
+ * "latencies": {code: ms, ...}} merged into attrs_json. Caller-supplied keys
+ * WIN: any of region/latencyMs/latencies already present in attrs_json is left
+ * untouched (that is the "pin a region" override). If the region list cannot
+ * be fetched or nothing is pingable, degrades to a plain fsdk_request_match.
+ * Blocking (does network round-trips) - call off the game thread. */
+fsdk_result fsdk_request_match_auto(fsdk_client* client,
+                                    const char* queue,
+                                    const char* attrs_json,
+                                    fsdk_ticket** out_ticket);
 
 /* Poll the current status of a ticket. Writes the status to *out_status.
  * This is a lightweight call intended to be invoked on a timer / each frame. */

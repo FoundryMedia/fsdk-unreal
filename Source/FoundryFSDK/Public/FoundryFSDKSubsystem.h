@@ -263,9 +263,15 @@ public:
 	/**
 	 * Request a match in a named queue. AttributesJson is an opaque, queue-specific
 	 * JSON object string (may be empty). Async: broadcasts OnRequestMatchComplete.
+	 *
+	 * bAutoRegion (default true): measure latency to every selectable region (list
+	 * cached ~5 min) and submit with the map - the matchmaker then places in the
+	 * lowest-latency region with capacity. To PIN a region (or subset), put
+	 * "region" (and/or "latencies") in AttributesJson - caller keys always win -
+	 * or pass false for the legacy regionless submit.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
-	void RequestMatch(const FString& Queue, const FString& AttributesJson);
+	void RequestMatch(const FString& Queue, const FString& AttributesJson, bool bAutoRegion = true);
 
 	/** Poll the active ticket's status. Async: broadcasts OnPollMatchComplete. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")

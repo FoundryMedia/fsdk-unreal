@@ -222,7 +222,7 @@ void UFoundryFSDKSubsystem::Authenticate(const FString& PlayerToken)
 	});
 }
 
-void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& AttributesJson)
+void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& AttributesJson, bool bAutoRegion)
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
@@ -236,10 +236,13 @@ void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& At
 	const FString QueueCopy = Queue;
 	const FString AttrsCopy = AttributesJson;
 
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, QueueCopy, AttrsCopy]()
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, QueueCopy, AttrsCopy, bAutoRegion]()
 	{
 		fsdk_result R;
 		{
+			// The auto path may ping each region's probe URL on a cache miss (~once per
+			// 5 min): a few hundred ms holding the core lock, on this worker - other SDK
+			// calls briefly queue behind it, the game thread never blocks.
 			FScopeLock Lock(&CoreRef->CS);
 			// Drop any previous ticket.
 			if (CoreRef->ActiveTicket != nullptr)
@@ -251,7 +254,9 @@ void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& At
 			const FTCHARToUTF8 AttrsUtf8(*AttrsCopy);
 			const char* Attrs = AttrsCopy.IsEmpty() ? nullptr : AttrsUtf8.Get();
 			fsdk_ticket* Ticket = nullptr;
-			R = fsdk_request_match(CoreRef->Client, QueueUtf8.Get(), Attrs, &Ticket);
+			R = bAutoRegion
+				? fsdk_request_match_auto(CoreRef->Client, QueueUtf8.Get(), Attrs, &Ticket)
+				: fsdk_request_match(CoreRef->Client, QueueUtf8.Get(), Attrs, &Ticket);
 			if (R == FSDK_OK)
 			{
 				CoreRef->ActiveTicket = Ticket;

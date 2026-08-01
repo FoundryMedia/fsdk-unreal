@@ -119,7 +119,7 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 	BindOnce(Sdk);
 	PendingQueue = Queue;
 	PendingAttributes = AttributesJson.IsEmpty() ? TEXT("{}") : AttributesJson;
-	SetPhase(EFMMSPhase::Requesting, TEXT("Requesting match..."));
+	SetPhase(EFMMSPhase::Requesting, TEXT("Checking regions and requesting match..."));
 	Sdk->RequestMatch(PendingQueue, PendingAttributes);
 }
 
@@ -153,7 +153,7 @@ void UFMMSSubsystem::HandleAuth(EFoundryFsdkResult Result)
 		Fail(TEXT("SDK unavailable."));
 		return;
 	}
-	SetPhase(EFMMSPhase::Requesting, TEXT("Requesting match..."));
+	SetPhase(EFMMSPhase::Requesting, TEXT("Checking regions and requesting match..."));
 	Sdk->RequestMatch(PendingQueue, PendingAttributes);
 }
 
