@@ -117,6 +117,10 @@ typedef struct fsdk_player_info {
     char    foundry_id[64];   /* Platform user id (FID), NUL-terminated.       */
     char    match_id[64];     /* Match this token authorizes, NUL-terminated.  */
     int64_t expires_at;       /* Token expiry, Unix epoch seconds.             */
+    /* Player display name from the SIGNED display_name claim - the TRUSTED
+     * nametag/join-message source (a client-supplied name is spoofable).
+     * Empty when the claim is absent (BYO players / older platform tokens). */
+    char    display_name[128];
 } fsdk_player_info;
 
 /* -------------------------------------------------------------------------- */

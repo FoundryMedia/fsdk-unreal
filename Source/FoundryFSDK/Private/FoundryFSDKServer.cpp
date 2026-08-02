@@ -154,8 +154,16 @@ bool FFoundryFSDKServer::IsAllocated()
 
 bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId)
 {
+	FString UnusedDisplayName;
+	return ValidatePlayer(MatchToken, OutFoundryId, OutMatchId, UnusedDisplayName);
+}
+
+bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
+                                        FString& OutDisplayName)
+{
 	OutFoundryId.Reset();
 	OutMatchId.Reset();
+	OutDisplayName.Reset();
 	if (State == nullptr || State->Server == nullptr)
 	{
 		return false;
@@ -174,6 +182,7 @@ bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutF
 	}
 	OutFoundryId = UTF8_TO_TCHAR(Info.foundry_id);
 	OutMatchId = UTF8_TO_TCHAR(Info.match_id);
+	OutDisplayName = UTF8_TO_TCHAR(Info.display_name);
 	return true;
 }
 

@@ -253,9 +253,26 @@ void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnect
 	// Deliberately NO endpoint in the user-facing message: the server IP must never
 	// hit screens, streams, or captured logs (DDoS surface - see fsdk-security).
 	SetPhase(EFMMSPhase::Traveling, TEXT("Match found - joining server..."));
+	// Ride the player's display name as UE's native ?Name= option so PlayerState/nametags
+	// never default to the OS machine name. COSMETIC layer only: the server overrides it
+	// from the match token's SIGNED display_name claim when present. Sanitized: URL option
+	// separators stripped, so it can never smuggle extra options (e.g. a second ?token=).
+	FString NameOption;
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		FString SessionName = Sdk->GetDisplayName();
+		SessionName.ReplaceInline(TEXT("?"), TEXT(""));
+		SessionName.ReplaceInline(TEXT("="), TEXT(""));
+		SessionName.ReplaceInline(TEXT("&"), TEXT(""));
+		SessionName = SessionName.TrimStartAndEnd().Left(64);
+		if (!SessionName.IsEmpty())
+		{
+			NameOption = FString::Printf(TEXT("?Name=%s"), *SessionName);
+		}
+	}
 	// The URL carries the match token AND the endpoint - do NOT log it.
-	const FString Url = FString::Printf(TEXT("%s:%d?token=%s"),
-	                                    *Connection.Ip, Connection.Port, *Connection.MatchToken);
+	const FString Url = FString::Printf(TEXT("%s:%d?token=%s%s"),
+	                                    *Connection.Ip, Connection.Port, *Connection.MatchToken, *NameOption);
 	PC->ClientTravel(Url, TRAVEL_Absolute);
 }
 

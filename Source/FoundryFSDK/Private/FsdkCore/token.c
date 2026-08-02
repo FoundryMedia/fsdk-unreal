@@ -257,6 +257,9 @@ fsdk_result fsdk_token_verify(const char* match_token,
         copy_bounded(out_info->foundry_id, sizeof out_info->foundry_id, sub);
         copy_bounded(out_info->match_id, sizeof out_info->match_id, mid);
         out_info->expires_at = (int64_t)exp;
+        /* Optional signed display name (absent on BYO/older tokens -> stays empty). */
+        json_extract_string(payload_json, "display_name",
+                            out_info->display_name, sizeof out_info->display_name);
     }
     fsdk_log(FSDK_LOG_DEBUG, "fsdk_token_verify: token accepted");
     return FSDK_OK;

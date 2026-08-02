@@ -94,6 +94,11 @@ public:
 	 */
 	bool ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId);
 
+	/** ValidatePlayer + the token's SIGNED display_name claim (empty when absent - BYO/older
+	 *  tokens). The trusted nametag/join-message source; prefer it over any client-sent name. */
+	bool ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
+	                    FString& OutDisplayName);
+
 	/** Agones Shutdown(); the orchestrator reclaims the box. */
 	void Shutdown();
 
