@@ -99,6 +99,12 @@ public:
 	bool ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
 	                    FString& OutDisplayName);
 
+	/** ValidatePlayer + the token's SIGNED team claim (the matchmaker's team index; -1 when
+	 *  absent - BYO/legacy matches). The trusted team-seating source; never accept a
+	 *  client-supplied team. */
+	bool ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
+	                    FString& OutDisplayName, int32& OutTeam);
+
 	/** Agones Shutdown(); the orchestrator reclaims the box. */
 	void Shutdown();
 

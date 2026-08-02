@@ -121,6 +121,10 @@ typedef struct fsdk_player_info {
      * nametag/join-message source (a client-supplied name is spoofable).
      * Empty when the claim is absent (BYO players / older platform tokens). */
     char    display_name[128];
+    /* Matchmaker team index from the SIGNED team claim - the TRUSTED team
+     * seating source (never accept a client-supplied team). -1 when the claim
+     * is absent (BYO / legacy matches formed before teams were persisted). */
+    int32_t team;
 } fsdk_player_info;
 
 /* -------------------------------------------------------------------------- */

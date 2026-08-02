@@ -161,9 +161,17 @@ bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutF
 bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
                                         FString& OutDisplayName)
 {
+	int32 UnusedTeam = -1;
+	return ValidatePlayer(MatchToken, OutFoundryId, OutMatchId, OutDisplayName, UnusedTeam);
+}
+
+bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutFoundryId, FString& OutMatchId,
+                                        FString& OutDisplayName, int32& OutTeam)
+{
 	OutFoundryId.Reset();
 	OutMatchId.Reset();
 	OutDisplayName.Reset();
+	OutTeam = -1;
 	if (State == nullptr || State->Server == nullptr)
 	{
 		return false;
@@ -183,6 +191,8 @@ bool FFoundryFSDKServer::ValidatePlayer(const FString& MatchToken, FString& OutF
 	OutFoundryId = UTF8_TO_TCHAR(Info.foundry_id);
 	OutMatchId = UTF8_TO_TCHAR(Info.match_id);
 	OutDisplayName = UTF8_TO_TCHAR(Info.display_name);
+	// The SIGNED team claim (the matchmaker's seat) - -1 when absent.
+	OutTeam = static_cast<int32>(Info.team);
 	return true;
 }
 

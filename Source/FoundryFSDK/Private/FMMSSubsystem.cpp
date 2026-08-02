@@ -4,6 +4,7 @@
 
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "FoundryConsoleSubsystem.h"
 #include "GameFramework/PlayerController.h"
 #include "TimerManager.h"
 
@@ -304,6 +305,16 @@ void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message)
 {
 	Phase = NewPhase;
 	UE_LOG(LogFMMS, Log, TEXT("[FMMS] phase=%d %s"), (int32)NewPhase, *Message);
+	// Mirror into the dev-console scrollback DIRECTLY: Shipping builds compile Log-verbosity
+	// lines out, so the console's UE_LOG capture alone never sees these. Phase messages are
+	// player-facing status text - never tokens/secrets (the no-secrets Print contract).
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UFoundryConsoleSubsystem* DevConsole = GI->GetSubsystem<UFoundryConsoleSubsystem>())
+		{
+			DevConsole->Print(FString::Printf(TEXT("[FMMS] %s"), *Message));
+		}
+	}
 	OnFMMSStatus.Broadcast(NewPhase, Message);
 }
 

@@ -153,6 +153,7 @@ fsdk_result fsdk_token_verify(const char* match_token,
                               fsdk_player_info* out_info) {
     if (out_info != NULL) {
         memset(out_info, 0, sizeof(*out_info));
+        out_info->team = -1; /* zeroed struct must never read as team 0 */
     }
     if (match_token == NULL) {
         return FSDK_ERR_INVALID_ARG;
@@ -260,6 +261,14 @@ fsdk_result fsdk_token_verify(const char* match_token,
         /* Optional signed display name (absent on BYO/older tokens -> stays empty). */
         json_extract_string(payload_json, "display_name",
                             out_info->display_name, sizeof out_info->display_name);
+        /* Optional signed team index (absent/negative -> -1 = unassigned). */
+        out_info->team = -1;
+        {
+            long team = 0;
+            if (json_extract_long(payload_json, "team", &team) && team >= 0 && team <= INT32_MAX) {
+                out_info->team = (int32_t)team;
+            }
+        }
     }
     fsdk_log(FSDK_LOG_DEBUG, "fsdk_token_verify: token accepted");
     return FSDK_OK;
