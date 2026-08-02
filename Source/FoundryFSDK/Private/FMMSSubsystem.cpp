@@ -4,7 +4,6 @@
 
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
-#include "FoundryConsoleSubsystem.h"
 #include "GameFramework/PlayerController.h"
 #include "TimerManager.h"
 
@@ -305,16 +304,10 @@ void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message)
 {
 	Phase = NewPhase;
 	UE_LOG(LogFMMS, Log, TEXT("[FMMS] phase=%d %s"), (int32)NewPhase, *Message);
-	// Mirror into the dev-console scrollback DIRECTLY: Shipping builds compile Log-verbosity
-	// lines out, so the console's UE_LOG capture alone never sees these. Phase messages are
-	// player-facing status text - never tokens/secrets (the no-secrets Print contract).
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		if (UFoundryConsoleSubsystem* DevConsole = GI->GetSubsystem<UFoundryConsoleSubsystem>())
-		{
-			DevConsole->Print(FString::Printf(TEXT("[FMMS] %s"), *Message));
-		}
-	}
+	// The dev console mirrors these itself: it subscribes OnFMMSStatus at Initialize
+	// (HandleFmmsStatus -> "[fmms] ..."), which survives Shipping (event-driven, not a
+	// UE_LOG capture). Do NOT also Print() here - that double-writes every phase line
+	// (the duplicate-console-lines bug, caught live 2026-08-02).
 	OnFMMSStatus.Broadcast(NewPhase, Message);
 }
 
