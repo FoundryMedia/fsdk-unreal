@@ -31,6 +31,7 @@ void UFMMSSubsystem::BindOnce(UFoundryFSDKSubsystem* Sdk)
 	Sdk->OnRequestMatchComplete.AddDynamic(this, &UFMMSSubsystem::HandleRequest);
 	Sdk->OnPollMatchComplete.AddDynamic(this, &UFMMSSubsystem::HandlePoll);
 	Sdk->OnGetConnectionComplete.AddDynamic(this, &UFMMSSubsystem::HandleConnection);
+	Sdk->OnMySessionComplete.AddDynamic(this, &UFMMSSubsystem::HandleMySession);
 	bBound = true;
 }
 
@@ -49,7 +50,7 @@ bool UFMMSSubsystem::ThrottleFindMatch()
 void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJson,
                                const FString& PlayerToken, const FString& ApiBaseUrl)
 {
-	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
+	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed && Phase != EFMMSPhase::Reconnectable)
 	{
 		UE_LOG(LogFMMS, Warning, TEXT("FindMatch ignored - flow already in progress (phase %d)"), (int32)Phase);
 		return;
@@ -58,6 +59,7 @@ void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJs
 	{
 		return;
 	}
+	AbandonReconnectSeat(); // searching fresh from Reconnectable = declining the old seat
 	if (Queue.IsEmpty())
 	{
 		Fail(TEXT("No queue specified."));
@@ -89,7 +91,7 @@ void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJs
 
 void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString& AttributesJson)
 {
-	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
+	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed && Phase != EFMMSPhase::Reconnectable)
 	{
 		UE_LOG(LogFMMS, Warning, TEXT("FindMatchAuthenticated ignored - flow already in progress (phase %d)"), (int32)Phase);
 		return;
@@ -98,6 +100,7 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 	{
 		return;
 	}
+	AbandonReconnectSeat(); // searching fresh from Reconnectable = declining the old seat
 	if (Queue.IsEmpty())
 	{
 		Fail(TEXT("No queue specified."));
@@ -133,7 +136,81 @@ void UFMMSSubsystem::Cancel()
 			Sdk->CancelMatch();
 		}
 	}
+	AbandonReconnectSeat(); // Cancel from Reconnectable = decline the live seat
 	SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."));
+}
+
+/** Decline any pending reconnect seat: cancel its ticket server-side + forget it. */
+void UFMMSSubsystem::AbandonReconnectSeat()
+{
+	if (ReconnectTicketId.IsEmpty())
+	{
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->AbandonMatch(ReconnectTicketId);
+	}
+	ReconnectTicketId.Reset();
+}
+
+void UFMMSSubsystem::CheckActiveSession()
+{
+	// Menu-entry recovery. After a server-initiated kick (operator stop, crash,
+	// network loss) the local phase is STALE - Traveling/Connecting with no flow
+	// actually running - so ask the PLATFORM, the only party that knows whether
+	// the match is still live. Never clobber a genuinely in-flight search.
+	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching)
+	{
+		return;
+	}
+	UFoundryFSDKSubsystem* Sdk = Fsdk();
+	if (Sdk == nullptr || !Sdk->IsLoggedIn())
+	{
+		return;
+	}
+	BindOnce(Sdk);
+	Sdk->QueryMySession();
+}
+
+void UFMMSSubsystem::Reconnect()
+{
+	if (Phase != EFMMSPhase::Reconnectable || ReconnectTicketId.IsEmpty())
+	{
+		UE_LOG(LogFMMS, Warning, TEXT("Reconnect ignored - no reconnectable match."));
+		return;
+	}
+	UFoundryFSDKSubsystem* Sdk = Fsdk();
+	if (Sdk == nullptr)
+	{
+		Fail(TEXT("FoundryFSDK subsystem unavailable."));
+		return;
+	}
+	BindOnce(Sdk);
+	SetPhase(EFMMSPhase::Connecting, TEXT("Reconnecting to your match..."));
+	Sdk->ReconnectMatch(ReconnectTicketId);
+	ReconnectTicketId.Reset(); // consumed; the connection flow owns it from here
+}
+
+void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat)
+{
+	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching || Phase == EFMMSPhase::Connecting)
+	{
+		return; // a live flow started meanwhile - its handlers own the phase
+	}
+	if (Result == EFoundryFsdkResult::Ok && Seat.bActive && !Seat.TicketId.IsEmpty())
+	{
+		ReconnectTicketId = Seat.TicketId;
+		SetPhase(EFMMSPhase::Reconnectable, TEXT("You have a match in progress."));
+		return;
+	}
+	// No live seat (incl. old-fid 404 / transient failure): the match is gone, so
+	// any stale local state must not brick Find Match - reset to Idle.
+	ReconnectTicketId.Reset();
+	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
+	{
+		SetPhase(EFMMSPhase::Idle, TEXT("Ready."));
+	}
 }
 
 void UFMMSSubsystem::HandleAuth(EFoundryFsdkResult Result)

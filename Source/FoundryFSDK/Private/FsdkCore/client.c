@@ -36,6 +36,7 @@
 #define FSDK_PATH_ME            "/v1/me/user"
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
 #define FSDK_PATH_REGIONS       "/v1/fmms/regions"
+#define FSDK_PATH_MY_SESSION    "/v1/fmms/my-session"
 
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
@@ -705,4 +706,73 @@ void fsdk_ticket_destroy(fsdk_ticket* ticket) {
     }
     free(ticket->ticket_id);
     free(ticket);
+}
+
+fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out) {
+    if (client == NULL || out == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    /* Zero first so any early return reads as "no seat", never stale stack data. */
+    memset(out, 0, sizeof(*out));
+    if (!client->authenticated) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+
+    /* GET {base_url}/v1/fmms/my-session -> { active, ticketId, matchId, queueKey }.
+     * The platform's answer, not the client's local state - after a server-side
+     * kick the local ticket handle is gone/stale and only fid knows whether the
+     * match is still live. An old fid without the route answers 404 -> NO_MATCH,
+     * which callers should treat as "no seat" (degrade to a fresh search). */
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_GET, FSDK_PATH_MY_SESSION,
+                                      client->player_token, NULL, &resp, &status);
+    if (r != FSDK_OK) {
+        return r;
+    }
+    if (status < 200 || status >= 300) {
+        fsdk_string_free(resp);
+        return http_status_to_result(status);
+    }
+
+    const char* data = json_data_object(resp);
+    int active = 0;
+    fsdk_json_extract_bool(data, "active", &active);
+    if (active) {
+        json_extract_string(data, "ticketId", out->ticket_id, sizeof(out->ticket_id));
+        json_extract_string(data, "matchId", out->match_id, sizeof(out->match_id));
+        json_extract_string(data, "queueKey", out->queue_key, sizeof(out->queue_key));
+        /* An active seat without a ticket id is unusable for reconnect. */
+        out->active = out->ticket_id[0] != '\0' ? 1 : 0;
+    }
+    fsdk_string_free(resp);
+    fsdk_log(FSDK_LOG_INFO, out->active ? "fsdk my_session: active seat"
+                                        : "fsdk my_session: no live seat");
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_resume_ticket(fsdk_client* client,
+                               const char* ticket_id,
+                               fsdk_ticket** out_ticket) {
+    if (client == NULL || ticket_id == NULL || ticket_id[0] == '\0' || out_ticket == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_ticket = NULL;
+    if (!client->authenticated) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+    fsdk_ticket* ticket = (fsdk_ticket*)calloc(1, sizeof(fsdk_ticket));
+    if (ticket == NULL) {
+        return FSDK_ERR_INTERNAL;
+    }
+    ticket->ticket_id = fsdk_strdup(ticket_id);
+    if (ticket->ticket_id == NULL) {
+        free(ticket);
+        return FSDK_ERR_INTERNAL;
+    }
+    /* FOUND: the seat came from my_session, so get_connection can resolve now
+     * (fid re-mints a fresh token bound to the same match + persisted team). */
+    ticket->status = FSDK_MATCH_FOUND;
+    *out_ticket = ticket;
+    return FSDK_OK;
 }

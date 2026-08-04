@@ -377,6 +377,119 @@ void UFoundryFSDKSubsystem::CancelMatch()
 	});
 }
 
+void UFoundryFSDKSubsystem::QueryMySession()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnMySessionComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundrySessionSeat());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		fsdk_result R;
+		fsdk_session_seat Seat;
+		FMemory::Memzero(&Seat, sizeof(Seat));
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			R = fsdk_my_session(CoreRef->Client, &Seat);
+		}
+		FFoundrySessionSeat Out;
+		if (R == FSDK_OK && Seat.active)
+		{
+			Out.bActive = true;
+			Out.TicketId = UTF8_TO_TCHAR(Seat.ticket_id);
+			Out.MatchId = UTF8_TO_TCHAR(Seat.match_id);
+			Out.QueueKey = UTF8_TO_TCHAR(Seat.queue_key);
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Out]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnMySessionComplete.Broadcast(Result, Out);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::ReconnectMatch(const FString& TicketId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnGetConnectionComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundryConnection());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	const FString TicketCopy = TicketId;
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, TicketCopy]()
+	{
+		fsdk_result R;
+		fsdk_connection Conn;
+		FMemory::Memzero(&Conn, sizeof(Conn));
+		{
+			// Resume + resolve in ONE worker (one lock hold) so the connection read can
+			// never race a half-swapped active ticket.
+			FScopeLock Lock(&CoreRef->CS);
+			const FTCHARToUTF8 TicketUtf8(*TicketCopy);
+			fsdk_ticket* Ticket = nullptr;
+			R = fsdk_resume_ticket(CoreRef->Client, TicketUtf8.Get(), &Ticket);
+			if (R == FSDK_OK)
+			{
+				if (CoreRef->ActiveTicket != nullptr)
+				{
+					fsdk_ticket_destroy(CoreRef->ActiveTicket);
+				}
+				CoreRef->ActiveTicket = Ticket;
+				R = fsdk_get_connection(CoreRef->Client, CoreRef->ActiveTicket, &Conn);
+			}
+		}
+		FFoundryConnection Out;
+		if (R == FSDK_OK)
+		{
+			Out.Ip = UTF8_TO_TCHAR(Conn.ip);
+			Out.Port = static_cast<int32>(Conn.port);
+			Out.MatchToken = UTF8_TO_TCHAR(Conn.match_token);
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Out]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnGetConnectionComplete.Broadcast(Result, Out);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::AbandonMatch(const FString& TicketId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || TicketId.IsEmpty())
+	{
+		return;
+	}
+
+	// Fire-and-forget decline: cancel the seat's ticket server-side via a
+	// transient handle (never touches the active ticket).
+	const FString TicketCopy = TicketId;
+	Async(EAsyncExecution::Thread, [CoreRef, TicketCopy]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		const FTCHARToUTF8 TicketUtf8(*TicketCopy);
+		fsdk_ticket* Ticket = nullptr;
+		if (fsdk_resume_ticket(CoreRef->Client, TicketUtf8.Get(), &Ticket) == FSDK_OK)
+		{
+			fsdk_cancel_match(CoreRef->Client, Ticket);
+			fsdk_ticket_destroy(Ticket);
+		}
+	});
+}
+
 // ── FRC chat ────────────────────────────────────────────────────────────────
 //
 // One chat session per game instance, driven from the GAME THREAD by a 0.25s

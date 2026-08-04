@@ -434,6 +434,36 @@ fsdk_result fsdk_cancel_match(fsdk_client* client, fsdk_ticket* ticket);
 void fsdk_ticket_destroy(fsdk_ticket* ticket);
 
 /* -------------------------------------------------------------------------- */
+/* Reconnect (am I already seated in a live match?)                           */
+/* -------------------------------------------------------------------------- */
+/* After a server-initiated kick (operator stop, crash, network loss) the
+ * platform - not the client's stuck local state - knows whether the player's
+ * match is still running. fsdk_my_session asks; an active seat means the game
+ * should offer RECONNECT (fsdk_resume_ticket + fsdk_get_connection re-resolves
+ * the SAME match, same persisted team, with a FRESH match token); no seat means
+ * the match is gone - search fresh. */
+
+/* The platform's answer to "am I already seated?" (GET /v1/fmms/my-session). */
+typedef struct fsdk_session_seat {
+    int  active;          /* 1 = seated in a LIVE match (reconnectable).       */
+    char ticket_id[128];  /* The seat's ticket id (feed fsdk_resume_ticket).   */
+    char match_id[64];    /* The live match id (informational).                */
+    char queue_key[128];  /* The queue's submit key, e.g. "conquest/classic".  */
+} fsdk_session_seat;
+
+/* Ask the platform whether the caller is already seated in a live match.
+ * Fills *out (caller storage); active=0 with empty fields when there is no
+ * live seat. Requires a prior successful authenticate. */
+fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out);
+
+/* Rebuild a ticket handle from a known ticket id (the reconnect path). Purely
+ * local - no network; the handle starts FSDK_MATCH_FOUND so fsdk_get_connection
+ * can resolve it immediately. Caller frees with fsdk_ticket_destroy. */
+fsdk_result fsdk_resume_ticket(fsdk_client* client,
+                               const char* ticket_id,
+                               fsdk_ticket** out_ticket);
+
+/* -------------------------------------------------------------------------- */
 /* CLIENT CHAT API (FRC rooms over the realtime WebSocket)                    */
 /* -------------------------------------------------------------------------- */
 /* Game chat rides the platform's control plane: every message is authorized,

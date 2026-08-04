@@ -64,10 +64,36 @@ struct FFoundryConnection
 	FString MatchToken;
 };
 
+/**
+ * The platform's "am I already seated?" answer, mirrors fsdk_session_seat.
+ * bActive = the player is seated in a LIVE match and can reconnect to it
+ * (ReconnectMatch); inactive = search fresh.
+ */
+USTRUCT(BlueprintType)
+struct FFoundrySessionSeat
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	bool bActive = false;
+
+	/** The seat's ticket id - feed ReconnectMatch / AbandonMatch. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString TicketId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString MatchId;
+
+	/** The queue's submit key, e.g. "conquest/classic". */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString QueueKey;
+};
+
 // Completion delegates - broadcast on the GAME THREAD when an async op finishes.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryFsdkResultEvent, EFoundryFsdkResult, Result);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkStatusEvent, EFoundryFsdkResult, Result, EFoundryMatchStatus, Status);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFoundryFsdkResult, Result, FFoundryConnection, Connection);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkSessionSeatEvent, EFoundryFsdkResult, Result, FFoundrySessionSeat, Seat);
 
 // Auth completion delegates - broadcast on the GAME THREAD.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryLoginEvent, EFoundryFsdkResult, Result, const FString&, DisplayName);
@@ -288,6 +314,31 @@ public:
 	/** Cancel the active ticket (best-effort, fire-and-forget). */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void CancelMatch();
+
+	/**
+	 * Ask the platform whether this player is already seated in a LIVE match
+	 * (GET /v1/fmms/my-session) - the reconnect-aware Find Match read. Async:
+	 * broadcasts OnMySessionComplete. An older fid without the route answers
+	 * NoMatch with an inactive seat - treat as "no seat".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void QueryMySession();
+
+	/**
+	 * Reconnect to a live seat from QueryMySession: rebuild the ticket handle
+	 * (it becomes the active ticket) and resolve its connection - fid re-mints a
+	 * FRESH match token bound to the SAME match + persisted team. Async:
+	 * broadcasts OnGetConnectionComplete, same handler as the normal flow.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void ReconnectMatch(const FString& TicketId);
+
+	/**
+	 * Decline a live seat: cancel that ticket server-side (best-effort,
+	 * fire-and-forget) so my-session stops reporting it.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void AbandonMatch(const FString& TicketId);
 
 	// ── FRC chat (the game's GLOBAL room over the platform realtime socket) ─────
 	// Server-authoritative end to end: the player token only ever grants ROOM
@@ -567,6 +618,9 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|FSDK")
 	FFoundryFsdkConnectionEvent OnGetConnectionComplete;
+
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|FSDK")
+	FFoundryFsdkSessionSeatEvent OnMySessionComplete;
 
 private:
 	/** Ensure a client exists (lazily create one bound to the default api base). */

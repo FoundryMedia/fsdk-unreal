@@ -17,7 +17,9 @@ enum class EFMMSPhase : uint8
 	Searching      UMETA(DisplayName = "Searching"),
 	Connecting     UMETA(DisplayName = "Connecting"),
 	Traveling      UMETA(DisplayName = "Joining Server"),
-	Failed         UMETA(DisplayName = "Failed")
+	Failed         UMETA(DisplayName = "Failed"),
+	/** The platform says this player is seated in a LIVE match - offer Reconnect. */
+	Reconnectable  UMETA(DisplayName = "Match In Progress")
 };
 
 /** Broadcast on the game thread on every phase change. */
@@ -59,9 +61,33 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void FindMatchAuthenticated(const FString& Queue, const FString& AttributesJson);
 
-	/** Cancel an in-flight flow (also cancels the FMMS ticket, best-effort). */
+	/** Cancel an in-flight flow (also cancels the FMMS ticket, best-effort). From
+	 *  Reconnectable this DECLINES the live seat (cancels its ticket server-side). */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void Cancel();
+
+	/**
+	 * Reconnect-aware menu-entry check: ask the PLATFORM whether this player is
+	 * already seated in a live match (my-session). Active seat -> phase
+	 * Reconnectable (offer the Reconnect button); no seat -> any STALE local
+	 * state (Traveling/Failed left over after a server-initiated kick) resets to
+	 * Idle so Find Match works immediately. No-op while a real search is in
+	 * flight, or when not signed in. Call on menu-map entry / after a disconnect.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void CheckActiveSession();
+
+	/**
+	 * Reconnect to the live match reported by CheckActiveSession: re-resolves the
+	 * SAME ticket's connection (fid mints a fresh token, same match, same
+	 * persisted team) and travels. Only valid in phase Reconnectable.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void Reconnect();
+
+	/** True when the platform reported a live seat (menu shows Reconnect). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool HasActiveMatch() const { return Phase == EFMMSPhase::Reconnectable; }
 
 	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
 	EFMMSPhase GetPhase() const { return Phase; }
@@ -75,10 +101,12 @@ private:
 	UFUNCTION() void HandleRequest(EFoundryFsdkResult Result);
 	UFUNCTION() void HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status);
 	UFUNCTION() void HandleConnection(EFoundryFsdkResult Result, FFoundryConnection Connection);
+	UFUNCTION() void HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat);
 
 	void Poll();
 	void StartPolling();
 	void StopPolling();
+	void AbandonReconnectSeat();
 	void SetPhase(EFMMSPhase NewPhase, const FString& Message);
 	void Fail(const FString& Message);
 	UFoundryFSDKSubsystem* Fsdk() const;
@@ -89,6 +117,8 @@ private:
 	EFMMSPhase Phase = EFMMSPhase::Idle;
 	FString PendingQueue;
 	FString PendingAttributes;
+	/** Live-seat ticket id from my-session (set while phase is Reconnectable). */
+	FString ReconnectTicketId;
 	FTimerHandle PollTimer;
 	bool bBound = false;
 	// Wall-clock of the last accepted FindMatch — throttles rapid re-clicks (a fast failure, e.g.
