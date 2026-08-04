@@ -278,6 +278,15 @@ public:
 		RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateSP(this, &SFoundryConsole::FocusInputDeferred));
 	}
 
+	/** Drop any pending input text (close path — see CloseConsole's focus clear). */
+	void ClearInput()
+	{
+		if (InputBox.IsValid())
+		{
+			InputBox->SetText(FText::GetEmpty());
+		}
+	}
+
 	/** Masked password capture (`foundry login`): dots in the box, no history/tab. */
 	void SetPasswordMode(bool bOn)
 	{
@@ -765,6 +774,15 @@ void UFoundryConsoleSubsystem::CloseConsole()
 		if (GI != nullptr && GI->GetGameViewportClient() != nullptr)
 		{
 			GI->GetGameViewportClient()->RemoveViewportWidgetContent(ConsoleWidget.ToSharedRef());
+		}
+		// The toggle KEYDOWN closes the console, but its WM_CHAR arrives AFTER —
+		// and the (now hidden) input box was still keyboard-focused, so the '`'
+		// typed into it and greeted the next open as pretyped text. Clear both
+		// the focus (so the trailing char routes nowhere) and any residue.
+		ConsoleWidget->ClearInput();
+		if (FSlateApplication::IsInitialized())
+		{
+			FSlateApplication::Get().ClearKeyboardFocus(EFocusCause::SetDirectly);
 		}
 	}
 }
