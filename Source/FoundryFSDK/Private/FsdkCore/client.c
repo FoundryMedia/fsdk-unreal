@@ -12,6 +12,13 @@
  * the player bearer token, and maps responses. With no transport installed every
  * networked call fails closed (FSDK_NOT_IMPLEMENTED).
  */
+/* Expose clock_gettime/CLOCK_MONOTONIC (POSIX.1b) even under a strict -std C compile:
+ * the region-ping RTT clock below needs a monotonic source, and glibc hides it unless
+ * this is defined. Must precede every libc include in this TU. Mirrors server.c. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 199309L
+#endif
+
 #include "fsdk_internal.h"
 
 #include <stdio.h>
