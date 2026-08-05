@@ -488,13 +488,18 @@ fsdk_result fsdk_resume_ticket(fsdk_client* client,
 #define FSDK_CHAT_BODY_MAX 512
 
 /* A chat CHANNEL is a room subscription multiplexed over the one socket:
- * GLOBAL = the game's all-players room; PARTY = the player's current party. */
+ * GLOBAL = the game's all-players room; PARTY = the player's current party;
+ * MATCH = the current match's all-chat (every player seated in the match);
+ * TEAM = your team's room only - the server resolves WHICH team from your
+ * seated ticket, the client never states a team index. */
 /* One room message, as fanned out by the platform. POD snapshot - copy what
  * you keep; the pointer is only valid inside the callback. */
 typedef enum fsdk_chat_channel {
     FSDK_CHAT_CHANNEL_GLOBAL = 0,
     FSDK_CHAT_CHANNEL_PARTY  = 1,
-    FSDK_CHAT_CHANNEL__COUNT = 2 /* internal bound - not a channel */
+    FSDK_CHAT_CHANNEL_MATCH  = 2,
+    FSDK_CHAT_CHANNEL_TEAM   = 3,
+    FSDK_CHAT_CHANNEL__COUNT = 4 /* internal bound - not a channel */
 } fsdk_chat_channel;
 
 typedef struct fsdk_chat_message {
@@ -536,6 +541,23 @@ fsdk_result fsdk_chat_join_party(fsdk_chat* chat, const char* party_id);
 /* Unsubscribe the party channel (player left/disbanded). The socket and the
  * other channels stay up. NULL-safe; a no-op when not joined. */
 fsdk_result fsdk_chat_leave_party(fsdk_chat* chat);
+
+/* Join the current match's MATCH room (all-chat: every player in the match)
+ * on the SAME socket (multiplexed subscription). match_id comes from the
+ * matchmaking connection/my-session flow. Same async shape as join_global:
+ * fsdk_chat_channel_ready(MATCH) flips on the server's confirmation. */
+fsdk_result fsdk_chat_join_match(fsdk_chat* chat, const char* match_id);
+
+/* Join YOUR TEAM's room for the match (multiplexed subscription). The server
+ * resolves which team from the caller's seated ticket - the client never
+ * states a team index, so joining the enemy team's room is impossible.
+ * fsdk_chat_channel_ready(TEAM) flips on the server's confirmation. */
+fsdk_result fsdk_chat_join_team(fsdk_chat* chat, const char* match_id);
+
+/* Unsubscribe BOTH the match and team channels (match over / traveled out).
+ * The socket and the other channels stay up. NULL-safe; a no-op when not
+ * joined. */
+fsdk_result fsdk_chat_leave_match(fsdk_chat* chat);
 
 /* Send to the GLOBAL channel. FSDK_ERR_UNAVAILABLE until that channel is
  * ready; FSDK_ERR_INVALID_ARG for an empty/oversized body. The echo arrives

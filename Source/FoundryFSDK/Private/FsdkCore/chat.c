@@ -8,8 +8,8 @@
  * membership is enforced by fid, never here.
  *
  * MULTIPLEXED CHANNELS: one socket, one auth, one keepalive - every channel
- * (GLOBAL, PARTY) is just a room.sub on that socket. Concurrent-chatter cost
- * is per socket, so adding a channel never adds a connection.
+ * (GLOBAL, PARTY, MATCH, TEAM) is just a room.sub on that socket. Concurrent-
+ * chatter cost is per socket, so adding a channel never adds a connection.
  *
  * Wire (JSON text frames, envelope {"t":...,"ts":...,"d":{...}}):
  *   out: {"t":"auth","d":{"token":...}}          (first frame; native WS could
@@ -36,6 +36,7 @@ long long fsdk_chat_ping_interval_ms = 25000;
 #define CHAT_REALTIME_PATH "/v1/realtime"
 #define CHAT_ROOM_GLOBAL_PATH "/v1/chat/rooms/global/"
 #define CHAT_ROOM_PARTY_PATH "/v1/chat/rooms/party/"
+#define CHAT_ROOM_MATCH_PATH "/v1/chat/rooms/match/"
 
 /* Narrow to the "data" envelope object; fall back to the whole body. */
 static const char* json_data_object(const char* body) {
@@ -157,19 +158,21 @@ static int valid_room_key(const char* key) {
            && strchr(key, '#') == NULL;
 }
 
-/* Resolve a channel's room over HTTP (the server authorizes membership), stamp
- * the slot, then subscribe: directly when the socket is already authed, or by
- * connect+auth (all populated slots sub on auth.ok). */
-static fsdk_result chat_join(fsdk_chat* chat, fsdk_chat_channel channel,
-                             const char* resolve_prefix, const char* key) {
-    char path[192];
+/* Full-path joiner: `path` is the COMPLETE resolve route, already assembled by
+ * a wrapper from validated single-segment keys (the team route embeds a '/'
+ * the public key validation would rightly reject). Resolve the room over HTTP
+ * (the server authorizes membership), stamp the slot, then subscribe: directly
+ * when the socket is already authed, or by connect+auth (all populated slots
+ * sub on auth.ok). */
+static fsdk_result chat_join_path(fsdk_chat* chat, fsdk_chat_channel channel,
+                                  const char* path) {
     char url[512];
     char* resp = NULL;
     long status = 0;
     fsdk_result rc;
     fsdk_chat_room_slot* slot;
 
-    if (chat == NULL || !valid_room_key(key)) {
+    if (chat == NULL) {
         return FSDK_ERR_INVALID_ARG;
     }
     if (!chat->client->authenticated || chat->client->player_token == NULL) {
@@ -177,7 +180,6 @@ static fsdk_result chat_join(fsdk_chat* chat, fsdk_chat_channel channel,
     }
 
     /* 1. Resolve the room over HTTP - the server authorizes membership here. */
-    (void)snprintf(path, sizeof(path), "%s%s", resolve_prefix, key);
     rc = fsdk_http_request(chat->client->base_url, FSDK_HTTP_GET, path,
                            chat->client->player_token, NULL, &resp, &status);
     if (rc != FSDK_OK) {
@@ -229,12 +231,40 @@ static fsdk_result chat_join(fsdk_chat* chat, fsdk_chat_channel channel,
     return FSDK_OK;
 }
 
+/* Prefix+key joiner: validates the key (a slug or UUID - one path segment,
+ * never a path) and appends it to the resolve prefix. */
+static fsdk_result chat_join(fsdk_chat* chat, fsdk_chat_channel channel,
+                             const char* resolve_prefix, const char* key) {
+    char path[192];
+    if (!valid_room_key(key)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s%s", resolve_prefix, key);
+    return chat_join_path(chat, channel, path);
+}
+
 fsdk_result fsdk_chat_join_global(fsdk_chat* chat, const char* game_slug) {
     return chat_join(chat, FSDK_CHAT_CHANNEL_GLOBAL, CHAT_ROOM_GLOBAL_PATH, game_slug);
 }
 
 fsdk_result fsdk_chat_join_party(fsdk_chat* chat, const char* party_id) {
     return chat_join(chat, FSDK_CHAT_CHANNEL_PARTY, CHAT_ROOM_PARTY_PATH, party_id);
+}
+
+fsdk_result fsdk_chat_join_match(fsdk_chat* chat, const char* match_id) {
+    return chat_join(chat, FSDK_CHAT_CHANNEL_MATCH, CHAT_ROOM_MATCH_PATH, match_id);
+}
+
+fsdk_result fsdk_chat_join_team(fsdk_chat* chat, const char* match_id) {
+    /* The team route is "{match_id}/team" - the '/' belongs to the ROUTE, not
+     * the key, so validate match_id as a single segment then hand the fully
+     * built path to the internal joiner (no key-validation weakening). */
+    char path[192];
+    if (!valid_room_key(match_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s%s/team", CHAT_ROOM_MATCH_PATH, match_id);
+    return chat_join_path(chat, FSDK_CHAT_CHANNEL_TEAM, path);
 }
 
 fsdk_result fsdk_chat_leave_party(fsdk_chat* chat) {
@@ -252,6 +282,32 @@ fsdk_result fsdk_chat_leave_party(fsdk_chat* chat) {
     }
     slot->room_id[0] = '\0';
     slot->joined = 0;
+    return rc;
+}
+
+fsdk_result fsdk_chat_leave_match(fsdk_chat* chat) {
+    static const fsdk_chat_channel match_channels[2] = {
+        FSDK_CHAT_CHANNEL_MATCH, FSDK_CHAT_CHANNEL_TEAM
+    };
+    fsdk_result rc = FSDK_OK;
+    int i;
+    if (chat == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    for (i = 0; i < 2; i++) {
+        fsdk_chat_room_slot* slot = &chat->rooms[match_channels[i]];
+        if (slot->room_id[0] == '\0') {
+            continue; /* nothing joined on this slot */
+        }
+        if (chat->ws_handle != NULL && chat->ws_authed && slot->joined) {
+            fsdk_result unsub_rc = send_room_unsub(chat, slot);
+            if (rc == FSDK_OK) {
+                rc = unsub_rc;
+            }
+        }
+        slot->room_id[0] = '\0';
+        slot->joined = 0;
+    }
     return rc;
 }
 

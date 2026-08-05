@@ -89,6 +89,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
 	bool HasActiveMatch() const { return Phase == EFMMSPhase::Reconnectable; }
 
+	/**
+	 * The live match id this player is seated in, as last reported by the
+	 * platform's my-session answer (CheckActiveSession / the reconnect flow).
+	 * The GameInstance subsystem survives travel, so in-match UI (match/team
+	 * chat) reads it after joining the server - call CheckActiveSession first
+	 * if it is still empty (the connection payload deliberately carries no
+	 * match id; my-session is the only client-side source). Empty = none.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	FString GetCurrentMatchId() const { return CurrentMatchId; }
+
 	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
 	EFMMSPhase GetPhase() const { return Phase; }
 
@@ -119,6 +130,9 @@ private:
 	FString PendingAttributes;
 	/** Live-seat ticket id from my-session (set while phase is Reconnectable). */
 	FString ReconnectTicketId;
+	/** Live match id from my-session (survives travel; cleared when the seat
+	 *  is gone / declined / a fresh search starts). */
+	FString CurrentMatchId;
 	FTimerHandle PollTimer;
 	bool bBound = false;
 	// Wall-clock of the last accepted FindMatch — throttles rapid re-clicks (a fast failure, e.g.

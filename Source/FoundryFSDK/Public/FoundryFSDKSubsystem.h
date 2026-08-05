@@ -106,7 +106,12 @@ UENUM(BlueprintType)
 enum class EFoundryChatChannel : uint8
 {
 	Global UMETA(DisplayName = "Global"),
-	Party  UMETA(DisplayName = "Party")
+	Party  UMETA(DisplayName = "Party"),
+	/** Match-wide all-chat: every player seated in the match. */
+	Match  UMETA(DisplayName = "Match"),
+	/** Your team only - the server resolves WHICH team from your seated
+	 *  ticket; the client never states a team index. */
+	Team   UMETA(DisplayName = "Team")
 };
 
 /** One friend from the redacted in-game social read (fid GameScope). */
@@ -370,6 +375,29 @@ public:
 	void LeavePartyChat();
 
 	/**
+	 * Join the current MATCH's all-chat room on the SAME socket (multiplexed -
+	 * every player seated in the match). MatchId comes from the FMMS flow
+	 * (UFMMSSubsystem::GetCurrentMatchId). Async: OnMatchChatStateChanged(true)
+	 * when the subscription is live.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void JoinMatchChat(const FString& MatchId);
+
+	/**
+	 * Join YOUR TEAM's room for the match (multiplexed). The server resolves
+	 * WHICH team from the caller's seated ticket - the client never states a
+	 * team index, so the enemy team's room is unjoinable. Async:
+	 * OnTeamChatStateChanged(true) when the subscription is live.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void JoinTeamChat(const FString& MatchId);
+
+	/** Unsubscribe BOTH the match and team channels (match over / traveled
+	 *  out). Socket + the other channels stay up. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Chat")
+	void LeaveMatchChat();
+
+	/**
 	 * Send to the GLOBAL channel (500-char server cap). The echo arrives via
 	 * OnChatMessage like everyone else's copy. Async: OnChatSendComplete fires
 	 * with the result (Unavailable until the room subscription is live).
@@ -393,7 +421,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry|Chat")
 	bool IsChatChannelReady(EFoundryChatChannel Channel) const
 	{
-		return Channel == EFoundryChatChannel::Party ? bPartyChatReady : bChatReady;
+		switch (Channel)
+		{
+		case EFoundryChatChannel::Party: return bPartyChatReady;
+		case EFoundryChatChannel::Match: return bMatchChatReady;
+		case EFoundryChatChannel::Team:  return bTeamChatReady;
+		default:                         return bChatReady;
+		}
 	}
 
 	/** Every room message (including the caller's own echo). */
@@ -407,6 +441,14 @@ public:
 	/** PARTY subscription went live / dropped. */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
 	FFoundryChatStateEvent OnPartyChatStateChanged;
+
+	/** MATCH (all-chat) subscription went live / dropped. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryChatStateEvent OnMatchChatStateChanged;
+
+	/** TEAM subscription went live / dropped. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
+	FFoundryChatStateEvent OnTeamChatStateChanged;
 
 	/** One SendChat finished (Ok, Unavailable before ready, InvalidArg, ...). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Chat")
@@ -636,6 +678,14 @@ private:
 	/** Kick one (re)join attempt on a worker (guarded by bChatJoinInFlight). */
 	void StartChatJoin();
 
+	/** Kick one channel-SUBSCRIPTION join (party/match/team) on a worker.
+	 *  Multiplexes onto the global chat's socket via the shared join helper -
+	 *  the SAME launcher re-mint retry path the global join uses. */
+	void StartChatSubscriptionJoin(EFoundryChatChannel Channel, const FString& Key);
+
+	/** Broadcast the per-channel state delegate. */
+	void BroadcastChatChannelState(EFoundryChatChannel Channel, bool bReady);
+
 	/** Run one social mutation on a worker and broadcast OnSocialActionComplete.
 	 *  Call returns an fsdk_result as int32 (the C ABI stays out of this header);
 	 *  bRefreshPartyOnOk chains a RefreshParty after party-shape changes. */
@@ -658,6 +708,8 @@ private:
 	// the chat borrows the client's token). These mirrors are game-thread-only.
 	bool bChatReady = false;
 	bool bPartyChatReady = false;   // PARTY channel mirror (same driver tick)
+	bool bMatchChatReady = false;   // MATCH channel mirror (same driver tick)
+	bool bTeamChatReady = false;    // TEAM channel mirror (same driver tick)
 	bool bChatDesired = false;      // JoinGlobalChat sets, LeaveChat clears
 	bool bChatJoinInFlight = false; // one join worker at a time
 	FString ChatGameSlug;           // the slug the auto-rejoin re-joins

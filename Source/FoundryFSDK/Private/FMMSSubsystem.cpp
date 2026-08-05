@@ -60,6 +60,7 @@ void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJs
 		return;
 	}
 	AbandonReconnectSeat(); // searching fresh from Reconnectable = declining the old seat
+	CurrentMatchId.Reset(); // a fresh search invalidates any previously known match
 	if (Queue.IsEmpty())
 	{
 		Fail(TEXT("No queue specified."));
@@ -101,6 +102,7 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 		return;
 	}
 	AbandonReconnectSeat(); // searching fresh from Reconnectable = declining the old seat
+	CurrentMatchId.Reset(); // a fresh search invalidates any previously known match
 	if (Queue.IsEmpty())
 	{
 		Fail(TEXT("No queue specified."));
@@ -137,6 +139,7 @@ void UFMMSSubsystem::Cancel()
 		}
 	}
 	AbandonReconnectSeat(); // Cancel from Reconnectable = decline the live seat
+	CurrentMatchId.Reset();
 	SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."));
 }
 
@@ -152,6 +155,7 @@ void UFMMSSubsystem::AbandonReconnectSeat()
 		Sdk->AbandonMatch(ReconnectTicketId);
 	}
 	ReconnectTicketId.Reset();
+	CurrentMatchId.Reset(); // the declined seat's match is no longer ours
 }
 
 void UFMMSSubsystem::CheckActiveSession()
@@ -194,6 +198,14 @@ void UFMMSSubsystem::Reconnect()
 
 void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat)
 {
+	// Record the live match id REGARDLESS of the phase machine below - it is
+	// informational (feeds GetCurrentMatchId for in-match match/team chat) and
+	// my-session is the only client-side source of it (the connection payload
+	// deliberately carries none).
+	if (Result == EFoundryFsdkResult::Ok && Seat.bActive)
+	{
+		CurrentMatchId = Seat.MatchId;
+	}
 	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching || Phase == EFMMSPhase::Connecting)
 	{
 		return; // a live flow started meanwhile - its handlers own the phase
@@ -207,6 +219,10 @@ void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionS
 	// No live seat (incl. old-fid 404 / transient failure): the match is gone, so
 	// any stale local state must not brick Find Match - reset to Idle.
 	ReconnectTicketId.Reset();
+	if (Result == EFoundryFsdkResult::Ok && !Seat.bActive)
+	{
+		CurrentMatchId.Reset(); // definitive platform answer: no live seat
+	}
 	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
 	{
 		SetPhase(EFMMSPhase::Idle, TEXT("Ready."));

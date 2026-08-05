@@ -80,6 +80,30 @@ struct FFsdkCoreState
 	}
 };
 
+/** Map a core chat channel to the Blueprint enum (values mirror 1:1). */
+static EFoundryChatChannel ToBlueprintChatChannel(fsdk_chat_channel Channel)
+{
+	switch (Channel)
+	{
+	case FSDK_CHAT_CHANNEL_PARTY: return EFoundryChatChannel::Party;
+	case FSDK_CHAT_CHANNEL_MATCH: return EFoundryChatChannel::Match;
+	case FSDK_CHAT_CHANNEL_TEAM:  return EFoundryChatChannel::Team;
+	default:                      return EFoundryChatChannel::Global;
+	}
+}
+
+/** Map the Blueprint chat channel to the core enum. */
+static fsdk_chat_channel ToCoreChatChannel(EFoundryChatChannel Channel)
+{
+	switch (Channel)
+	{
+	case EFoundryChatChannel::Party: return FSDK_CHAT_CHANNEL_PARTY;
+	case EFoundryChatChannel::Match: return FSDK_CHAT_CHANNEL_MATCH;
+	case EFoundryChatChannel::Team:  return FSDK_CHAT_CHANNEL_TEAM;
+	default:                         return FSDK_CHAT_CHANNEL_GLOBAL;
+	}
+}
+
 extern "C"
 {
 	/** fsdk_chat_message_fn: stage a POD-copy for the driver tick to broadcast
@@ -94,8 +118,7 @@ extern "C"
 			return;
 		}
 		FFsdkCoreState::FChatMsgCopy Copy;
-		Copy.Channel = Message->channel == FSDK_CHAT_CHANNEL_PARTY
-			? EFoundryChatChannel::Party : EFoundryChatChannel::Global;
+		Copy.Channel = ToBlueprintChatChannel(Message->channel);
 		Copy.DisplayName = UTF8_TO_TCHAR(Message->display_name);
 		Copy.FoundryId = UTF8_TO_TCHAR(Message->from_foundry_id);
 		Copy.Body = UTF8_TO_TCHAR(Message->body);
@@ -499,6 +522,59 @@ void UFoundryFSDKSubsystem::AbandonMatch(const FString& TicketId)
 // worker mid-join (blocking room-resolve HTTP) must never stall the game
 // thread; undrained frames simply carry to the next tick in order.
 
+/** Dispatch a channel join to its core wrapper. */
+static fsdk_result FoundryFSDKChatJoinCall(fsdk_chat* Chat, fsdk_chat_channel Channel,
+	const char* Key)
+{
+	switch (Channel)
+	{
+	case FSDK_CHAT_CHANNEL_PARTY: return fsdk_chat_join_party(Chat, Key);
+	case FSDK_CHAT_CHANNEL_MATCH: return fsdk_chat_join_match(Chat, Key);
+	case FSDK_CHAT_CHANNEL_TEAM:  return fsdk_chat_join_team(Chat, Key);
+	default:                      return fsdk_chat_join_global(Chat, Key);
+	}
+}
+
+/** The ONE join path every channel routes through, with the launcher re-mint
+ *  retry: run the channel's join and, on UNAUTHORIZED with a re-mintable
+ *  launcher session, transparently re-mint the 15-min daemon token and retry
+ *  ONCE. WORKER THREAD ONLY (the pipe read and the join's room-resolve HTTP
+ *  both block); the CALLER HOLDS the core lock. Creates the chat handle on
+ *  first use (any channel may be joined first - one socket regardless). */
+static fsdk_result FoundryFSDKChatJoinLocked(
+	const TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe>& CoreRef,
+	fsdk_chat_channel Channel, const FString& Key, bool bCanReHandoff)
+{
+	if (CoreRef->Chat == nullptr)
+	{
+		const fsdk_result CreateResult = fsdk_chat_create(CoreRef->Client, &CoreRef->Chat);
+		if (CreateResult != FSDK_OK)
+		{
+			return CreateResult;
+		}
+		fsdk_chat_set_message_callback(CoreRef->Chat,
+			&FoundryFSDKChatMessageThunk, CoreRef.Get());
+	}
+	const FTCHARToUTF8 KeyUtf8(*Key);
+	fsdk_result Result = FoundryFSDKChatJoinCall(CoreRef->Chat, Channel, KeyUtf8.Get());
+	if (Result == FSDK_ERR_UNAUTHORIZED && bCanReHandoff)
+	{
+		// The 15-min daemon token expired mid-session: transparently re-mint
+		// from the launcher and retry the join once. Worker thread - the pipe
+		// read is allowed to block here.
+		FString Fresh;
+		if (FoundryFSDKReadLauncherToken(Fresh) && !Fresh.IsEmpty())
+		{
+			const FTCHARToUTF8 FreshUtf8(*Fresh);
+			if (fsdk_set_player_token(CoreRef->Client, FreshUtf8.Get()) == FSDK_OK)
+			{
+				Result = FoundryFSDKChatJoinCall(CoreRef->Chat, Channel, KeyUtf8.Get());
+			}
+		}
+	}
+	return Result;
+}
+
 void UFoundryFSDKSubsystem::JoinGlobalChat(const FString& GameSlug)
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
@@ -561,37 +637,8 @@ void UFoundryFSDKSubsystem::StartChatJoin()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			if (CoreRef->Chat == nullptr)
-			{
-				Result = fsdk_chat_create(CoreRef->Client, &CoreRef->Chat);
-				if (Result == FSDK_OK)
-				{
-					fsdk_chat_set_message_callback(CoreRef->Chat,
-						&FoundryFSDKChatMessageThunk, CoreRef.Get());
-				}
-			}
-			else
-			{
-				Result = FSDK_OK;
-			}
-			if (Result == FSDK_OK)
-			{
-				Result = fsdk_chat_join_global(CoreRef->Chat, TCHAR_TO_UTF8(*Slug));
-			}
-			if (Result == FSDK_ERR_UNAUTHORIZED && bCanReHandoff)
-			{
-				// The 15-min daemon token expired mid-session: transparently re-mint
-				// from the launcher and retry the join once. Worker thread - the
-				// pipe read is allowed to block here.
-				FString Fresh;
-				if (FoundryFSDKReadLauncherToken(Fresh) && !Fresh.IsEmpty())
-				{
-					if (fsdk_set_player_token(CoreRef->Client, TCHAR_TO_UTF8(*Fresh)) == FSDK_OK)
-					{
-						Result = fsdk_chat_join_global(CoreRef->Chat, TCHAR_TO_UTF8(*Slug));
-					}
-				}
-			}
+			Result = FoundryFSDKChatJoinLocked(CoreRef, FSDK_CHAT_CHANNEL_GLOBAL,
+				Slug, bCanReHandoff);
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
 		{
@@ -616,13 +663,30 @@ void UFoundryFSDKSubsystem::StartChatJoin()
 
 void UFoundryFSDKSubsystem::JoinPartyChat(const FString& PartyId)
 {
-	// The party channel is a SUBSCRIPTION on the global chat's socket - the
-	// join worker multiplexes it through the same handle (creating the handle
-	// if the game joined party chat first). No second connection ever.
+	StartChatSubscriptionJoin(EFoundryChatChannel::Party, PartyId);
+}
+
+void UFoundryFSDKSubsystem::JoinMatchChat(const FString& MatchId)
+{
+	StartChatSubscriptionJoin(EFoundryChatChannel::Match, MatchId);
+}
+
+void UFoundryFSDKSubsystem::JoinTeamChat(const FString& MatchId)
+{
+	StartChatSubscriptionJoin(EFoundryChatChannel::Team, MatchId);
+}
+
+void UFoundryFSDKSubsystem::StartChatSubscriptionJoin(EFoundryChatChannel Channel,
+	const FString& Key)
+{
+	// Every non-global channel is a SUBSCRIPTION on the global chat's socket -
+	// the join worker multiplexes it through the same handle (creating the
+	// handle if this channel is joined first). No second connection ever.
+	// Routes through the SAME launcher re-mint retry path as the global join.
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
-	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || PartyId.IsEmpty())
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || Key.IsEmpty())
 	{
-		OnPartyChatStateChanged.Broadcast(false);
+		BroadcastChatChannelState(Channel, false);
 		return;
 	}
 	if (!ChatTickHandle.IsValid())
@@ -630,25 +694,30 @@ void UFoundryFSDKSubsystem::JoinPartyChat(const FString& PartyId)
 		ChatTickHandle = FTSTicker::GetCoreTicker().AddTicker(
 			FTickerDelegate::CreateUObject(this, &UFoundryFSDKSubsystem::ChatDriverTick), 0.25f);
 	}
-	Async(EAsyncExecution::Thread, [CoreRef, PartyId]()
+	const fsdk_chat_channel CoreChannel = ToCoreChatChannel(Channel);
+	const bool bCanReHandoff = bLauncherSession;
+	Async(EAsyncExecution::Thread, [CoreRef, CoreChannel, Key, bCanReHandoff]()
 	{
 		FScopeLock Lock(&CoreRef->CS);
-		if (CoreRef->Chat == nullptr)
-		{
-			if (fsdk_chat_create(CoreRef->Client, &CoreRef->Chat) != FSDK_OK)
-			{
-				return;
-			}
-			fsdk_chat_set_message_callback(CoreRef->Chat,
-				&FoundryFSDKChatMessageThunk, CoreRef.Get());
-		}
-		const fsdk_result Result = fsdk_chat_join_party(CoreRef->Chat, TCHAR_TO_UTF8(*PartyId));
+		const fsdk_result Result =
+			FoundryFSDKChatJoinLocked(CoreRef, CoreChannel, Key, bCanReHandoff);
 		if (Result != FSDK_OK)
 		{
-			UE_LOG(LogFoundryFSDK, Warning, TEXT("Party chat join failed: %s"),
+			UE_LOG(LogFoundryFSDK, Warning, TEXT("Chat channel join failed: %s"),
 				UTF8_TO_TCHAR(fsdk_result_str(Result)));
 		}
 	});
+}
+
+void UFoundryFSDKSubsystem::BroadcastChatChannelState(EFoundryChatChannel Channel, bool bReady)
+{
+	switch (Channel)
+	{
+	case EFoundryChatChannel::Party: OnPartyChatStateChanged.Broadcast(bReady); break;
+	case EFoundryChatChannel::Match: OnMatchChatStateChanged.Broadcast(bReady); break;
+	case EFoundryChatChannel::Team:  OnTeamChatStateChanged.Broadcast(bReady); break;
+	default:                         OnChatStateChanged.Broadcast(bReady); break;
+	}
 }
 
 void UFoundryFSDKSubsystem::LeavePartyChat()
@@ -668,6 +737,23 @@ void UFoundryFSDKSubsystem::LeavePartyChat()
 	});
 }
 
+void UFoundryFSDKSubsystem::LeaveMatchChat()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return;
+	}
+	Async(EAsyncExecution::Thread, [CoreRef]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->Chat != nullptr)
+		{
+			(void)fsdk_chat_leave_match(CoreRef->Chat); // clears MATCH + TEAM
+		}
+	});
+}
+
 void UFoundryFSDKSubsystem::SendChatToChannel(EFoundryChatChannel Channel, const FString& Body)
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
@@ -676,8 +762,7 @@ void UFoundryFSDKSubsystem::SendChatToChannel(EFoundryChatChannel Channel, const
 		OnChatSendComplete.Broadcast(EFoundryFsdkResult::Unavailable);
 		return;
 	}
-	const fsdk_chat_channel CoreChannel = Channel == EFoundryChatChannel::Party
-		? FSDK_CHAT_CHANNEL_PARTY : FSDK_CHAT_CHANNEL_GLOBAL;
+	const fsdk_chat_channel CoreChannel = ToCoreChatChannel(Channel);
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
 	Async(EAsyncExecution::Thread, [CoreRef, CoreChannel, Body, WeakThis]()
 	{
@@ -722,6 +807,16 @@ void UFoundryFSDKSubsystem::LeaveChat()
 	{
 		bPartyChatReady = false;
 		OnPartyChatStateChanged.Broadcast(false);
+	}
+	if (bMatchChatReady)
+	{
+		bMatchChatReady = false;
+		OnMatchChatStateChanged.Broadcast(false);
+	}
+	if (bTeamChatReady)
+	{
+		bTeamChatReady = false;
+		OnTeamChatStateChanged.Broadcast(false);
 	}
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
 	if (!CoreRef.IsValid())
@@ -1219,6 +1314,8 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 
 	bool bReadyNow = bChatReady;
 	bool bPartyReadyNow = bPartyChatReady;
+	bool bMatchReadyNow = bMatchChatReady;
+	bool bTeamReadyNow = bTeamChatReady;
 	if (CoreRef->CS.TryLock())
 	{
 		if (CoreRef->Chat != nullptr)
@@ -1236,6 +1333,10 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 			bReadyNow = fsdk_chat_ready(CoreRef->Chat) != 0;
 			bPartyReadyNow =
 				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_PARTY) != 0;
+			bMatchReadyNow =
+				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_MATCH) != 0;
+			bTeamReadyNow =
+				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_TEAM) != 0;
 		}
 		CoreRef->CS.Unlock();
 	}
@@ -1264,6 +1365,18 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 	{
 		bPartyChatReady = bPartyReadyNow;
 		OnPartyChatStateChanged.Broadcast(bPartyChatReady);
+	}
+
+	if (bMatchReadyNow != bMatchChatReady)
+	{
+		bMatchChatReady = bMatchReadyNow;
+		OnMatchChatStateChanged.Broadcast(bMatchChatReady);
+	}
+
+	if (bTeamReadyNow != bTeamChatReady)
+	{
+		bTeamChatReady = bTeamReadyNow;
+		OnTeamChatStateChanged.Broadcast(bTeamChatReady);
 	}
 
 	if (bReadyNow != bChatReady)
