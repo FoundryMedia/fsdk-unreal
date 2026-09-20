@@ -589,10 +589,14 @@ public:
 	// long-lived stored in the game. No launcher session -> fail fast (no form).
 
 	/**
-	 * Auto-authenticate from the launcher handoff (FOUNDRY_IPC). Async: broadcasts
-	 * OnLoginComplete (Ok on success; NotAuthenticated when there's no launcher
-	 * session, which the caller surfaces as "sign in through the Foundry launcher").
-	 * The default sign-in for launcher-distributed games (e.g. Conquest).
+	 * Auto-authenticate. DEFAULT: the launcher handoff (FOUNDRY_IPC). With no handoff
+	 * (the editor, a bare exe), a build that carries FID auth - every non-Shipping
+	 * build - falls back to TryResumeSession(): the session a developer persisted
+	 * once with the console's `foundry login`, so the editor signs in on every start
+	 * with no typing. Async: broadcasts OnLoginComplete (Ok on success;
+	 * NotAuthenticated when there is neither a launcher session nor a persisted one,
+	 * which the caller surfaces as "sign in through the Foundry launcher"). The
+	 * default sign-in for launcher-distributed games (e.g. Conquest).
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
 	void AutoLoginFromLauncher();

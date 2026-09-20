@@ -142,6 +142,22 @@ If you do not have a project yet:
    appears as a build target.
 3. Install the plugin as in section 2.
 
+### 2.2 The short way: `foundry init --template ue5-game`
+
+With the [`foundry` CLI](https://github.com/FoundryMedia/foundry/releases) installed, run this
+once from the folder that holds your `.uproject` (after the New Project wizard):
+
+```sh
+foundry init --template ue5-game
+```
+
+It does steps 2–4 of section 2 and step 2 of section 2.1 for you: downloads the latest plugin
+release into `Plugins/FoundryFSDK/`, adds the plugin entry to the `.uproject`, writes
+`Source/<Game>Server.Target.cs`, pins the network protocol version in your primary game module
+(section 3.4), and writes the `.foundry/config.yml` + `Docker/Dockerfile` that section 6 ships
+with. It never overwrites a file you already have. You still add `"FoundryFSDK"` to your
+`Build.cs`, regenerate project files and build.
+
 Everything below uses `MyGame` as the project name — substitute yours.
 
 ---
@@ -258,19 +274,19 @@ void AMyMenuPlayerController::HandleFMMSStatus(EFMMSPhase Phase, const FString& 
 Conquest's version: `Source/Conquest/Core/Player/MainMenuPlayerController.cpp`
 (`BeginPlay` → `AutoLoginFromLauncher`, `HandleLoginComplete`, `Cmd_FindMatch`).
 
-**In the editor there is no launcher, so `AutoLoginFromLauncher()` reports
-`NotAuthenticated`.** That is correct behavior, not a bug. For the day-to-day dev loop:
+**In the editor there is no launcher.** The first time, sign in once by hand: run with
+`-DevMode` (editor command line, or *Additional Launch Parameters* for a Standalone Game), press
+**`~`** for the Foundry console, type `foundry login <email>`; the password is prompted masked
+and the session is remembered in the OS keyring (Windows Credential Manager). From then on
+`AutoLoginFromLauncher()` finds no launcher, falls back to that remembered session, and every
+editor start signs in on its own — the same `OnLoginComplete` fires, your name is on screen,
+your menu code runs unchanged. `foundry logout` forgets it; `foundry whoami`,
+`foundry findmatch <queue>`, `foundry cancel` are there too.
 
-- Run with `-DevMode` (editor command line, or *Additional Launch Parameters* for a Standalone
-  Game), press **`~`** for the Foundry console, type `foundry login <email>`; the password is
-  prompted masked. The same `OnLoginComplete` fires, so your menu code is exercised unchanged.
-  `foundry whoami`, `foundry findmatch <queue>`, `foundry cancel` are there too.
-- This credential path exists **only in non-Shipping builds** (`FOUNDRY_FSDK_FID_AUTH`, set by
-  `FoundryFSDK.Build.cs`). A Shipping client carries no login code at all — only the launcher
-  handoff. That is the point.
-
-The launcher handoff itself is exercised the first time your build is installed and launched
-from the launcher (a test-build install; see section 6).
+This credential path exists **only in non-Shipping builds** (`FOUNDRY_FSDK_FID_AUTH`, set by
+`FoundryFSDK.Build.cs`). A Shipping client carries no login code at all — only the launcher
+handoff. That is the point. The handoff itself is exercised the first time your build is
+installed and launched from the launcher (a test-build install; see section 6).
 
 ### 3.2 Find a match — `UFMMSSubsystem`
 
@@ -558,9 +574,11 @@ assumed fully reverse-engineered; every permission is enforced by the platform.
 
 ## 6. Ship it: package, push, host, publish
 
-The `foundry` CLI drives the pipeline from a `.foundry/config.yml` in your project root.
-Sign in once with `foundry login`, register the game once in the console (or
-`foundry games create --name "Goo Crew"` — the slug is derived from the name and is permanent).
+The `foundry` CLI drives the pipeline from a `.foundry/config.yml` in your project root
+(`foundry init --template ue5-game` writes it, section 2.2). Sign in once with
+`foundry login`, register the game once in the console (or
+`foundry games create --name "Goo Crew"` — the slug is derived from the name and is permanent),
+and put your publisher handle + the slug in the config.
 
 ```yaml
 # .foundry/config.yml  (Conquest's, with the names changed)
@@ -587,43 +605,37 @@ server:
   imageName: goo-crew-server
 ```
 
-The server needs a `Docker/Dockerfile` + `Docker/entrypoint.sh`. `foundry package --server`
-cross-compiles and stages the Linux server to `Saved/StagedBuilds/LinuxServer/`, then runs
-`docker build` with `Saved/StagedBuilds/` as the context, so the Dockerfile `COPY`s
-`LinuxServer/`:
+The server needs a `Docker/Dockerfile`. `foundry package --server` cross-compiles and stages
+the Linux server to `Saved/StagedBuilds/LinuxServer/`, then runs `docker build` with
+`Saved/StagedBuilds/` as the context, so the Dockerfile `COPY`s `LinuxServer/`. This one is
+self-contained (no extra files in the context) and is what `foundry init --template ue5-game`
+writes:
 
 ```dockerfile
 # Docker/Dockerfile
+# Stage 1: the staged server minus its debug symbols (~1.4 GB the server never reads).
+FROM ubuntu:22.04 AS staged
+COPY LinuxServer/ /server/
+RUN find /server \( -name '*.debug' -o -name '*.sym' -o -name '*.pdb' \) -delete
+
+# Stage 2: the image. A UE Linux server needs only glibc + TLS roots (OpenSSL is static).
 FROM ubuntu:22.04
-# A UE Linux server needs only glibc + TLS roots (OpenSSL is statically linked into the binary).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates libc6 \
  && rm -rf /var/lib/apt/lists/*
-COPY LinuxServer/ /server/
-COPY entrypoint.sh /entrypoint.sh
 # UE dedicated servers REFUSE to run as root; the ELF loses its +x bit on Windows filesystems.
-RUN useradd -m -u 1000 ueserver \
- && chmod +x /server/GooCrew/Binaries/Linux/GooCrewServer /entrypoint.sh \
- && chown -R ueserver:ueserver /server
+RUN useradd -m -u 1000 ueserver
+COPY --from=staged --chown=ueserver:ueserver /server/ /server/
+RUN chmod +x /server/GooCrew/Binaries/Linux/GooCrewServer
 USER ueserver
 EXPOSE 7777/udp
-ENTRYPOINT ["/entrypoint.sh"]
+# The platform hands the container FOUNDRY_GAME_PORT and FOUNDRY_AUTH_BASE. The server loads
+# ServerDefaultMap from Config/DefaultEngine.ini; put a map name first to override.
+ENTRYPOINT ["/bin/sh", "-c", "exec /server/GooCrew/Binaries/Linux/GooCrewServer -Port=${FOUNDRY_GAME_PORT:-7777} -FoundryAuthBase=${FOUNDRY_AUTH_BASE:-https://auth.foundryplatform.app} -unattended -stdout -FullStdOutLogOutput"]
 ```
 
-```sh
-#!/bin/sh
-# Docker/entrypoint.sh - the platform sets FOUNDRY_GAME_PORT and FOUNDRY_AUTH_BASE.
-exec /server/GooCrew/Binaries/Linux/GooCrewServer GooCrew_Arena \
-  -Port="${FOUNDRY_GAME_PORT:-7777}" \
-  -FoundryAuthBase="${FOUNDRY_AUTH_BASE:-https://auth.foundryplatform.app}" \
-  -unattended -stdout -FullStdOutLogOutput
-```
-
-The Dockerfile path comes from `server.dockerfile`, but the **build context is
-`Saved/StagedBuilds/`**, so `COPY entrypoint.sh` resolves there: copy `Docker/entrypoint.sh` into
-`Saved/StagedBuilds/` before packaging (the CLI does not do this for you yet), LF-terminated.
-Put a `.dockerignore` next to it excluding `Windows/`, `**/*.debug`, `**/*.sym`, `**/*.pdb`
-and `Manifest_*.txt` — about 1.4 GB of symbols the server never reads.
+Set `ServerDefaultMap` (and `GameDefaultMap`) in `Config/DefaultEngine.ini` under
+`[/Script/EngineSettings.GameMapsSettings]` so the server knows what to load.
 
 Then, in order:
 
@@ -702,7 +714,7 @@ re-vendoring from `fsdk-core`, re-apply that gate — upstream does not carry it
 | Server log `PreLogin rejected: token validation failed` on every join | The server cannot reach the JWKS at `<FoundryAuthBase>/.well-known/jwks.json`, or the token was minted for another match. Check `-FoundryAuthBase` and the container's outbound HTTPS. |
 | `MyGameServer` is not a build target | The engine is a Launcher (binary) install, or the `Server.Target.cs` was added without regenerating project files. |
 | Container exits at once with `Refusing to run with the root privileges` | Run the server as a non-root user (the Dockerfile above). |
-| `foundry package --server`: `Dockerfile not found` / `COPY LinuxServer/` or `COPY entrypoint.sh` fails | The Dockerfile path is `server.dockerfile` in the config; the build context is `Saved/StagedBuilds/`, so `entrypoint.sh` must be copied there. |
+| `foundry package --server`: `Dockerfile not found` / `COPY LinuxServer/` fails | The Dockerfile path is `server.dockerfile` in the config; the build context is `Saved/StagedBuilds/`, so every `COPY` source must live there. |
 
 ## License
 

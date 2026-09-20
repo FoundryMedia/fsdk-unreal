@@ -1634,7 +1634,16 @@ void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
 			}
 			else
 			{
+#if FOUNDRY_FSDK_FID_AUTH
+				// No launcher handoff (the editor, a bare exe). A build that carries FID
+				// auth (every non-Shipping build) resumes the session the developer
+				// persisted ONCE with the console's `foundry login` (OS keyring) - sign in
+				// once per machine, not once per editor start. Nothing persisted ->
+				// NotAuthenticated, exactly as before.
+				Self->TryResumeSession();
+#else
 				Self->ApplyLoginResult(EFoundryFsdkResult::NotAuthenticated, FString(), FString());
+#endif
 			}
 		});
 	});
