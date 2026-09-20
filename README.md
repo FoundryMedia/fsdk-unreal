@@ -642,9 +642,15 @@ foundry fcm publish Saved/StagedBuilds/Windows --version 0.1.0 --prerelease
 #      (--managed = platform-held KMS signing, available once Foundry has enabled it for your org.)
 ```
 
-Create the matchmaking queue in the console (**Matchmaking → New queue**: game, mode, team
-shape, fill rules) or with `foundry fmms queue create --help`. Its name is what
-`FindMatchAuthenticated` takes.
+Create the matchmaking queue in the console (**Matchmaking → New queue**) or from the CLI. Its
+name — `<game-slug>/<mode-slug>` — is what `FindMatchAuthenticated` takes:
+
+```sh
+foundry fmms queue create --game goo-crew --mode-slug spread --display-name "Spread" \
+  --teams 4 --team-size 12 --min-players 4 --backfill
+#   -> queue "goo-crew/spread": up to 4 teams of 12, a match starts at 4 players,
+#      later searchers join in progress.
+```
 
 Foundry's own walkthrough of this pipeline is the **Goo Crew** series: Ep1 sign in, Ep2 host
 it, Ep3 match it, Ep4 ship it.
