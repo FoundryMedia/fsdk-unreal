@@ -24,6 +24,9 @@
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/CommandLine.h"
+#include "Misc/CoreMisc.h"
+#include "Misc/Parse.h"
 #include "Misc/ScopeLock.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDK, Log, All);
@@ -172,10 +175,26 @@ void UFoundryFSDKSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 	UE_LOG(LogFoundryFSDK, Log, TEXT("FoundryFSDK subsystem initialized (fsdk-core %s)"),
 		UTF8_TO_TCHAR(fsdk_version()));
+
+	// Sign in with NO game code: the launcher handoff, or (dev builds) the session
+	// `foundry login` remembered. Deferred to the first frame so everything that binds
+	// OnLoginComplete in its own Initialize (the dev console) sees the result.
+	// -NoFoundryAutoLogin hands the timing to the game (it calls AutoLoginFromLauncher).
+	if (!IsRunningDedicatedServer() && !IsRunningCommandlet()
+		&& !FParse::Param(FCommandLine::Get(), TEXT("NoFoundryAutoLogin")))
+	{
+		StartupAutoLoginRetriesLeft = 2;
+		ScheduleStartupAutoLogin(0.0f);
+	}
 }
 
 void UFoundryFSDKSubsystem::Deinitialize()
 {
+	if (StartupAutoLoginTickHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(StartupAutoLoginTickHandle);
+		StartupAutoLoginTickHandle.Reset();
+	}
 	// Chat first: stop the driver tick + detach the WS sink BEFORE the core state
 	// can go away (the sink holds only a weak ref, but a live tick must not race
 	// the teardown).
@@ -1418,13 +1437,47 @@ TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> UFoundryFSDKSubsystem::EnsureCli
 void UFoundryFSDKSubsystem::ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName,
                                              const FString& FoundryId)
 {
+	bAutoLoginInFlight = false;
+	const bool bStartup = bStartupAutoLoginInFlight;
+	bStartupAutoLoginInFlight = false;
 	if (Result == EFoundryFsdkResult::Ok)
 	{
 		bIsLoggedIn = true;
 		CachedDisplayName = DisplayName;
 		CachedFoundryId = FoundryId;
 	}
+	else if (bStartup && StartupAutoLoginRetriesLeft > 0
+		&& (Result == EFoundryFsdkResult::Network || Result == EFoundryFsdkResult::Timeout))
+	{
+		// The first HTTPS request of a process can lose to a cold DNS/TLS path; a
+		// startup sign-in retries a transient failure instead of greeting the player
+		// with "sign-in failed". The retry broadcasts its own result.
+		--StartupAutoLoginRetriesLeft;
+		UE_LOG(LogFoundryFSDK, Warning, TEXT("Startup sign-in hit a transient %s - retrying in 2s"),
+			*UEnum::GetValueAsString(Result));
+		ScheduleStartupAutoLogin(2.0f);
+		return;
+	}
 	OnLoginComplete.Broadcast(Result, DisplayName);
+}
+
+void UFoundryFSDKSubsystem::ScheduleStartupAutoLogin(float DelaySeconds)
+{
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	StartupAutoLoginTickHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateLambda([WeakThis](float) -> bool
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->StartupAutoLoginTickHandle.Reset();
+				if (Self->StartAutoLogin())
+				{
+					Self->bStartupAutoLoginInFlight = true;
+				}
+			}
+			return false; // one-shot
+		}),
+		DelaySeconds);
 }
 
 #if FOUNDRY_FSDK_FID_AUTH
@@ -1516,7 +1569,7 @@ void UFoundryFSDKSubsystem::TryResumeSession()
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		OnLoginComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FString());
+		ApplyLoginResult(EFoundryFsdkResult::NotAuthenticated, FString(), FString());
 		return;
 	}
 
@@ -1609,9 +1662,22 @@ void UFoundryFSDKSubsystem::Logout()
 
 void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
 {
+	StartAutoLogin();
+}
+
+bool UFoundryFSDKSubsystem::StartAutoLogin()
+{
 	// DEFAULT sign-in: read a scoped match token from the launcher session daemon
 	// (FOUNDRY_IPC) on a worker, then authenticate on the game thread. No handoff ->
 	// fail fast (NotAuthenticated); the menu surfaces "sign in through the launcher".
+	// One attempt at a time: a call while one is in flight is a no-op (that attempt's
+	// OnLoginComplete reaches everyone bound by then). A call after completion runs
+	// again - cheap, and a launcher session gets a fresh token that way.
+	if (bAutoLoginInFlight)
+	{
+		return false;
+	}
+	bAutoLoginInFlight = true;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
 	Async(EAsyncExecution::Thread, [WeakThis]()
 	{
@@ -1647,6 +1713,7 @@ void UFoundryFSDKSubsystem::AutoLoginFromLauncher()
 			}
 		});
 	});
+	return true;
 }
 
 void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
@@ -1660,7 +1727,7 @@ void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		OnLoginComplete.Broadcast(EFoundryFsdkResult::Internal, FString());
+		ApplyLoginResult(EFoundryFsdkResult::Internal, FString(), FString());
 		return;
 	}
 	fsdk_result R;

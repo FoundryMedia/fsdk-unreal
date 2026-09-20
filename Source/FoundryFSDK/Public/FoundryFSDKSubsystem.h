@@ -595,8 +595,14 @@ public:
 	 * once with the console's `foundry login`, so the editor signs in on every start
 	 * with no typing. Async: broadcasts OnLoginComplete (Ok on success;
 	 * NotAuthenticated when there is neither a launcher session nor a persisted one,
-	 * which the caller surfaces as "sign in through the Foundry launcher"). The
-	 * default sign-in for launcher-distributed games (e.g. Conquest).
+	 * which the caller surfaces as "sign in through the Foundry launcher").
+	 *
+	 * The subsystem CALLS THIS ITSELF on the first frame (no game code needed; a
+	 * transient network failure is retried twice; `-NoFoundryAutoLogin` on the
+	 * command line hands the timing to the game). Calling it again is safe: while an
+	 * attempt is in flight it is a no-op, afterwards it signs in again (a launcher
+	 * session gets a fresh token). Bind OnLoginComplete, or read IsLoggedIn() /
+	 * GetDisplayName() if you come late.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Auth")
 	void AutoLoginFromLauncher();
@@ -674,6 +680,17 @@ private:
 
 	/** Apply a session result on the game thread: cache identity + broadcast OnLoginComplete. */
 	void ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName, const FString& FoundryId);
+
+	/** AutoLoginFromLauncher's body; false when an attempt was already in flight. */
+	bool StartAutoLogin();
+
+	/** Queue the startup sign-in (or a retry) on the core ticker, DelaySeconds from now. */
+	void ScheduleStartupAutoLogin(float DelaySeconds);
+
+	bool bAutoLoginInFlight = false;         // one AutoLoginFromLauncher attempt at a time
+	bool bStartupAutoLoginInFlight = false;  // the in-flight attempt is the subsystem's own
+	int32 StartupAutoLoginRetriesLeft = 0;   // transient Network/Timeout retries (startup only)
+	FTSTicker::FDelegateHandle StartupAutoLoginTickHandle;
 
 	/** Game thread (the chat driver tick): drain inbound WS frames into the chat
 	 *  handle, run the keepalive, detect ready flips, drive the auto-rejoin. */

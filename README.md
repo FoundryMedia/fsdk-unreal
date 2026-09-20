@@ -175,8 +175,9 @@ connects to that pipe and receives a short-lived, matchmaking-scoped player toke
 never sees a password, never stores a session, and holds no secret** — a decompiled client can
 at most act as that player's matchmaking identity for 15 minutes.
 
-`AutoLoginFromLauncher()` does the whole thing. It is asynchronous and reports through
-`OnLoginComplete(Result, DisplayName)`:
+**You do not have to call anything to be signed in.** The subsystem runs
+`AutoLoginFromLauncher()` by itself on the first frame; your game only listens. The call is
+asynchronous and reports through `OnLoginComplete(Result, DisplayName)`:
 
 - `Ok` — signed in; `DisplayName` is the player's platform display name (put it on screen).
 - `NotAuthenticated` — no launcher session (the game was not started from the launcher, or the
@@ -235,7 +236,9 @@ void AMyMenuPlayerController::BeginPlay()
     Fsdk->OnLoginComplete.AddDynamic(this, &AMyMenuPlayerController::HandleLoginComplete);
     Fmms->OnFMMSStatus.AddDynamic(this, &AMyMenuPlayerController::HandleFMMSStatus);
 
-    // The default sign-in: the launcher handoff (FOUNDRY_IPC). No credentials in the game.
+    // The plugin already started signing in at startup. Calling again is safe: a no-op
+    // while that attempt is in flight, a fresh sign-in if it already finished - either
+    // way this controller gets its OnLoginComplete.
     Fsdk->AutoLoginFromLauncher();
 }
 
@@ -287,6 +290,9 @@ This credential path exists **only in non-Shipping builds** (`FOUNDRY_FSDK_FID_A
 `FoundryFSDK.Build.cs`). A Shipping client carries no login code at all — only the launcher
 handoff. That is the point. The handoff itself is exercised the first time your build is
 installed and launched from the launcher (a test-build install; see section 6).
+
+A game that wants to own the moment of sign-in (a splash first, say) passes
+`-NoFoundryAutoLogin` on the command line and calls `AutoLoginFromLauncher()` itself.
 
 ### 3.2 Find a match — `UFMMSSubsystem`
 
