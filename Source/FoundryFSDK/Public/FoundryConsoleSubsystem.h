@@ -14,6 +14,7 @@ class FFoundryConsoleLogCapture;
 class SFoundryConsole;
 class SFoundryStatsOverlay;
 class SFoundryNetGraph;
+class SWidget;
 
 /** Who may run (and see, in `help`) a console command. Evaluated live against the
  *  FSDK session, so the available surface changes with auth state. */
@@ -191,6 +192,9 @@ private:
 
 	void CloseConsole();
 	void RemoveNetGraph();
+	/** Hand keyboard focus back to FocusBeforeOpen (else the game viewport) one tick after a close. */
+	void ScheduleFocusRestore();
+	void RestoreFocus();
 	void RemoveStatsOverlay();
 	void SetWidgetPasswordMode(bool bOn);
 	void LoadPersistedHistory();
@@ -222,6 +226,12 @@ private:
 
 	TSharedPtr<FFoundryConsoleLogCapture> LogCapture; // shared: deleter is type-erased (fwd-decl safe)
 	FTSTicker::FDelegateHandle LogDrainTicker;
+
+	/** Keyboard focus at the moment the console OPENED (a menu's text box, the game
+	 *  viewport, ...). Restored on close so Esc / the toggle key hand control back to
+	 *  wherever the player was, instead of leaving nothing focused. */
+	TWeakPtr<SWidget> FocusBeforeOpen;
+	FTSTicker::FDelegateHandle FocusRestoreTicker;
 
 	FKey ConsoleKey;
 	FKey OverlayKey;

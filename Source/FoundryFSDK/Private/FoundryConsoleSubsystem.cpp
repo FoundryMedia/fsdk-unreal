@@ -721,6 +721,7 @@ void UFoundryConsoleSubsystem::Deinitialize()
 	}
 	KeyProcessor.Reset();
 	CloseConsole();
+	FTSTicker::GetCoreTicker().RemoveTicker(FocusRestoreTicker); // nothing to hand focus back to on teardown
 	RemoveStatsOverlay();
 	RemoveNetGraph();
 	ConsoleWidget.Reset();
@@ -755,6 +756,15 @@ void UFoundryConsoleSubsystem::ToggleConsole()
 	{
 		ConsoleWidget = SNew(SFoundryConsole).Owner(this);
 	}
+	// Remember where keyboard focus is BEFORE the console takes it (a menu's text
+	// box, the game viewport, ...) so closing hands control straight back there.
+	// A close-then-reopen inside one tick would otherwise restore over the new open.
+	FTSTicker::GetCoreTicker().RemoveTicker(FocusRestoreTicker);
+	FocusBeforeOpen.Reset();
+	if (FSlateApplication::IsInitialized())
+	{
+		FocusBeforeOpen = FSlateApplication::Get().GetKeyboardFocusedWidget();
+	}
 	GI->GetGameViewportClient()->AddViewportWidgetContent(ConsoleWidget.ToSharedRef(), /*ZOrder=*/10002);
 	bConsoleOpen = true;
 	ConsoleWidget->FocusInput();
@@ -777,13 +787,45 @@ void UFoundryConsoleSubsystem::CloseConsole()
 		}
 		// The toggle KEYDOWN closes the console, but its WM_CHAR arrives AFTER —
 		// and the (now hidden) input box was still keyboard-focused, so the '`'
-		// typed into it and greeted the next open as pretyped text. Clear both
-		// the focus (so the trailing char routes nowhere) and any residue.
+		// typed into it and greeted the next open as pretyped text. Clear the
+		// residue and drop focus NOW (so the trailing char routes nowhere), then
+		// hand focus back NEXT TICK to wherever it was before the open — an
+		// immediate restore would type that same char into the menu's text box,
+		// and leaving focus cleared strands the player with dead input.
 		ConsoleWidget->ClearInput();
 		if (FSlateApplication::IsInitialized())
 		{
 			FSlateApplication::Get().ClearKeyboardFocus(EFocusCause::SetDirectly);
+			ScheduleFocusRestore();
 		}
+	}
+}
+
+void UFoundryConsoleSubsystem::ScheduleFocusRestore()
+{
+	FTSTicker::GetCoreTicker().RemoveTicker(FocusRestoreTicker);
+	FocusRestoreTicker = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateWeakLambda(this, [this](float) { RestoreFocus(); return false; }), 0.f);
+}
+
+void UFoundryConsoleSubsystem::RestoreFocus()
+{
+	FocusRestoreTicker.Reset();
+	if (bConsoleOpen || !FSlateApplication::IsInitialized())
+	{
+		return; // reopened before the tick landed - the open path re-recorded focus
+	}
+	FSlateApplication& Slate = FSlateApplication::Get();
+	const TSharedPtr<SWidget> Previous = FocusBeforeOpen.Pin();
+	FocusBeforeOpen.Reset();
+	// SetKeyboardFocus answers false when the widget is no longer in any window
+	// (a menu that closed while the console was up). Nothing focused before the
+	// open, or a target that is gone, falls back to the game viewport - the one
+	// focus target that always makes sense in a game, and the one whose loss is
+	// what "the console unfocused me" feels like.
+	if (!Previous.IsValid() || !Slate.SetKeyboardFocus(Previous, EFocusCause::SetDirectly))
+	{
+		Slate.SetUserFocusToGameViewport(Slate.GetUserIndexForKeyboard(), EFocusCause::SetDirectly);
 	}
 }
 
