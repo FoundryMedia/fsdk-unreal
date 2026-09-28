@@ -40,6 +40,17 @@ DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDKCore, Log, All);
 
 namespace
 {
+	/** Chained log observer (FoundryFSDKSetAuxLogSink) - see FoundryFSDKTransport.h.
+	 *  Own lock, deliberately separate from any fsdk-core state lock: the core
+	 *  can log from inside a worker that already holds its own critical section,
+	 *  so this sink must never try to take one - it only stores/invokes the
+	 *  TFunction, whatever the subscriber does with it is the subscriber's problem. */
+	FCriticalSection GFsdkLogAuxLock;
+	TFunction<void(int32, const FString&)> GFsdkLogAuxSink;
+}
+
+namespace
+{
 	/** Result captured by the completion lambda; heap-owned (shared) so it safely
 	 *  outlives a timed-out request that completes later. bDone is the atomic
 	 *  release/acquire barrier: the completing thread writes Code/Body, THEN sets
@@ -72,6 +83,20 @@ extern "C"
 			case FSDK_LOG_WARN:  UE_LOG(LogFoundryFSDKCore, Warning, TEXT("%s"), *Msg); break;
 			case FSDK_LOG_INFO:  UE_LOG(LogFoundryFSDKCore, Log,     TEXT("%s"), *Msg); break;
 			default:             UE_LOG(LogFoundryFSDKCore, Verbose, TEXT("%s"), *Msg); break;
+		}
+
+		// Chained observer (see FoundryFSDKSetAuxLogSink) - never replaces the
+		// UE_LOG routing above, just an additional tap. Copy the TFunction out
+		// under the lock and invoke it OUTSIDE the lock (the subscriber may do
+		// its own locking/dispatch; never call out while holding this one).
+		TFunction<void(int32, const FString&)> Aux;
+		{
+			FScopeLock Lock(&GFsdkLogAuxLock);
+			Aux = GFsdkLogAuxSink;
+		}
+		if (Aux)
+		{
+			Aux(static_cast<int32>(Level), Msg);
 		}
 	}
 
@@ -418,6 +443,18 @@ void FoundryFSDKInstallHttpTransport()
 void FoundryFSDKInstallLogSink()
 {
 	fsdk_set_log_sink(&FoundryFSDKLogSink, nullptr);
+}
+
+void FoundryFSDKSetAuxLogSink(TFunction<void(int32 Level, const FString& Message)> OnLog)
+{
+	FScopeLock Lock(&GFsdkLogAuxLock);
+	GFsdkLogAuxSink = MoveTemp(OnLog);
+}
+
+void FoundryFSDKClearAuxLogSink()
+{
+	FScopeLock Lock(&GFsdkLogAuxLock);
+	GFsdkLogAuxSink = nullptr;
 }
 
 void FoundryFSDKShutdownBridges()

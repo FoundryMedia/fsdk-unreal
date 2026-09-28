@@ -36,6 +36,7 @@ const char* fsdk_result_str(fsdk_result result) {
         case FSDK_ERR_AGONES:           return "FSDK_ERR_AGONES";
         case FSDK_ERR_INTERNAL:         return "FSDK_ERR_INTERNAL";
         case FSDK_ERR_UNAVAILABLE:      return "FSDK_ERR_UNAVAILABLE";
+        case FSDK_ERR_RATE_LIMITED:     return "FSDK_ERR_RATE_LIMITED";
         default:                        return "FSDK_ERR_UNKNOWN";
     }
 }

@@ -43,6 +43,7 @@ struct FFsdkCoreState
 	fsdk_client* Client = nullptr;
 	fsdk_ticket* ActiveTicket = nullptr;
 	fsdk_chat* Chat = nullptr;
+	fsdk_textchat* TextChat = nullptr;
 	FCriticalSection CS;
 
 	// ── Chat WS handoff ──
@@ -66,8 +67,35 @@ struct FFsdkCoreState
 	};
 	TArray<FChatMsgCopy> ChatMessages;
 
+	/** Text-chat lines copied by FoundryFSDKTextChatLineThunk. GAME-THREAD-ONLY
+	 *  drain rule mirrors ChatMessages above: staged under CS (from whichever
+	 *  worker/thread produced the line), broadcast + cleared by the driver tick
+	 *  AFTER releasing the lock. */
+	struct FTextChatLineCopy
+	{
+		FFoundryChatLine Line;
+	};
+	TArray<FTextChatLineCopy> TextChatLines;
+
+	/** One pending chat slash-command invocation, staged by
+	 *  FoundryFSDKChatCommandThunk (fires on whatever thread called
+	 *  fsdk_textchat_submit - a worker, while CS is already held by that same
+	 *  call) for the game thread to execute the Blueprint handler on
+	 *  (SubmitChatLine's completion drains this - see
+	 *  UFoundryFSDKSubsystem::DrainPendingChatCommands). */
+	struct FStagedChatCommand
+	{
+		FString Name;
+		TArray<FString> Args;
+	};
+	TArray<FStagedChatCommand> PendingChatCommands;
+
 	~FFsdkCoreState()
 	{
+		if (TextChat != nullptr)
+		{
+			fsdk_textchat_destroy(TextChat); // detaches Chat's message callback first
+		}
 		if (Chat != nullptr)
 		{
 			fsdk_chat_destroy(Chat); // borrows Client - must go first
@@ -112,7 +140,16 @@ extern "C"
 	/** fsdk_chat_message_fn: stage a POD-copy for the driver tick to broadcast
 	 *  once it releases the core lock. UserData is the owning FFsdkCoreState -
 	 *  guaranteed alive: this only ever fires inside the tick's drain, which
-	 *  holds a ref. */
+	 *  holds a ref.
+	 *
+	 *  NOTE: once ConfigureTextChat has created a text-chat handle bound to
+	 *  this fsdk_chat (the default Platform preset), fsdk_textchat_create takes
+	 *  over this callback slot (fsdk_chat_set_message_callback is single-
+	 *  owner) - ConfigureTextChat immediately re-installs this SAME thunk as
+	 *  fsdk-core's room PASS-THROUGH (fsdk_textchat_set_room_passthrough), so
+	 *  it keeps firing for every raw room message (all four channels) exactly
+	 *  as before; FoundryFSDKTextChatLineThunk below is a SEPARATE slot on the
+	 *  same handle that records text chat's own Party history/OnChatLine. */
 	static void FoundryFSDKChatMessageThunk(const fsdk_chat_message* Message, void* UserData)
 	{
 		FFsdkCoreState* State = static_cast<FFsdkCoreState*>(UserData);
@@ -126,6 +163,107 @@ extern "C"
 		Copy.FoundryId = UTF8_TO_TCHAR(Message->from_foundry_id);
 		Copy.Body = UTF8_TO_TCHAR(Message->body);
 		State->ChatMessages.Add(MoveTemp(Copy));
+	}
+}
+
+/** Map a core text-chat channel to the Blueprint enum (values mirror 1:1). */
+static EFoundryTextChatChannel ToBlueprintTextChatChannel(fsdk_textchat_channel Channel)
+{
+	switch (Channel)
+	{
+	case FSDK_TEXTCHAT_WHISPER: return EFoundryTextChatChannel::Whisper;
+	case FSDK_TEXTCHAT_SYSTEM:  return EFoundryTextChatChannel::System;
+	default:                    return EFoundryTextChatChannel::Party;
+	}
+}
+
+/** Map the Blueprint text-chat channel to the core enum. */
+static fsdk_textchat_channel ToCoreTextChatChannel(EFoundryTextChatChannel Channel)
+{
+	switch (Channel)
+	{
+	case EFoundryTextChatChannel::Whisper: return FSDK_TEXTCHAT_WHISPER;
+	case EFoundryTextChatChannel::System:  return FSDK_TEXTCHAT_SYSTEM;
+	default:                               return FSDK_TEXTCHAT_PARTY;
+	}
+}
+
+/** Map a core text-chat line kind to the Blueprint enum (values mirror 1:1). */
+static EFoundryChatLineKind ToBlueprintChatLineKind(fsdk_textchat_line_kind Kind)
+{
+	switch (Kind)
+	{
+	case FSDK_TEXTCHAT_LINE_WHISPER_IN:  return EFoundryChatLineKind::WhisperIn;
+	case FSDK_TEXTCHAT_LINE_WHISPER_OUT: return EFoundryChatLineKind::WhisperOut;
+	case FSDK_TEXTCHAT_LINE_SYSTEM:      return EFoundryChatLineKind::System;
+	case FSDK_TEXTCHAT_LINE_ERROR:       return EFoundryChatLineKind::Error;
+	default:                             return EFoundryChatLineKind::Chat;
+	}
+}
+
+extern "C"
+{
+	/** fsdk_textchat_line_fn: stage a POD-copy of every recorded line for the
+	 *  driver tick to broadcast (OnChatLine) once it releases the core lock.
+	 *  UserData is the owning FFsdkCoreState (same contract as
+	 *  FoundryFSDKChatMessageThunk above - only ever fires inside a call this
+	 *  binding made under the lock, which holds a ref).
+	 *
+	 *  NOTE: this used to ALSO bridge Party/Chat lines back into OnChatMessage
+	 *  (fsdk_textchat_create takes over the fsdk_chat message-callback slot, so
+	 *  OnChatMessage would otherwise go silent for Party). That bridge is GONE
+	 *  now that ConfigureTextChat installs FoundryFSDKChatMessageThunk itself as
+	 *  fsdk-core's new room pass-through (fsdk_textchat_set_room_passthrough) -
+	 *  it already receives every raw room message (all four channels,
+	 *  including Party) directly from the core, so bridging from here too would
+	 *  double-fire OnChatMessage for Party. */
+	static void FoundryFSDKTextChatLineThunk(const fsdk_textchat_line* Line, void* UserData)
+	{
+		FFsdkCoreState* State = static_cast<FFsdkCoreState*>(UserData);
+		if (State == nullptr || Line == nullptr)
+		{
+			return;
+		}
+		FFsdkCoreState::FTextChatLineCopy Copy;
+		Copy.Line.Id = Line->id;
+		Copy.Line.Channel = ToBlueprintTextChatChannel(Line->channel);
+		Copy.Line.Kind = ToBlueprintChatLineKind(Line->kind);
+		Copy.Line.FromFoundryId = UTF8_TO_TCHAR(Line->from_foundry_id);
+		Copy.Line.FromName = UTF8_TO_TCHAR(Line->from_name);
+		Copy.Line.PeerFoundryId = UTF8_TO_TCHAR(Line->peer_foundry_id);
+		Copy.Line.PeerName = UTF8_TO_TCHAR(Line->peer_name);
+		Copy.Line.Body = UTF8_TO_TCHAR(Line->body);
+		Copy.Line.TimestampMs = static_cast<int64>(Line->ts_ms);
+		State->TextChatLines.Add(MoveTemp(Copy));
+	}
+
+	/** fsdk_textchat_command_fn: ONE native thunk backs EVERY Blueprint chat
+	 *  command (fsdk_textchat_register_command keeps a single fn + user_data
+	 *  per name; UserData is the owning FFsdkCoreState). Fires SYNCHRONOUSLY
+	 *  from inside fsdk_textchat_submit's dispatch, on whatever thread called
+	 *  submit (a worker, with CS already held by that call) - a Blueprint
+	 *  delegate can only run on the game thread, so this only STAGES the
+	 *  invocation; UFoundryFSDKSubsystem::DrainPendingChatCommands executes it
+	 *  from SubmitChatLine's game-thread completion and records the handler's
+	 *  response itself. */
+	static void FoundryFSDKChatCommandThunk(fsdk_textchat* /*Tc*/, int Argc, const char** Argv,
+		const char* /*Rest*/, void* UserData)
+	{
+		FFsdkCoreState* State = static_cast<FFsdkCoreState*>(UserData);
+		if (State == nullptr || Argc <= 0 || Argv == nullptr || Argv[0] == nullptr)
+		{
+			return;
+		}
+		FFsdkCoreState::FStagedChatCommand Cmd;
+		Cmd.Name = UTF8_TO_TCHAR(Argv[0]);
+		for (int i = 1; i < Argc; i++)
+		{
+			if (Argv[i] != nullptr)
+			{
+				Cmd.Args.Add(UTF8_TO_TCHAR(Argv[i]));
+			}
+		}
+		State->PendingChatCommands.Add(MoveTemp(Cmd));
 	}
 }
 
@@ -163,6 +301,7 @@ namespace
 			case FSDK_ERR_TOKEN_EXPIRED:     return EFoundryFsdkResult::Unauthorized;
 			case FSDK_ERR_NO_MATCH:          return EFoundryFsdkResult::NoMatch;
 			case FSDK_ERR_UNAVAILABLE:       return EFoundryFsdkResult::Unavailable;
+			case FSDK_ERR_RATE_LIMITED:      return EFoundryFsdkResult::RateLimited;
 			case FSDK_ERR_AGONES:            return EFoundryFsdkResult::Internal;
 			case FSDK_ERR_INTERNAL:          return EFoundryFsdkResult::Internal;
 			default:                         return EFoundryFsdkResult::Unknown;
@@ -204,6 +343,10 @@ void UFoundryFSDKSubsystem::Deinitialize()
 		ChatTickHandle.Reset();
 	}
 	FoundryFSDKClearWsSink();
+	// The aux log sink (ConfigureTextChat's bRouteSdkLogToSystem) holds only a
+	// weak ref to the core state, but drop it too - no reason for a torn-down
+	// subsystem's diagnostics to keep dispatching workers.
+	FoundryFSDKClearAuxLogSink();
 	// Drop the subsystem's reference. Any worker mid-call holds its own ref, so
 	// the handles stay alive until that call returns, then free on the last release.
 	Core.Reset();
@@ -944,7 +1087,17 @@ void UFoundryFSDKSubsystem::RefreshParty()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->OnPartyUpdated.Broadcast(ToBlueprintResult(Result), Party);
+				const EFoundryFsdkResult BpResult = ToBlueprintResult(Result);
+				Self->OnPartyUpdated.Broadcast(BpResult, Party);
+				if (BpResult == EFoundryFsdkResult::Ok)
+				{
+					// Text-chat party auto-bind: this is the ONE choke point every
+					// party-shape change lands on (CreateParty/AcceptPartyInvite/
+					// DeclinePartyInvite/LeaveParty all chain an automatic
+					// RefreshParty on success - see RunSocialAction's
+					// bRefreshPartyOnOk).
+					Self->ApplyTextChatPartyId(Party.PartyId);
+				}
 			}
 		});
 	});
@@ -1314,6 +1467,414 @@ void UFoundryFSDKSubsystem::MarkWhisperRead(const FString& FriendFoundryId)
 	});
 }
 
+// ── FRC text chat ────────────────────────────────────────────────────────────
+
+void UFoundryFSDKSubsystem::ConfigureTextChat(const FFoundryTextChatConfig& Config)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		UE_LOG(LogFoundryFSDK, Error, TEXT("ConfigureTextChat called before a client exists"));
+		return;
+	}
+
+	if (!ChatTickHandle.IsValid())
+	{
+		ChatTickHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UFoundryFSDKSubsystem::ChatDriverTick), 0.25f);
+	}
+	bTextChatConfigured = true;
+
+	const bool bPlatform = Config.Mode == EFoundryTextChatMode::Platform;
+	fsdk_textchat_config Cfg;
+	fsdk_textchat_config_default(&Cfg);
+	Cfg.mode = bPlatform ? FSDK_TEXTCHAT_MODE_PLATFORM : FSDK_TEXTCHAT_MODE_LOCAL;
+	Cfg.history_lines = Config.HistoryLines;
+	Cfg.whisper_poll_ms = Config.WhisperPollMs;
+	Cfg.friends_refresh_ms = Config.FriendsRefreshMs;
+	// bind[] left at the "use the preset" sentinel (fsdk_textchat_config_default
+	// already zeroed it) - this slice exposes only the Mode preset, not a
+	// per-channel override, to Blueprint.
+
+	const bool bWantLogRoute = Config.bRouteSdkLogToSystem;
+
+	// fsdk_textchat_create MAY block: in Platform mode, when the client is
+	// already authenticated, it synchronously fetches the friends cache
+	// (refresh_friends -> fsdk_social_friends) before returning. Run the whole
+	// thing on a worker, matching every other core call that can touch the
+	// network (InitializeClient is the one exception in this file, and it
+	// never does I/O).
+	Async(EAsyncExecution::Thread, [CoreRef, Cfg, bPlatform, bWantLogRoute]()
+	{
+		FScopeLock Lock(&CoreRef->CS);
+
+		// Replacing an existing configuration: destroy the old handle FIRST -
+		// it may currently own the FRC chat's message callback.
+		if (CoreRef->TextChat != nullptr)
+		{
+			fsdk_textchat_destroy(CoreRef->TextChat);
+			CoreRef->TextChat = nullptr;
+		}
+
+		fsdk_chat* ChatForCreate = nullptr;
+		if (bPlatform)
+		{
+			// Reuse an existing chat handle (e.g. JoinGlobalChat already made
+			// one) rather than creating a second - fsdk_textchat_create takes
+			// over its message callback, and the room-pass-through re-install
+			// below hands it right back so raw room consumers are unaffected.
+			if (CoreRef->Chat == nullptr)
+			{
+				const fsdk_result ChatResult = fsdk_chat_create(CoreRef->Client, &CoreRef->Chat);
+				if (ChatResult != FSDK_OK)
+				{
+					UE_LOG(LogFoundryFSDK, Error,
+						TEXT("ConfigureTextChat: fsdk_chat_create failed: %s"),
+						UTF8_TO_TCHAR(fsdk_result_str(ChatResult)));
+					return;
+				}
+			}
+			ChatForCreate = CoreRef->Chat;
+		}
+
+		fsdk_textchat* NewTc = nullptr;
+		const fsdk_result Result =
+			fsdk_textchat_create(CoreRef->Client, ChatForCreate, &Cfg, &NewTc);
+		if (Result != FSDK_OK)
+		{
+			UE_LOG(LogFoundryFSDK, Error, TEXT("fsdk_textchat_create failed: %s"),
+				UTF8_TO_TCHAR(fsdk_result_str(Result)));
+			return;
+		}
+		CoreRef->TextChat = NewTc;
+		fsdk_textchat_set_line_callback(NewTc, &FoundryFSDKTextChatLineThunk, CoreRef.Get());
+		// fsdk_textchat_create took over ChatForCreate's message-callback slot
+		// (fsdk_chat_set_message_callback is single-owner), so re-install the
+		// SAME thunk + user_data the chat callback used as the room pass-
+		// through: fsdk-core now hands every raw room message (all four
+		// channels, before textchat records its own Party line) to this thunk
+		// first, so OnChatMessage keeps firing exactly as it did before
+		// ConfigureTextChat existed.
+		if (ChatForCreate != nullptr)
+		{
+			fsdk_textchat_set_room_passthrough(NewTc, &FoundryFSDKChatMessageThunk, CoreRef.Get());
+		}
+
+		if (bWantLogRoute)
+		{
+			// Chain onto the module's existing UE_LOG sink (never replace it -
+			// see FoundryFSDKSetAuxLogSink's doc comment). The subscriber can
+			// fire from ANY thread (whatever thread produced the log line), so
+			// it must not touch CoreRef->CS itself (this call already holds it
+			// reentrantly on some platforms only) - dispatch a FRESH worker per
+			// line instead, which safely re-acquires the lock from a new call
+			// stack. WARN+ diagnostics are rare, so a worker per line is fine.
+			TWeakPtr<FFsdkCoreState, ESPMode::ThreadSafe> WeakCore(CoreRef);
+			const int32 MinLevel = static_cast<int32>(Cfg.log_sink_min_level);
+			FoundryFSDKSetAuxLogSink([WeakCore, MinLevel](int32 Level, const FString& Message)
+			{
+				if (Level < MinLevel)
+				{
+					return;
+				}
+				TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> Pinned = WeakCore.Pin();
+				if (!Pinned.IsValid())
+				{
+					return;
+				}
+				Async(EAsyncExecution::Thread, [Pinned, Level, Message]()
+				{
+					FScopeLock InnerLock(&Pinned->CS);
+					if (Pinned->TextChat != nullptr)
+					{
+						(void)fsdk_textchat_system(Pinned->TextChat,
+							static_cast<fsdk_log_level>(Level), TCHAR_TO_UTF8(*Message));
+					}
+				});
+			});
+		}
+		else
+		{
+			FoundryFSDKClearAuxLogSink();
+		}
+	});
+}
+
+void UFoundryFSDKSubsystem::SubmitChatLine(const FString& Line)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		OnChatLineSubmitted.Broadcast(EFoundryFsdkResult::NotAuthenticated);
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, Line, WeakThis]()
+	{
+		// May block: the active channel's send can hit the network (a
+		// Platform-bound Party send or a whisper).
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = CoreRef->TextChat != nullptr
+				? fsdk_textchat_submit(CoreRef->TextChat, TCHAR_TO_UTF8(*Line))
+				: FSDK_ERR_NOT_AUTHENTICATED;
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				// A slash command may have staged an invocation synchronously
+				// inside the submit call above - execute it now, on the game
+				// thread, before reporting the submit itself as complete.
+				Self->DrainPendingChatCommands();
+				Self->OnChatLineSubmitted.Broadcast(ToBlueprintResult(Result));
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::SetActiveChatChannel(EFoundryTextChatChannel Channel)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	ActiveChatChannelMirror = Channel; // optimistic - ChatDriverTick reconciles
+	const fsdk_textchat_channel CoreChannel = ToCoreTextChatChannel(Channel);
+	FScopeLock Lock(&CoreRef->CS); // no network - brief hold, matches PostSystemMessage
+	(void)fsdk_textchat_set_active(CoreRef->TextChat, CoreChannel);
+}
+
+void UFoundryFSDKSubsystem::GetChatHistory(EFoundryTextChatChannel Channel, bool bAllChannels,
+	TArray<FFoundryChatLine>& OutLines)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	// TryLock, matching the chat driver tick: a worker may be mid-send/-poll
+	// holding CS across a network call, and this can be called every frame a
+	// panel is open - it must never stall the game thread. A missed attempt
+	// leaves OutLines untouched; the caller's next call (next frame) reads
+	// fresh data once the lock frees.
+	if (!CoreRef->CS.TryLock())
+	{
+		return;
+	}
+	constexpr int32 MaxLines = 512;
+	TArray<fsdk_textchat_line> Buf;
+	Buf.SetNum(MaxLines);
+	const size_t Count = fsdk_textchat_history(CoreRef->TextChat,
+		bAllChannels ? -1 : static_cast<int>(ToCoreTextChatChannel(Channel)),
+		Buf.GetData(), static_cast<size_t>(MaxLines));
+	CoreRef->CS.Unlock();
+
+	OutLines.Reset(static_cast<int32>(Count));
+	for (size_t i = 0; i < Count; i++)
+	{
+		FFoundryChatLine L;
+		L.Id = Buf[i].id;
+		L.Channel = ToBlueprintTextChatChannel(Buf[i].channel);
+		L.Kind = ToBlueprintChatLineKind(Buf[i].kind);
+		L.FromFoundryId = UTF8_TO_TCHAR(Buf[i].from_foundry_id);
+		L.FromName = UTF8_TO_TCHAR(Buf[i].from_name);
+		L.PeerFoundryId = UTF8_TO_TCHAR(Buf[i].peer_foundry_id);
+		L.PeerName = UTF8_TO_TCHAR(Buf[i].peer_name);
+		L.Body = UTF8_TO_TCHAR(Buf[i].body);
+		L.TimestampMs = static_cast<int64>(Buf[i].ts_ms);
+		OutLines.Add(MoveTemp(L));
+	}
+}
+
+void UFoundryFSDKSubsystem::PostSystemMessage(const FString& Text, bool bIsError)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	FScopeLock Lock(&CoreRef->CS); // no network - runs inline
+	(void)fsdk_textchat_system(CoreRef->TextChat,
+		bIsError ? FSDK_LOG_ERROR : FSDK_LOG_INFO, TCHAR_TO_UTF8(*Text));
+}
+
+void UFoundryFSDKSubsystem::SetWhisperPolling(bool bEnabled)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	FScopeLock Lock(&CoreRef->CS); // no network - just flips a flag/due-now bit
+	fsdk_textchat_set_whisper_polling(CoreRef->TextChat, bEnabled ? 1 : 0);
+}
+
+void UFoundryFSDKSubsystem::InjectChatLine(EFoundryTextChatChannel Channel, const FString& FromName,
+	const FString& FromFoundryId, const FString& Body)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	const fsdk_textchat_channel CoreChannel = ToCoreTextChatChannel(Channel);
+	FScopeLock Lock(&CoreRef->CS); // no network - runs inline
+	(void)fsdk_textchat_inject(CoreRef->TextChat, CoreChannel,
+		TCHAR_TO_UTF8(*FromName), TCHAR_TO_UTF8(*FromFoundryId), TCHAR_TO_UTF8(*Body));
+}
+
+bool UFoundryFSDKSubsystem::RegisterChatCommand(const FString& Name, const FString& Help,
+	const FFoundryChatCommandHandlerBP& Handler)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr || !Handler.IsBound())
+	{
+		return false;
+	}
+	fsdk_result Result;
+	{
+		FScopeLock Lock(&CoreRef->CS); // no network - runs inline
+		Result = fsdk_textchat_register_command(CoreRef->TextChat,
+			TCHAR_TO_UTF8(*Name), TCHAR_TO_UTF8(*Help),
+			&FoundryFSDKChatCommandThunk, CoreRef.Get());
+	}
+	if (Result != FSDK_OK)
+	{
+		return false;
+	}
+	ChatCommandHandlers.Add(Name.ToLower(), Handler);
+	return true;
+}
+
+void UFoundryFSDKSubsystem::GetChatCommandCompletions(const FString& Prefix, TArray<FString>& OutNames)
+{
+	OutNames.Reset();
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	constexpr int32 MaxNames = 64;
+	TArray<const char*> Buf;
+	Buf.SetNum(MaxNames);
+	size_t Count;
+	{
+		FScopeLock Lock(&CoreRef->CS); // no network - runs inline
+		Count = fsdk_textchat_command_completions(CoreRef->TextChat,
+			TCHAR_TO_UTF8(*Prefix), Buf.GetData(), static_cast<size_t>(MaxNames));
+		// Copy the (SDK-owned) C strings to FStrings BEFORE releasing the lock -
+		// their storage is only guaranteed valid "until the command table
+		// changes", which a concurrent RegisterChatCommand could do the instant
+		// this unlocks.
+		OutNames.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; i < Count; i++)
+		{
+			OutNames.Add(UTF8_TO_TCHAR(Buf[i]));
+		}
+	}
+}
+
+void UFoundryFSDKSubsystem::ApplyTextChatPartyId(const FString& NewPartyId)
+{
+	if (NewPartyId.Equals(TextChatPartyId, ESearchCase::CaseSensitive))
+	{
+		return;
+	}
+	TextChatPartyId = NewPartyId;
+	if (!bTextChatConfigured)
+	{
+		return; // nothing to apply yet - ConfigureTextChat hasn't run
+	}
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return;
+	}
+	const FString PartyIdCopy = NewPartyId;
+	Async(EAsyncExecution::Thread, [CoreRef, PartyIdCopy]()
+	{
+		// Platform binding joins/leaves the FRC PARTY room over the network;
+		// HOST/LOCAL binding just remembers the id - either way this can only
+		// safely run on a worker.
+		FScopeLock Lock(&CoreRef->CS);
+		if (CoreRef->TextChat != nullptr)
+		{
+			const FTCHARToUTF8 IdUtf8(*PartyIdCopy);
+			(void)fsdk_textchat_set_party(CoreRef->TextChat,
+				PartyIdCopy.IsEmpty() ? nullptr : IdUtf8.Get());
+		}
+	});
+}
+
+void UFoundryFSDKSubsystem::KickTextChatTick(int64 NowMs)
+{
+	if (bTextChatTickInFlight)
+	{
+		return;
+	}
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid())
+	{
+		return;
+	}
+	bTextChatTickInFlight = true;
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, NowMs, WeakThis]()
+	{
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			if (CoreRef->TextChat != nullptr)
+			{
+				// Ticks the FRC chat keepalive + auto-rejoin itself (do NOT
+				// also call fsdk_chat_tick - see ChatDriverTick) and, while
+				// SetWhisperPolling(true), the whisper poll + friends-cache
+				// refresh - the reason this whole call lives on a worker.
+				fsdk_textchat_tick(CoreRef->TextChat, static_cast<long long>(NowMs));
+			}
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->bTextChatTickInFlight = false;
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::DrainPendingChatCommands()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	TArray<FFsdkCoreState::FStagedChatCommand> Pending;
+	{
+		FScopeLock Lock(&CoreRef->CS);
+		Pending = MoveTemp(CoreRef->PendingChatCommands);
+		CoreRef->PendingChatCommands.Reset();
+	}
+	for (const FFsdkCoreState::FStagedChatCommand& Cmd : Pending)
+	{
+		const FFoundryChatCommandHandlerBP* Handler = ChatCommandHandlers.Find(Cmd.Name.ToLower());
+		if (Handler == nullptr || !Handler->IsBound())
+		{
+			continue;
+		}
+		const FString Response = Handler->Execute(Cmd.Args);
+		if (Response.IsEmpty())
+		{
+			continue;
+		}
+		FScopeLock Lock(&CoreRef->CS); // no network - runs inline
+		(void)fsdk_textchat_system(CoreRef->TextChat, FSDK_LOG_INFO, TCHAR_TO_UTF8(*Response));
+	}
+}
+
 bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
@@ -1331,10 +1892,12 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 		CoreRef->bChatClosed = false;
 	}
 
+	const int64 NowMs = static_cast<int64>(FPlatformTime::Seconds() * 1000.0);
 	bool bReadyNow = bChatReady;
 	bool bPartyReadyNow = bPartyChatReady;
 	bool bMatchReadyNow = bMatchChatReady;
 	bool bTeamReadyNow = bTeamChatReady;
+	EFoundryTextChatChannel ActiveChannelNow = ActiveChatChannelMirror;
 	if (CoreRef->CS.TryLock())
 	{
 		if (CoreRef->Chat != nullptr)
@@ -1347,8 +1910,14 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 			{
 				fsdk_chat_on_ws_closed(CoreRef->Chat);
 			}
-			fsdk_chat_tick(CoreRef->Chat,
-				static_cast<long long>(FPlatformTime::Seconds() * 1000.0));
+			// Once ConfigureTextChat owns this chat handle, fsdk_textchat_tick
+			// ticks it internally (and can additionally block on the whisper
+			// poll) - KickTextChatTick below drives that on a worker instead.
+			// Calling fsdk_chat_tick here TOO would double-tick it.
+			if (CoreRef->TextChat == nullptr)
+			{
+				fsdk_chat_tick(CoreRef->Chat, static_cast<long long>(NowMs));
+			}
 			bReadyNow = fsdk_chat_ready(CoreRef->Chat) != 0;
 			bPartyReadyNow =
 				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_PARTY) != 0;
@@ -1356,6 +1925,12 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_MATCH) != 0;
 			bTeamReadyNow =
 				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_TEAM) != 0;
+		}
+		if (CoreRef->TextChat != nullptr)
+		{
+			// Cheap local read (no network) - catches a bare "/p" switching the
+			// active channel INSIDE the core.
+			ActiveChannelNow = ToBlueprintTextChatChannel(fsdk_textchat_active(CoreRef->TextChat));
 		}
 		CoreRef->CS.Unlock();
 	}
@@ -1378,6 +1953,21 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 		{
 			OnChatMessage.Broadcast(Msg.Channel, Msg.DisplayName, Msg.FoundryId, Msg.Body);
 		}
+	}
+	if (!CoreRef->TextChatLines.IsEmpty())
+	{
+		TArray<FFsdkCoreState::FTextChatLineCopy> Lines = MoveTemp(CoreRef->TextChatLines);
+		CoreRef->TextChatLines.Reset();
+		for (const FFsdkCoreState::FTextChatLineCopy& L : Lines)
+		{
+			OnChatLine.Broadcast(L.Line);
+		}
+	}
+
+	if (ActiveChannelNow != ActiveChatChannelMirror)
+	{
+		ActiveChatChannelMirror = ActiveChannelNow;
+		OnActiveChatChannelChanged.Broadcast(ActiveChatChannelMirror);
 	}
 
 	if (bPartyReadyNow != bPartyChatReady)
@@ -1419,6 +2009,11 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 		&& FPlatformTime::Seconds() >= NextChatRejoinTime)
 	{
 		StartChatJoin();
+	}
+
+	if (bTextChatConfigured)
+	{
+		KickTextChatTick(NowMs);
 	}
 	return true; // keep ticking
 }

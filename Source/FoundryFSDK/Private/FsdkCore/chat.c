@@ -190,6 +190,9 @@ static fsdk_result chat_join_path(fsdk_chat* chat, fsdk_chat_channel channel,
         if (status == 401 || status == 403) {
             return FSDK_ERR_UNAUTHORIZED;
         }
+        if (status == 429) {
+            return FSDK_ERR_RATE_LIMITED;
+        }
         return status == 404 ? FSDK_ERR_NO_MATCH : FSDK_ERR_PROTOCOL;
     }
     slot = &chat->rooms[channel];
@@ -203,6 +206,9 @@ static fsdk_result chat_join_path(fsdk_chat* chat, fsdk_chat_channel channel,
     }
     fsdk_string_free(resp);
     slot->joined = 0;
+    /* Remember the resolve path so a dropped socket can be auto-rejoined
+     * later (fsdk_chat_rejoin_all) without the host re-supplying the key. */
+    copy_bounded(slot->join_path, sizeof(slot->join_path), path);
 
     /* 2. Socket already authed (channel add / re-join): subscribe directly. */
     if (chat->ws_handle != NULL && chat->ws_authed) {
@@ -282,6 +288,7 @@ fsdk_result fsdk_chat_leave_party(fsdk_chat* chat) {
     }
     slot->room_id[0] = '\0';
     slot->joined = 0;
+    slot->join_path[0] = '\0'; /* a deliberate leave is never auto-rejoined */
     return rc;
 }
 
@@ -307,8 +314,37 @@ fsdk_result fsdk_chat_leave_match(fsdk_chat* chat) {
         }
         slot->room_id[0] = '\0';
         slot->joined = 0;
+        slot->join_path[0] = '\0'; /* a deliberate leave is never auto-rejoined */
     }
     return rc;
+}
+
+/* ---- rejoin (auto-recovery after a socket drop) --------------------------- */
+
+/* Internal-only (fsdk_internal.h). Re-runs chat_join_path for every slot that
+ * still remembers a resolve path (i.e. every channel a host ever successfully
+ * joined and never explicitly left) - the host's own textchat/rejoin driver
+ * calls this from a backoff timer after fsdk_chat_on_ws_closed. Attempts every
+ * remembered slot regardless of an earlier failure; returns the FIRST
+ * non-FSDK_OK result (FSDK_OK if every attempted slot succeeded, or if there
+ * was nothing to rejoin). */
+fsdk_result fsdk_chat_rejoin_all(fsdk_chat* chat) {
+    int i;
+    fsdk_result first_rc = FSDK_OK;
+    if (chat == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    for (i = 0; i < FSDK_CHAT_CHANNEL__COUNT; i++) {
+        fsdk_result rc;
+        if (chat->rooms[i].join_path[0] == '\0') {
+            continue;
+        }
+        rc = chat_join_path(chat, (fsdk_chat_channel)i, chat->rooms[i].join_path);
+        if (first_rc == FSDK_OK && rc != FSDK_OK) {
+            first_rc = rc;
+        }
+    }
+    return first_rc;
 }
 
 /* ---- send ----------------------------------------------------------------- */

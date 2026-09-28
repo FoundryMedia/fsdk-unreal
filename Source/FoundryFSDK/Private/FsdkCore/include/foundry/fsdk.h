@@ -34,7 +34,7 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 #define FSDK_VERSION_MAJOR 0
-#define FSDK_VERSION_MINOR 2
+#define FSDK_VERSION_MINOR 3
 #define FSDK_VERSION_PATCH 0
 
 /* Returns a static, NUL-terminated semantic version string (e.g. "0.1.0").
@@ -59,7 +59,8 @@ typedef enum fsdk_result {
     FSDK_ERR_NO_MATCH = 10,      /* Ticket has no connection yet / cancelled.  */
     FSDK_ERR_AGONES = 11,        /* Agones SDK lifecycle call failed.          */
     FSDK_ERR_INTERNAL = 12,      /* Unexpected internal error.                 */
-    FSDK_ERR_UNAVAILABLE = 13    /* No server capacity for the queue (503).    */
+    FSDK_ERR_UNAVAILABLE = 13,   /* No server capacity for the queue (503).    */
+    FSDK_ERR_RATE_LIMITED = 14   /* Server rate window exceeded (429).         */
 } fsdk_result;
 
 /* Returns a static human-readable string for a result code (for logging). */
@@ -82,6 +83,11 @@ typedef struct fsdk_ticket fsdk_ticket;
 /* Chat session handle (client-side; FRC rooms over the realtime WebSocket).
  * Opaque; lifetime is bound to its client. */
 typedef struct fsdk_chat fsdk_chat;
+
+/* Text chat handle (client-side; the chat-box module built on fsdk_chat +
+ * fsdk_dm_* - see the CLIENT TEXT CHAT API block below). Opaque; lifetime is
+ * independent of (but may borrow) an fsdk_chat. */
+typedef struct fsdk_textchat fsdk_textchat;
 
 /* -------------------------------------------------------------------------- */
 /* Value types (POD, caller-owned storage)                                    */
@@ -700,6 +706,237 @@ fsdk_result fsdk_dm_history(fsdk_client* client, const char* friend_foundry_id,
                             fsdk_dm_message* out, size_t capacity, size_t* out_count);
 fsdk_result fsdk_dm_send(fsdk_client* client, const char* friend_foundry_id, const char* body);
 fsdk_result fsdk_dm_mark_read(fsdk_client* client, const char* friend_foundry_id);
+
+/* -------------------------------------------------------------------------- */
+/* CLIENT TEXT CHAT API (the chat box: channels, input line, slash commands, */
+/* history)                                                                   */
+/* -------------------------------------------------------------------------- */
+/* fsdk_textchat is the chat-box module built ON TOP of fsdk_chat (FRC rooms)
+ * and fsdk_dm_* (whisper) - a game gives it one input line (fsdk_textchat_submit)
+ * and takes one line stream back (the line callback + fsdk_textchat_history).
+ * It owns: three channels (PARTY, WHISPER, SYSTEM), slash-command parsing
+ * (built-in whisper/reply/party/help plus host-registered commands), whisper
+ * name resolution against the friends cache, the whisper poll (player sockets
+ * are room-only - incoming whispers can only ever be polled, never pushed),
+ * and auto-rejoin of dropped FRC room subscriptions.
+ *
+ * Three presets (fsdk_textchat_mode), each an assignment of a BINDING per
+ * channel (fsdk_textchat_bind) that can be overridden per channel in the
+ * config:
+ *   PLATFORM (default) - party rides an FRC room, whisper rides the DM REST
+ *     surface; every message is authorized/logged server-side.
+ *   LOCAL - party is HOST-bound (the game supplies its own transport via
+ *     fsdk_textchat_set_host_send + fsdk_textchat_inject for the inbound
+ *     half), whisper is OFF (a whisper is a Foundry-account feature - it
+ *     cannot exist without the platform). In LOCAL mode with no chat handle,
+ *     this module makes ZERO HTTP/WS calls, ever.
+ * SYSTEM is always LOCAL-bound (echoed into history only) regardless of the
+ * preset or any per-channel override - it never has a wire representation.
+ *
+ * A per-channel override of FSDK_TEXTCHAT_BIND_PLATFORM (value 0) is read as
+ * "no override, use the preset's binding" - there is no way to force a
+ * channel TO PLATFORM against a non-PLATFORM preset via this field. This is
+ * intentional: memset the config to zero (fsdk_textchat_config_default does
+ * this) and only set `bind[ch]` on the channels you want to steer AWAY from
+ * the preset's own choice. */
+
+/* Which conversational surface a line/command targets. */
+typedef enum fsdk_textchat_channel {
+    FSDK_TEXTCHAT_PARTY = 0,
+    FSDK_TEXTCHAT_WHISPER = 1,
+    FSDK_TEXTCHAT_SYSTEM = 2,
+    FSDK_TEXTCHAT_CHANNEL__COUNT = 3 /* internal bound - not a channel */
+} fsdk_textchat_channel;
+
+/* How a channel's outbound send / inbound delivery is wired. */
+typedef enum fsdk_textchat_bind {
+    FSDK_TEXTCHAT_BIND_PLATFORM = 0, /* FRC room (party) / DM REST (whisper). */
+    FSDK_TEXTCHAT_BIND_HOST = 1,     /* Host-supplied transport (fsdk_textchat_set_host_send
+                                      * for outbound, fsdk_textchat_inject for inbound). */
+    FSDK_TEXTCHAT_BIND_LOCAL = 2,    /* Echo straight into history - no transport at all. */
+    FSDK_TEXTCHAT_BIND_OFF = 3       /* Refused with a SYSTEM "not available" line.       */
+} fsdk_textchat_bind;
+
+/* A config preset: which bindings the channels default to before any
+ * per-channel override is applied. */
+typedef enum fsdk_textchat_mode {
+    FSDK_TEXTCHAT_MODE_PLATFORM = 0,
+    FSDK_TEXTCHAT_MODE_LOCAL = 1
+} fsdk_textchat_mode;
+
+/* What kind of line was recorded (drives how a panel colors/tabs it). */
+typedef enum fsdk_textchat_line_kind {
+    FSDK_TEXTCHAT_LINE_CHAT = 0,         /* Ordinary content on PARTY.        */
+    FSDK_TEXTCHAT_LINE_WHISPER_IN = 1,   /* An inbound whisper.               */
+    FSDK_TEXTCHAT_LINE_WHISPER_OUT = 2,  /* An outbound whisper the caller sent. */
+    FSDK_TEXTCHAT_LINE_SYSTEM = 3,       /* Informational notice.             */
+    FSDK_TEXTCHAT_LINE_ERROR = 4         /* A failure/rejection notice.       */
+} fsdk_textchat_line_kind;
+
+/* Longest accepted line body - whisper is the widest channel (2000 chars,
+ * server-capped; +NUL headroom matches FSDK_DM_BODY_MAX exactly). */
+#define FSDK_TEXTCHAT_BODY_MAX FSDK_DM_BODY_MAX
+
+/* One recorded line (content or notice). POD snapshot - copy what you keep;
+ * the pointer handed to the line callback is only valid inside the call. */
+typedef struct fsdk_textchat_line {
+    long long id;                       /* Monotonic per textchat, starts at 1. */
+    fsdk_textchat_channel channel;
+    fsdk_textchat_line_kind kind;
+    char from_foundry_id[64];           /* Author; empty for SYSTEM/ERROR.      */
+    char from_name[128];                /* Author display name; "You" for the
+                                          * local player when no name is known. */
+    char peer_foundry_id[64];           /* WHISPER_* only: the OTHER side.      */
+    char peer_name[128];
+    char body[FSDK_TEXTCHAT_BODY_MAX];
+    long long ts_ms;                    /* fsdk_textchat_tick's now_ms when this
+                                          * line was recorded; 0 if unknown (no
+                                          * tick has run yet).                  */
+} fsdk_textchat_line;
+
+/* Construction config. Call fsdk_textchat_config_default first and only
+ * override what you need - a zeroed struct alone is NOT a valid config (the
+ * mode/log-level defaults live in fsdk_textchat_config_default, not in a
+ * zero-initialized struct). */
+typedef struct fsdk_textchat_config {
+    fsdk_textchat_mode mode;                                /* Preset; PLATFORM by default. */
+    fsdk_textchat_bind bind[FSDK_TEXTCHAT_CHANNEL__COUNT];  /* Per-channel override; a slot
+                                                              * left at FSDK_TEXTCHAT_BIND_PLATFORM
+                                                              * (0) defers to the preset - see
+                                                              * the block comment above.      */
+    int history_lines;          /* Ring size per channel; <= 0 -> 200.          */
+    int whisper_poll_ms;        /* Whisper poll cadence; <= 0 -> 5000.          */
+    int friends_refresh_ms;     /* Friends-cache refresh cadence; <= 0 -> 120000. */
+    fsdk_log_level log_sink_min_level; /* Threshold for fsdk_textchat_log_sink. */
+} fsdk_textchat_config;
+
+/* Fill *out with the recommended defaults (PLATFORM mode, every bind slot at
+ * the "use the preset" sentinel, 200-line history, 5s whisper poll, 2min
+ * friends refresh, WARN log-sink threshold). */
+void fsdk_textchat_config_default(fsdk_textchat_config* out);
+
+/* Invoked for every recorded line (content or notice), synchronously from
+ * whichever call produced it (fsdk_textchat_submit / _tick / _inject / _system /
+ * the installed log sink). Copy what you keep. */
+typedef void (*fsdk_textchat_line_fn)(const fsdk_textchat_line* line, void* user_data);
+
+/* Host-supplied outbound transport for a HOST-bound channel (the game
+ * replicates the message itself - e.g. its own netcode party chat). Return
+ * FSDK_OK once the game has taken responsibility for delivering it; any other
+ * result is surfaced to the player as a mapped ERROR line and the message is
+ * NOT echoed into history. */
+typedef fsdk_result (*fsdk_textchat_host_send_fn)(fsdk_textchat_channel channel,
+                                                  const char* body, void* user_data);
+
+/* A slash command handler (built-ins + fsdk_textchat_register_command).
+ * argv[0] is the command name (without the leading slash, lower-cased);
+ * argv[1..argc-1] are the remaining whitespace-split arguments (a "quoted
+ * argument" stays one token). rest is the RAW text after the command name,
+ * trimmed, NOT re-split - "" when there is none. */
+typedef void (*fsdk_textchat_command_fn)(fsdk_textchat* tc, int argc, const char** argv,
+                                         const char* rest, void* user_data);
+
+/* Create a text-chat handle. In PLATFORM mode (the default preset, or any
+ * config whose mode is PLATFORM) chat_or_null MUST be non-NULL - party rides
+ * its rooms. In LOCAL mode chat_or_null MAY be NULL (nothing to rejoin/tick).
+ * When chat_or_null is given, this call installs itself as ITS message
+ * callback (fsdk_chat_set_message_callback) - the textchat module OWNS that
+ * callback from then on; a game that also wants raw room messages reads them
+ * from fsdk_textchat_history / the line callback instead of the chat handle
+ * directly. config_or_null defaults per fsdk_textchat_config_default. */
+fsdk_result fsdk_textchat_create(fsdk_client* client, fsdk_chat* chat_or_null,
+                                 const fsdk_textchat_config* config_or_null,
+                                 fsdk_textchat** out);
+
+/* Destroy a text-chat handle and free its resources (detaches from a borrowed
+ * chat handle's message callback first). Safe to call with NULL. */
+void fsdk_textchat_destroy(fsdk_textchat* tc);
+
+/* Install the line callback (pass NULL to remove). */
+void fsdk_textchat_set_line_callback(fsdk_textchat* tc, fsdk_textchat_line_fn fn, void* user_data);
+
+/* Install the HOST-binding outbound transport (pass NULL to remove). Only
+ * consulted for a channel currently bound HOST. */
+void fsdk_textchat_set_host_send(fsdk_textchat* tc, fsdk_textchat_host_send_fn fn, void* user_data);
+
+/* The textchat takes the chat handle's single message-callback slot. A host that
+ * ALSO consumes raw room messages (GLOBAL/MATCH/TEAM, which the textchat does
+ * not record, or PARTY in raw form) installs this pass-through: it receives
+ * every room message, same pointer and thread as fsdk_chat_set_message_callback
+ * would, BEFORE the textchat records its PARTY line. Pass NULL to remove. */
+void fsdk_textchat_set_room_passthrough(fsdk_textchat* tc, fsdk_chat_message_fn fn, void* user_data);
+
+/* Record an INBOUND line from a HOST-bound transport (the game's own netcode
+ * delivered a party message, or is bridging some other whisper-like surface).
+ * WHISPER records as WHISPER_IN with peer = (from_name, from_foundry_id_or_null).
+ * Rejects FSDK_TEXTCHAT_SYSTEM (use fsdk_textchat_system instead). */
+fsdk_result fsdk_textchat_inject(fsdk_textchat* tc, fsdk_textchat_channel channel,
+                                 const char* from_name, const char* from_foundry_id_or_null,
+                                 const char* body);
+
+/* Submit one input-box line: a leading '/' is a slash command (a doubled
+ * "//" sends the literal, single-slashed text to the active channel);
+ * anything else goes to the active channel. FSDK_ERR_INVALID_ARG for an
+ * empty/whitespace-only line (nothing recorded) - every other outcome
+ * (unknown command, a channel that refuses the send, a mapped server error)
+ * is reported as a recorded SYSTEM/ERROR line, not a return code. */
+fsdk_result fsdk_textchat_submit(fsdk_textchat* tc, const char* line);
+
+/* Which channel plain (non-slash) input targets. */
+fsdk_result fsdk_textchat_set_active(fsdk_textchat* tc, fsdk_textchat_channel channel);
+fsdk_textchat_channel fsdk_textchat_active(const fsdk_textchat* tc);
+
+/* Join/leave the PARTY channel's room (PLATFORM binding) or just remember the
+ * id (HOST/LOCAL binding, no network). NULL/empty leaves. */
+fsdk_result fsdk_textchat_set_party(fsdk_textchat* tc, const char* party_id_or_null);
+
+/* Record a SYSTEM-channel notice from the host (e.g. a game-state
+ * announcement). level ERROR records as kind ERROR, anything else as SYSTEM. */
+fsdk_result fsdk_textchat_system(fsdk_textchat* tc, fsdk_log_level level, const char* text);
+
+/* A ready-made fsdk_log_fn the host MAY install with fsdk_set_log_sink(
+ * fsdk_textchat_log_sink, tc) to surface the core's own diagnostics (any
+ * module, not just this one) as SYSTEM/ERROR lines, filtered at
+ * config.log_sink_min_level. This module never installs the process-wide
+ * sink itself. */
+void fsdk_textchat_log_sink(fsdk_log_level level, const char* message, void* tc);
+
+/* Register a host command reachable as "/<name>". name must be <= 23 ASCII
+ * chars with no whitespace/'/' and must not collide with a built-in or a
+ * reserved name (t/team, a/all, g/global - the room-slot channels a future
+ * slice may wire up); re-registering an existing name replaces its handler.
+ * FSDK_ERR_INVALID_ARG on any of the above; FSDK_ERR_INTERNAL if the command
+ * table is full. */
+fsdk_result fsdk_textchat_register_command(fsdk_textchat* tc, const char* name, const char* help,
+                                           fsdk_textchat_command_fn fn, void* user_data);
+
+/* Command-name completions (built-ins + registered) starting with prefix (no
+ * leading slash; "" matches everything). Fills up to capacity pointers into
+ * storage owned by the SDK (valid until tc is destroyed or the command table
+ * changes) and returns the count written. For a panel's autocomplete. */
+size_t fsdk_textchat_command_completions(const fsdk_textchat* tc, const char* prefix,
+                                         const char** out_names, size_t capacity);
+
+/* Copy up to capacity lines, oldest -> newest, from one channel
+ * (channel_or_minus1 in [0, FSDK_TEXTCHAT_CHANNEL__COUNT)) or every channel
+ * merged by id (channel_or_minus1 == -1). When more lines exist than
+ * capacity, the NEWEST capacity lines are returned (still oldest -> newest
+ * order). Returns the count written. */
+size_t fsdk_textchat_history(const fsdk_textchat* tc, int channel_or_minus1,
+                             fsdk_textchat_line* out, size_t capacity);
+
+/* Enable/disable the whisper poll (PLATFORM binding only; a no-op otherwise).
+ * The host should disable this whenever the chat box/whisper tab is
+ * hidden/unfocused - every poller needs idle controls. Enabling schedules an
+ * immediate poll on the NEXT fsdk_textchat_tick call. */
+void fsdk_textchat_set_whisper_polling(fsdk_textchat* tc, int enabled);
+
+/* Drive the module: the chat-handle keepalive (if one was given), the
+ * whisper poll + friends-cache refresh (PLATFORM binding, while polling is
+ * enabled), and auto-rejoin of any FRC room the socket dropped (backoff 1s ->
+ * 30s; a SYSTEM notice only after 30s of continuous failure). Call each
+ * frame/tick with a monotonic millisecond clock. */
+void fsdk_textchat_tick(fsdk_textchat* tc, long long now_ms);
 
 /* -------------------------------------------------------------------------- */
 /* SERVER API (runs in the dedicated server - our trusted box)               */

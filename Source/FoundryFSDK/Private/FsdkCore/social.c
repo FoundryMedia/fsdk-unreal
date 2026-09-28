@@ -41,6 +41,9 @@ static fsdk_result social_status_to_result(long status) {
     if (status == 401 || status == 403) {
         return FSDK_ERR_UNAUTHORIZED;
     }
+    if (status == 429) {
+        return FSDK_ERR_RATE_LIMITED;
+    }
     return status == 404 ? FSDK_ERR_NO_MATCH : FSDK_ERR_PROTOCOL;
 }
 

@@ -43,7 +43,10 @@ enum class EFoundryFsdkResult : uint8
 	NotImplemented   UMETA(DisplayName = "Not Implemented"),
 	Unavailable      UMETA(DisplayName = "No Servers Available"),
 	Internal         UMETA(DisplayName = "Internal Error"),
-	Unknown          UMETA(DisplayName = "Unknown")
+	Unknown          UMETA(DisplayName = "Unknown"),
+	// Appended after S1 shipped (FSDK_ERR_RATE_LIMITED) - never reorder the
+	// values above; existing Blueprint switches key on them by index.
+	RateLimited      UMETA(DisplayName = "Rate Limited")
 };
 
 /** Blueprint-facing connection details, mirrors fsdk_connection. */
@@ -250,6 +253,162 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryConversationsEvent,
 	EFoundryFsdkResult, Result, const TArray<FFoundryDmConversation>&, Conversations);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryWhisperHistoryEvent,
 	EFoundryFsdkResult, Result, const FString&, FriendId, const TArray<FFoundryDmMessage>&, Messages);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FRC text chat (the chat box: channels, input line, slash commands, history)
+// ═══════════════════════════════════════════════════════════════════════════
+// Built on TOP of the FRC chat rooms (EFoundryChatChannel::Party) and the
+// whisper (DM) surface above - see fsdk-core's "CLIENT TEXT CHAT API" block in
+// foundry/fsdk.h. A game gives it ONE input line (SubmitChatLine) and takes ONE
+// line stream back (OnChatLine + GetChatHistory); the slash-command parsing,
+// whisper name resolution, whisper poll, and FRC-room auto-rejoin all happen
+// inside fsdk_textchat, not in this binding.
+
+/** Which conversational surface a text-chat line/command targets, mirrors
+ *  fsdk_textchat_channel. Distinct from EFoundryChatChannel (the four FRC room
+ *  slots above) - Party here rides EFoundryChatChannel::Party under the hood
+ *  in the default Platform binding; Whisper rides the DM REST surface; System
+ *  never has a wire representation. */
+UENUM(BlueprintType)
+enum class EFoundryTextChatChannel : uint8
+{
+	Party   UMETA(DisplayName = "Party"),
+	Whisper UMETA(DisplayName = "Whisper"),
+	System  UMETA(DisplayName = "System")
+};
+
+/** What kind of line was recorded, mirrors fsdk_textchat_line_kind - drives how
+ *  a panel colors/tabs a line. */
+UENUM(BlueprintType)
+enum class EFoundryChatLineKind : uint8
+{
+	Chat       UMETA(DisplayName = "Chat"),
+	WhisperIn  UMETA(DisplayName = "Whisper In"),
+	WhisperOut UMETA(DisplayName = "Whisper Out"),
+	System     UMETA(DisplayName = "System"),
+	Error      UMETA(DisplayName = "Error")
+};
+
+/**
+ * Which transport preset ConfigureTextChat selects, mirrors fsdk_textchat_mode.
+ *   Platform (default) - Party rides an FRC room, Whisper rides the DM REST
+ *     surface; every message is authorized/logged server-side.
+ *   Local - Party is HOST-bound (the game supplies its own transport/netcode
+ *     via InjectChatLine for inbound; there is no outbound send hook in this
+ *     slice - see the class doc on ConfigureTextChat), Whisper answers "not
+ *     available" (a whisper is a Foundry-account feature - it cannot exist
+ *     without the platform). ZERO HTTP/WS calls are ever made in this mode.
+ * System is ALWAYS local (echoed into history only) regardless of Mode.
+ */
+UENUM(BlueprintType)
+enum class EFoundryTextChatMode : uint8
+{
+	Platform UMETA(DisplayName = "Platform"),
+	Local    UMETA(DisplayName = "Local")
+};
+
+/** One recorded chat-box line (content or notice), mirrors fsdk_textchat_line. */
+USTRUCT(BlueprintType)
+struct FFoundryChatLine
+{
+	GENERATED_BODY()
+
+	/** Monotonic per text-chat handle (resets on the next ConfigureTextChat), starts at 1. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	int64 Id = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	EFoundryTextChatChannel Channel = EFoundryTextChatChannel::Party;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	EFoundryChatLineKind Kind = EFoundryChatLineKind::Chat;
+
+	/** Author; empty for System/Error lines. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	FString FromFoundryId;
+
+	/** Author display name; "You" for the local player when no name is known. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	FString FromName;
+
+	/** Whisper lines only: the OTHER side of the conversation. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	FString PeerFoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	FString PeerName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	FString Body;
+
+	/** fsdk_textchat_tick's now_ms when this line was recorded; 0 before the
+	 *  first tick has run. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|TextChat")
+	int64 TimestampMs = 0;
+};
+
+/**
+ * ConfigureTextChat's config, mirrors fsdk_textchat_config MINUS the
+ * per-channel bind-override table (Party/Whisper/System all follow Mode's
+ * preset in this slice - a future slice can widen this if a game needs a
+ * mixed binding, e.g. Party over its own netcode with Whisper still on the
+ * platform).
+ */
+USTRUCT(BlueprintType)
+struct FFoundryTextChatConfig
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|TextChat")
+	EFoundryTextChatMode Mode = EFoundryTextChatMode::Platform;
+
+	/** Ring size per channel. <= 0 defaults to 200 in the core. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|TextChat")
+	int32 HistoryLines = 200;
+
+	/** Whisper poll cadence while SetWhisperPolling(true) is active. <= 0
+	 *  defaults to 5000. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|TextChat")
+	int32 WhisperPollMs = 5000;
+
+	/** Friends-cache refresh cadence (whisper /w name resolution). <= 0
+	 *  defaults to 120000. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|TextChat")
+	int32 FriendsRefreshMs = 120000;
+
+	/**
+	 * Forward this subsystem's own WARN+ fsdk-core diagnostics (any module, not
+	 * just text chat) into the System channel as System/Error lines, IN
+	 * ADDITION to the existing UE_LOG routing (LogFoundryFSDKCore) - this never
+	 * steals the process-wide fsdk_set_log_sink (FoundryFSDKInstallLogSink owns
+	 * that for the whole module's lifetime); it chains onto it via a small
+	 * auxiliary hook (FoundryFSDKSetAuxLogSink). Off by default.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|TextChat")
+	bool bRouteSdkLogToSystem = false;
+};
+
+// Text chat delegates - broadcast on the GAME THREAD.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryChatLineEvent, const FFoundryChatLine&, Line);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryTextChatChannelEvent, EFoundryTextChatChannel, Channel);
+
+/**
+ * Chat slash-command handler: Args are the command's arguments (the leading
+ * "/name" already stripped, quote-aware split) -> an optional response string
+ * (recorded as a System line when non-empty).
+ *
+ * This mirrors FFoundryConsoleHandlerBP's SHAPE (FoundryConsoleSubsystem.h:33 -
+ * native FString return, TArray<FString> args) as its OWN type rather than
+ * literally reusing it: FoundryConsoleSubsystem.h includes FMMSSubsystem.h,
+ * which includes THIS header (for EFoundryFsdkResult/EFoundryMatchStatus/
+ * FFoundryConnection) - including FoundryConsoleSubsystem.h back from here
+ * would be a genuine new circular header (untested elsewhere in this module),
+ * so this slice declares a same-shaped delegate instead. A game with one
+ * handler function for both surfaces binds it to a variable of either type -
+ * the UFUNCTION signature is identical either way. See the S2 report for this
+ * deviation from the plan's literal "reuse FFoundryConsoleHandlerBP" wording.
+ */
+DECLARE_DYNAMIC_DELEGATE_RetVal_OneParam(FString, FFoundryChatCommandHandlerBP, const TArray<FString>&, Args);
 
 /**
  * FoundryFSDK game-client facade.
@@ -583,6 +742,150 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryFsdkResultEvent OnWhisperSendComplete;
 
+	// ── FRC text chat (the chat box: channels, slash commands, whisper) ─────────
+	// A section built ON TOP of the FRC Party room above and the whisper (DM)
+	// surface above (fsdk_textchat, see ../../fsdk-core/include/foundry/fsdk.h
+	// "CLIENT TEXT CHAT API"). One input line (SubmitChatLine) in, one line
+	// stream (OnChatLine) + a per-channel history ring (GetChatHistory) out.
+	// Built-in slash commands: /w /whisper /msg /tell /dm <friend> <text>
+	// (whisper), /r /reply <text> (reply to the last inbound whisper),
+	// /p /party [text] (send, or with no text select Party as the active
+	// channel), /help /? . /t /team /a /all /g /global are RESERVED (the other
+	// FRC room slots above) and answer "not available in this game" until a
+	// future slice wires them into this module.
+	//
+	// Party auto-binds to this subsystem's OWN party: whenever RefreshParty (or
+	// the CreateParty/AcceptPartyInvite/DeclinePartyInvite/LeaveParty chains
+	// that call it automatically) lands a party id on the game thread, this
+	// subsystem calls fsdk_textchat_set_party itself - a game does nothing for
+	// party chat beyond ConfigureTextChat once.
+
+	/**
+	 * (Re)configure the chat-box module. Starts the chat driver ticker if it
+	 * isn't already running (today only a room join starts it). In Platform
+	 * mode (the default) this creates the FRC chat handle if one doesn't
+	 * already exist (shared with JoinGlobalChat/JoinPartyChat above) and MAY
+	 * block briefly on a friends-list fetch, so the whole create runs on a
+	 * WORKER THREAD; call it once at startup (or again to change Mode - the
+	 * previous configuration's history/active channel/whisper target are
+	 * discarded).
+	 *
+	 * In Platform mode, fsdk_textchat_create installs itself as the FRC chat
+	 * handle's SOLE message callback (fsdk_chat_set_message_callback), so this
+	 * re-installs FoundryFSDKChatMessageThunk as fsdk-core's ROOM PASS-THROUGH
+	 * (fsdk_textchat_set_room_passthrough, fsdk-core 0a47316+a777915) right
+	 * after - every raw room message (all four channels: Global/Party/Match/
+	 * Team, including the caller's own echo) still reaches OnChatMessage
+	 * exactly as it did before ConfigureTextChat existed; text chat separately
+	 * records its own Party line into OnChatLine/GetChatHistory from the same
+	 * message, via a distinct callback slot on the SAME handle.
+	 *
+	 * KNOWN LIMITATION (see the S2 report):
+	 *  - Local mode's Party channel binds HOST by default (fsdk-core's preset),
+	 *    but this slice never installs fsdk_textchat_set_host_send (it would
+	 *    need to invoke a Blueprint delegate from whatever thread the core
+	 *    calls it on, which can be a worker - unsafe for the Blueprint VM). So
+	 *    Local-mode Party SENDS surface "No party chat transport." as an Error
+	 *    line; InjectChatLine (the INBOUND half - the game's own netcode
+	 *    delivered a message) works today. A native (non-Blueprint) host-send
+	 *    hook is a follow-on slice.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void ConfigureTextChat(const FFoundryTextChatConfig& Config);
+
+	/**
+	 * Submit one input-box line: a leading '/' is a slash command (a doubled
+	 * "//" sends the literal, single-slashed text to the active channel);
+	 * anything else goes to the active channel (SetActiveChatChannel). Runs on
+	 * a WORKER THREAD (a Platform-bound send may block on the network). Every
+	 * outcome - a sent message, an unknown command, a rejected send - is
+	 * reported as a recorded line via OnChatLine, never through the result
+	 * event; OnChatLineSubmitted only reports the SUBMIT call itself (Ok, or
+	 * InvalidArg for an empty/whitespace-only line - nothing recorded).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void SubmitChatLine(const FString& Line);
+
+	/** Which channel plain (non-slash) input targets. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void SetActiveChatChannel(EFoundryTextChatChannel Channel);
+
+	/** Game-thread snapshot - kept in sync by the chat driver tick (so a /p
+	 *  with no text, which switches the active channel INSIDE the core, is
+	 *  reflected here too). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|TextChat")
+	EFoundryTextChatChannel GetActiveChatChannel() const { return ActiveChatChannelMirror; }
+
+	/**
+	 * Copy this channel's history (oldest -> newest) into OutLines, or every
+	 * channel merged by id when bAllChannels is true (Channel is then ignored).
+	 * In-memory only (no network) but still core state, so this briefly takes
+	 * the core lock (TryLock - matching the chat driver tick, so a worker
+	 * mid-send never stalls the game thread; a missed attempt just leaves
+	 * OutLines untouched and the NEXT call picks up fresh data).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void GetChatHistory(EFoundryTextChatChannel Channel, bool bAllChannels,
+		TArray<FFoundryChatLine>& OutLines);
+
+	/** Record a SYSTEM-channel notice from the host game (e.g. a game-state
+	 *  announcement). bIsError records as kind Error, otherwise System. No
+	 *  network - runs inline under the core lock. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void PostSystemMessage(const FString& Text, bool bIsError);
+
+	/**
+	 * Enable/disable the whisper poll (Platform binding only; a no-op
+	 * otherwise). Disable this whenever the chat box/whisper tab is hidden or
+	 * unfocused - every poller needs idle controls. Enabling schedules an
+	 * immediate poll on the next chat driver tick.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void SetWhisperPolling(bool bEnabled);
+
+	/**
+	 * Record an INBOUND line from a HOST-bound transport (the game's own
+	 * netcode delivered a party message, or is bridging some other
+	 * whisper-like surface). Whisper records as kind WhisperIn with the peer
+	 * set from FromName/FromFoundryId. Rejected on the System channel (use
+	 * PostSystemMessage instead). No network - runs inline under the core lock.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void InjectChatLine(EFoundryTextChatChannel Channel, const FString& FromName,
+		const FString& FromFoundryId, const FString& Body);
+
+	/**
+	 * Register a host command reachable as "/<name>" (<= 23 ASCII chars, no
+	 * whitespace/'/', must not collide with a built-in or a reserved name -
+	 * t/team/a/all/g/global). Re-registering an existing name replaces its
+	 * handler. The handler's returned string (if non-empty) is recorded as a
+	 * System line. @return false on an invalid/reserved name or a full command
+	 * table.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	bool RegisterChatCommand(const FString& Name, const FString& Help,
+		const FFoundryChatCommandHandlerBP& Handler);
+
+	/** Command-name completions (built-ins + registered) starting with Prefix
+	 *  (no leading slash; empty matches everything) - for a panel's
+	 *  autocomplete. No network - runs inline under the core lock. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void GetChatCommandCompletions(const FString& Prefix, TArray<FString>& OutNames);
+
+	/** Every recorded chat-box line (content or notice). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|TextChat")
+	FFoundryChatLineEvent OnChatLine;
+
+	/** The active channel changed (SetActiveChatChannel, or a bare "/p"). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|TextChat")
+	FFoundryTextChatChannelEvent OnActiveChatChannelChanged;
+
+	/** SubmitChatLine's own outcome (Ok, or InvalidArg for an empty line) - NOT
+	 *  the send's outcome; watch OnChatLine for the recorded System/Error line
+	 *  a rejected/failed send produces. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|TextChat")
+	FFoundryFsdkResultEvent OnChatLineSubmitted;
+
 	// ── Auto-login (DEFAULT: the Foundry launcher's session daemon) ─────────────
 	// The game gets a short-lived matchmaking token from the launcher's session
 	// daemon over the local FOUNDRY_IPC handoff - no in-game credentials, nothing
@@ -713,6 +1016,37 @@ private:
 	void RunSocialAction(const FString& Action, bool bRefreshPartyOnOk,
 		TFunction<int32(FFsdkCoreState&)> Call);
 
+	/** Text-chat party auto-bind: called whenever RefreshParty's completion
+	 *  (including the automatic RefreshParty the party-mutation chains run)
+	 *  lands a party id on the game thread. A no-op when the id hasn't changed
+	 *  or no text chat has been configured; otherwise dispatches
+	 *  fsdk_textchat_set_party on a worker (Platform binding may join/leave an
+	 *  FRC room over the network). */
+	void ApplyTextChatPartyId(const FString& NewPartyId);
+
+	/** Kick one text-chat tick (chat keepalive + rejoin + whisper poll/friends
+	 *  refresh) on a worker, guarded by bTextChatTickInFlight so at most one
+	 *  runs at a time. Called from ChatDriverTick every 0.25s once
+	 *  ConfigureTextChat has run - the core's fsdk_textchat_tick can block on
+	 *  the whisper-poll HTTP, so it must never run on the game thread. */
+	void KickTextChatTick(int64 NowMs);
+
+	/** Execute (on the GAME THREAD) any chat-command invocations staged by the
+	 *  native command thunk during the last SubmitChatLine (a slash command
+	 *  dispatches synchronously inside fsdk_textchat_submit, on the worker that
+	 *  called it - the Blueprint handler itself can only run here). Records
+	 *  each handler's non-empty response as a System line
+	 *  (fsdk_textchat_system - brief core-lock hold, no network). */
+	void DrainPendingChatCommands();
+
+	/** Registered chat slash-command handlers, keyed by lower-cased name.
+	 *  fsdk_textchat_register_command keeps only ONE native fn + user_data per
+	 *  command name, so ONE thunk fires for all of them and looks the actual
+	 *  Blueprint delegate up here by name (mirrors UFoundryConsoleSubsystem's
+	 *  FCommandEntry table). Game-thread-only: written by RegisterChatCommand,
+	 *  read by DrainPendingChatCommands. */
+	TMap<FString, FFoundryChatCommandHandlerBP> ChatCommandHandlers;
+
 	/** Ref-counted fsdk-core handles + serialization lock (owned). */
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> Core;
 
@@ -737,4 +1071,12 @@ private:
 	double NextChatRejoinTime = 0;  // backoff gate (FPlatformTime::Seconds)
 	int32 ChatRejoinStrikes = 0;    // exponential backoff ladder
 	FTSTicker::FDelegateHandle ChatTickHandle;
+
+	// ── Text-chat state ──
+	// The fsdk_textchat handle lives inside FFsdkCoreState (same lock as the
+	// client/chat). These mirrors are game-thread-only.
+	bool bTextChatConfigured = false;   // ConfigureTextChat has run at least once
+	bool bTextChatTickInFlight = false; // one KickTextChatTick worker at a time
+	EFoundryTextChatChannel ActiveChatChannelMirror = EFoundryTextChatChannel::Party;
+	FString TextChatPartyId;            // last party id applied (ApplyTextChatPartyId)
 };

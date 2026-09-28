@@ -382,10 +382,23 @@ void fsdk_dispatch_ws_close(void* handle);
  * Internal-only: tests shrink it. */
 extern long long fsdk_chat_ping_interval_ms; /* default 25000 */
 
+/* Re-join every room slot that still remembers a resolve path (see
+ * fsdk_chat_room_slot.join_path) - the auto-rejoin driver (textchat.c) calls
+ * this from a backoff timer after fsdk_chat_on_ws_closed. Implemented in
+ * chat.c; internal-only (not part of the public ABI - a game never calls this
+ * directly, it goes through fsdk_textchat_tick). */
+fsdk_result fsdk_chat_rejoin_all(fsdk_chat* chat);
+
 /* One multiplexed channel slot: a room subscription on the shared socket. */
 typedef struct fsdk_chat_room_slot {
     char room_id[64];            /* Resolved room UUID; empty = channel unused. */
     int  joined;                 /* room.sub.ok seen on the current socket.     */
+    char join_path[192];         /* The resolve route that produced room_id (a
+                                   * complete /v1/chat/rooms/... path) - stamped
+                                   * on a successful join, cleared on an
+                                   * explicit leave. Lets fsdk_chat_rejoin_all
+                                   * re-join after a socket drop without the
+                                   * host re-supplying the original key.        */
 } fsdk_chat_room_slot;
 
 /* Chat session state (client-side FRC rooms). Lifetime bound to its client.
@@ -398,6 +411,101 @@ struct fsdk_chat {
     long long    last_ping_ms;   /* Host-clock stamp of the last ping sent.     */
     fsdk_chat_message_fn on_message;
     void*        on_message_user_data;
+};
+
+/* -------------------------------------------------------------------------- */
+/* Text chat (textchat.c) - internal state.                                   */
+/* -------------------------------------------------------------------------- */
+
+/* A fixed-capacity ring of recorded lines for one channel. Allocated lazily
+ * (on the first append) so a channel that never records anything (e.g. WHISPER
+ * in a game that never whispers) costs nothing. */
+typedef struct textchat_ring {
+    fsdk_textchat_line* buf;
+    size_t capacity;   /* fsdk_textchat_config.history_lines, resolved.        */
+    size_t count;      /* Entries currently held (<= capacity).                */
+    size_t next_write; /* Index the NEXT append will land on.                  */
+} textchat_ring;
+
+#define FSDK_TEXTCHAT_MAX_COMMANDS 32
+#define FSDK_TEXTCHAT_CMD_NAME_MAX 24  /* 23 chars + NUL. */
+#define FSDK_TEXTCHAT_CMD_HELP_MAX 128
+#define FSDK_TEXTCHAT_MAX_WHISPER_PEERS 32
+#define FSDK_TEXTCHAT_MAX_FRIENDS 64
+
+typedef struct textchat_command {
+    char name[FSDK_TEXTCHAT_CMD_NAME_MAX]; /* Lower-cased, no leading slash.    */
+    char help[FSDK_TEXTCHAT_CMD_HELP_MAX];
+    fsdk_textchat_command_fn fn;
+    void* user_data;
+} textchat_command;
+
+/* Per-peer whisper-poll bookkeeping: how far we have already surfaced into
+ * history, so a re-poll never re-emits an already-shown message even if
+ * fsdk_dm_mark_read failed. Bounded to FSDK_TEXTCHAT_MAX_WHISPER_PEERS -
+ * least-recently-touched is evicted when full. */
+typedef struct textchat_whisper_seen {
+    char foundry_id[64];
+    long long last_seen_id;
+    long long touched_at_ms;
+} textchat_whisper_seen;
+
+struct fsdk_textchat {
+    fsdk_client* client;  /* Borrowed: must outlive the textchat.              */
+    fsdk_chat*   chat;    /* Borrowed; NULL only in LOCAL mode.                */
+
+    fsdk_textchat_mode mode;
+    fsdk_textchat_bind bind[FSDK_TEXTCHAT_CHANNEL__COUNT]; /* Resolved (preset + override). */
+    int history_lines;
+    int whisper_poll_ms;
+    int friends_refresh_ms;
+    fsdk_log_level log_sink_min_level;
+
+    textchat_ring rings[FSDK_TEXTCHAT_CHANNEL__COUNT];
+    long long next_line_id; /* Starts at 1; monotonic across every channel.    */
+
+    fsdk_textchat_line_fn on_line;
+    void* on_line_user_data;
+    fsdk_textchat_host_send_fn host_send;
+    void* host_send_user_data;
+    fsdk_chat_message_fn room_passthrough; /* Every raw room message, before textchat. */
+    void* room_passthrough_user_data;
+
+    fsdk_textchat_channel active_channel;
+
+    char party_id[64];
+
+    /* whisper targets */
+    char reply_target_id[64];   /* Last INBOUND whisperer (/r target).         */
+    char reply_target_name[128];
+    char whisper_target_id[64]; /* Last /w target (plain-text-while-WHISPER-active target). */
+    char whisper_target_name[128];
+
+    int whisper_polling_enabled;
+    int whisper_poll_due_now;    /* Set on enable; forces the NEXT tick to poll immediately. */
+    long long next_whisper_poll_ms;
+    textchat_whisper_seen whisper_seen[FSDK_TEXTCHAT_MAX_WHISPER_PEERS];
+    size_t whisper_seen_count;
+
+    /* friends cache (name resolution for /w) */
+    fsdk_friend friends[FSDK_TEXTCHAT_MAX_FRIENDS];
+    size_t friends_count;
+    long long friends_last_refresh_ms;
+    int friends_ever_loaded;
+
+    /* rejoin-on-drop backoff state (PLATFORM binding, chat != NULL only) */
+    int rejoin_active;
+    int rejoin_disconnected_notified;
+    long long rejoin_backoff_ms;
+    long long rejoin_next_at_ms;
+    long long rejoin_disconnected_since_ms;
+
+    long long clock_now_ms; /* Last now_ms handed to fsdk_textchat_tick; 0 = never ticked. */
+
+    textchat_command commands[FSDK_TEXTCHAT_MAX_COMMANDS];
+    size_t command_count;
+
+    int log_sink_reentrant_guard; /* fsdk_textchat_log_sink re-entrancy guard. */
 };
 
 /* -------------------------------------------------------------------------- */
