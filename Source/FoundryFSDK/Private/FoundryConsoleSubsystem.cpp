@@ -25,6 +25,7 @@
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/SLeafWidget.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -204,10 +205,81 @@ private:
 	float SmoothedDelta = 0.f;
 };
 
-// ── The developer console Slate widget (full-screen; view/input only) ───────────
+// ── Console window chrome glyphs (line-drawn: the UI fonts carry no symbols) ────
+
+enum class EFoundryConsoleGlyph : uint8 { Close, Maximize, Windowed, Grip };
+
+/** Paint-only icon on a 12-unit design grid, scaled to the allotted box. */
+class SFoundryConsoleGlyph : public SLeafWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SFoundryConsoleGlyph) {}
+		SLATE_ATTRIBUTE(EFoundryConsoleGlyph, Glyph)
+	SLATE_END_ARGS()
+
+	void Construct(const FArguments& InArgs)
+	{
+		Glyph = InArgs._Glyph;
+		SetVisibility(EVisibility::HitTestInvisible); // the wrapping border takes the mouse
+	}
+
+	virtual FVector2D ComputeDesiredSize(float) const override { return FVector2D(12.0, 12.0); }
+
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
+		FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle,
+		bool bParentEnabled) const override
+	{
+		const FVector2f Size = FVector2f(AllottedGeometry.GetLocalSize());
+		const float Unit = FMath::Min(Size.X, Size.Y) / 12.f;
+		const EFoundryConsoleGlyph Which = Glyph.Get();
+		const FLinearColor Color = Which == EFoundryConsoleGlyph::Grip
+			? FLinearColor(0.75f, 0.95f, 1.f, 0.55f) : FLinearColor(0.75f, 0.95f, 1.f);
+		auto Stroke = [&](std::initializer_list<FVector2f> DesignPoints)
+		{
+			TArray<FVector2f> Points;
+			Points.Reserve(int32(DesignPoints.size()));
+			for (const FVector2f& P : DesignPoints)
+			{
+				Points.Add(P * Unit);
+			}
+			FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(),
+				Points, ESlateDrawEffect::None, Color, true, 1.5f);
+		};
+		switch (Which)
+		{
+		case EFoundryConsoleGlyph::Close:
+			Stroke({ FVector2f(1.f, 1.f), FVector2f(11.f, 11.f) });
+			Stroke({ FVector2f(11.f, 1.f), FVector2f(1.f, 11.f) });
+			break;
+		case EFoundryConsoleGlyph::Maximize:
+			Stroke({ FVector2f(1.f, 1.f), FVector2f(11.f, 1.f), FVector2f(11.f, 11.f), FVector2f(1.f, 11.f), FVector2f(1.f, 1.f) });
+			break;
+		case EFoundryConsoleGlyph::Windowed: // a window in front of another
+			Stroke({ FVector2f(1.f, 4.f), FVector2f(8.f, 4.f), FVector2f(8.f, 11.f), FVector2f(1.f, 11.f), FVector2f(1.f, 4.f) });
+			Stroke({ FVector2f(4.f, 4.f), FVector2f(4.f, 1.f), FVector2f(11.f, 1.f), FVector2f(11.f, 8.f), FVector2f(8.f, 8.f) });
+			break;
+		case EFoundryConsoleGlyph::Grip: // three diagonals into the bottom-right corner
+			Stroke({ FVector2f(1.f, 11.f), FVector2f(11.f, 1.f) });
+			Stroke({ FVector2f(5.f, 11.f), FVector2f(11.f, 5.f) });
+			Stroke({ FVector2f(9.f, 11.f), FVector2f(11.f, 9.f) });
+			break;
+		}
+		return LayerId + 1;
+	}
+
+private:
+	TAttribute<EFoundryConsoleGlyph> Glyph;
+};
+
+// ── The developer console Slate widget (view/input only) ────────────────────────
 
 /** Pure view over the subsystem's scrollback + an input line. All echo, masking,
- *  and dispatch live in UFoundryConsoleSubsystem::SubmitLine. */
+ *  and dispatch live in UFoundryConsoleSubsystem::SubmitLine.
+ *
+ *  Opens covering the viewport. The title bar shrinks it to a window (drag the
+ *  bar to move, the bottom-right grip to resize, never under MinWindowSize) and
+ *  back; the window mode + rect last for the run, not across runs. Outside the
+ *  window the mouse falls through to the game. */
 class SFoundryConsole : public SCompoundWidget
 {
 public:
@@ -218,35 +290,114 @@ public:
 	void Construct(const FArguments& InArgs)
 	{
 		Owner = InArgs._Owner;
+		SetVisibility(EVisibility::SelfHitTestInvisible); // windowed: clicks beside the window reach the game
+
+		const FSlateBrush* White = FCoreStyle::Get().GetBrush("WhiteBrush");
 
 		ChildSlot
 		[
+			// 1px outline, windowed only, so the window reads against the game.
 			SNew(SBorder)
-			.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
-			.BorderBackgroundColor(FLinearColor(0.01f, 0.02f, 0.04f, 0.92f))
-			.Padding(FMargin(16.f, 12.f))
+			.BorderImage(White)
+			.BorderBackgroundColor(FLinearColor(0.3f, 0.9f, 1.f, 0.35f))
+			.Padding_Lambda([this]() { return FMargin(bWindowed ? 1.f : 0.f); })
 			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot()
-				.FillHeight(1.f)
+				SNew(SBorder)
+				.BorderImage(White)
+				.BorderBackgroundColor(FLinearColor(0.01f, 0.02f, 0.04f, 0.92f))
+				.Padding(0.f)
+				.OnMouseButtonDown(this, &SFoundryConsole::HandleBodyMouseDown)
 				[
-					SAssignNew(ScrollBox, SScrollBox)
-					+ SScrollBox::Slot()
+					SNew(SOverlay)
+					+ SOverlay::Slot()
 					[
-						SAssignNew(LogText, STextBlock)
-						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
-						.ColorAndOpacity(FLinearColor(0.75f, 0.95f, 1.f))
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(SBorder)
+							.BorderImage(White)
+							.BorderBackgroundColor(FLinearColor(0.03f, 0.07f, 0.11f, 0.96f))
+							.Padding(FMargin(16.f, 0.f, 0.f, 0.f))
+							.OnMouseButtonDown(this, &SFoundryConsole::HandleTitleMouseDown)
+							.OnMouseDoubleClick(this, &SFoundryConsole::HandleTitleDoubleClick)
+							[
+								SNew(SHorizontalBox)
+								+ SHorizontalBox::Slot()
+								.FillWidth(1.f)
+								.VAlign(VAlign_Center)
+								[
+									SNew(STextBlock)
+									.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
+									.ColorAndOpacity(FLinearColor(0.45f, 0.55f, 0.65f))
+									.Text(FText::FromString(TEXT("Foundry Console")))
+								]
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								[
+									MakeChromeButton(ModeButton, TAttribute<EFoundryConsoleGlyph>::CreateLambda([this]()
+									{
+										return bWindowed ? EFoundryConsoleGlyph::Maximize : EFoundryConsoleGlyph::Windowed;
+									}))
+								]
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								[
+									MakeChromeButton(CloseButton, EFoundryConsoleGlyph::Close)
+								]
+							]
+						]
+						+ SVerticalBox::Slot()
+						.FillHeight(1.f)
+						.Padding(FMargin(16.f, 12.f))
+						[
+							SNew(SVerticalBox)
+							+ SVerticalBox::Slot()
+							.FillHeight(1.f)
+							[
+								SAssignNew(ScrollBox, SScrollBox)
+								+ SScrollBox::Slot()
+								[
+									SAssignNew(LogText, STextBlock)
+									.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
+									.ColorAndOpacity(FLinearColor(0.75f, 0.95f, 1.f))
+								]
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.Padding(0.f, 8.f, 0.f, 0.f)
+							[
+								SAssignNew(InputBox, SEditableTextBox)
+								.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
+								.HintText(FText::FromString(TEXT("Type 'help' for commands")))
+								.OnTextCommitted(this, &SFoundryConsole::HandleCommitted)
+								.OnKeyDownHandler(this, &SFoundryConsole::HandleInputKeyDown)
+							]
+						]
 					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0.f, 8.f, 0.f, 0.f)
-				[
-					SAssignNew(InputBox, SEditableTextBox)
-					.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
-					.HintText(FText::FromString(TEXT("Type 'help' for commands")))
-					.OnTextCommitted(this, &SFoundryConsole::HandleCommitted)
-					.OnKeyDownHandler(this, &SFoundryConsole::HandleInputKeyDown)
+					// Resize grip: sits in the body's right padding, so it never covers the input box.
+					+ SOverlay::Slot()
+					.HAlign(HAlign_Right)
+					.VAlign(VAlign_Bottom)
+					.Padding(FMargin(0.f, 0.f, 1.f, 1.f))
+					[
+						SNew(SBox)
+						.WidthOverride(14.f)
+						.HeightOverride(14.f)
+						.Visibility_Lambda([this]() { return bWindowed ? EVisibility::Visible : EVisibility::Collapsed; })
+						[
+							SNew(SBorder)
+							.BorderImage(White)
+							.BorderBackgroundColor(FLinearColor::Transparent)
+							.Padding(0.f)
+							.Cursor(EMouseCursor::ResizeSouthEast)
+							.OnMouseButtonDown(this, &SFoundryConsole::HandleGripMouseDown)
+							[
+								SNew(SFoundryConsoleGlyph)
+								.Glyph(EFoundryConsoleGlyph::Grip)
+							]
+						]
+					]
 				]
 			]
 		];
@@ -270,6 +421,83 @@ public:
 		}
 	}
 
+	// Windowed = the one child gets its own rect instead of the whole viewport.
+	virtual void OnArrangeChildren(const FGeometry& AllottedGeometry, FArrangedChildren& ArrangedChildren) const override
+	{
+		if (!bWindowed)
+		{
+			SCompoundWidget::OnArrangeChildren(AllottedGeometry, ArrangedChildren);
+			return;
+		}
+		const TSharedRef<SWidget> Child = ChildSlot.GetWidget();
+		if (ArrangedChildren.Accepts(Child->GetVisibility()))
+		{
+			FVector2f Pos, Size;
+			GetWindowRect(FVector2f(AllottedGeometry.GetLocalSize()), Pos, Size);
+			ArrangedChildren.AddWidget(AllottedGeometry.MakeChild(Child, Size, FSlateLayoutTransform(Pos)));
+		}
+	}
+
+	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if ((Drag != EDrag::Move && Drag != EDrag::Resize) || !HasMouseCapture())
+		{
+			return FReply::Unhandled();
+		}
+		const FVector2f Area = FVector2f(MyGeometry.GetLocalSize());
+		const FVector2f Delta = FVector2f(MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition())) - DragStartMouse;
+		if (Drag == EDrag::Move)
+		{
+			WindowPos = DragStartPos + Delta;
+		}
+		else
+		{
+			// Grows from a fixed top-left: floor at the minimum, ceiling at the viewport edge.
+			const FVector2f MinSize = FVector2f::Min(MinWindowSize, Area);
+			const FVector2f MaxSize = FVector2f::Max(MinSize, Area - WindowPos);
+			WindowSize.X = FMath::Clamp(DragStartSize.X + Delta.X, MinSize.X, MaxSize.X);
+			WindowSize.Y = FMath::Clamp(DragStartSize.Y + Delta.Y, MinSize.Y, MaxSize.Y);
+		}
+		// Store the on-screen rect, so dragging past an edge never banks slack to undo.
+		FVector2f Pos, Size;
+		GetWindowRect(Area, Pos, Size);
+		WindowPos = Pos;
+		WindowSize = Size;
+		Invalidate(EInvalidateWidgetReason::Layout);
+		return FReply::Handled();
+	}
+
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (Drag == EDrag::None || MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
+		{
+			return FReply::Unhandled();
+		}
+		const EDrag Ended = Drag;
+		Drag = EDrag::None;
+		// A chrome button fires only when the press and the release both land on it.
+		const TSharedPtr<SWidget> Pressed = Ended == EDrag::PressMode ? ModeButton
+			: Ended == EDrag::PressClose ? CloseButton : TSharedPtr<SBorder>();
+		if (Pressed.IsValid() && Pressed->GetTickSpaceGeometry().IsUnderLocation(MouseEvent.GetScreenSpacePosition()))
+		{
+			if (Ended == EDrag::PressMode)
+			{
+				SetWindowed(!bWindowed);
+			}
+			else if (UFoundryConsoleSubsystem* Sub = Owner.Get())
+			{
+				Sub->ToggleConsole(); // open, so this closes (and restores focus) like Esc
+			}
+		}
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override
+	{
+		SCompoundWidget::OnMouseCaptureLost(CaptureLostEvent);
+		Drag = EDrag::None;
+	}
+
 	void FocusInput()
 	{
 		// Defer one tick: the toggle key's WM_CHAR arrives AFTER the (swallowed) keydown,
@@ -281,6 +509,7 @@ public:
 	/** Drop any pending input text (close path — see CloseConsole's focus clear). */
 	void ClearInput()
 	{
+		Drag = EDrag::None; // a close mid-drag never resumes on the next open
 		if (InputBox.IsValid())
 		{
 			InputBox->SetText(FText::GetEmpty());
@@ -300,6 +529,118 @@ public:
 	}
 
 private:
+	enum class EDrag : uint8 { None, Move, Resize, PressMode, PressClose };
+
+	/** The window rect inside a viewport of Area: the stored rect, held to the minimum
+	 *  size and kept on screen (a viewport smaller than the minimum wins). */
+	void GetWindowRect(const FVector2f Area, FVector2f& OutPos, FVector2f& OutSize) const
+	{
+		const FVector2f MinSize = FVector2f::Min(MinWindowSize, Area);
+		OutSize.X = FMath::Clamp(WindowSize.X, MinSize.X, Area.X);
+		OutSize.Y = FMath::Clamp(WindowSize.Y, MinSize.Y, Area.Y);
+		OutPos.X = FMath::Clamp(WindowPos.X, 0.f, Area.X - OutSize.X);
+		OutPos.Y = FMath::Clamp(WindowPos.Y, 0.f, Area.Y - OutSize.Y);
+	}
+
+	void SetWindowed(bool bInWindowed)
+	{
+		bWindowed = bInWindowed;
+		if (bWindowed && !bHasWindowRect)
+		{
+			// First shrink: 60% of the viewport (never under the minimum), centered.
+			const FVector2f Area = FVector2f(GetTickSpaceGeometry().GetLocalSize());
+			WindowSize = FVector2f::Max(MinWindowSize, Area * 0.6f);
+			WindowPos = (Area - WindowSize) * 0.5f;
+			bHasWindowRect = true;
+		}
+		Invalidate(EInvalidateWidgetReason::Layout);
+		FocusInput();
+	}
+
+	/** Title-bar button: a hover-tinted box around a glyph. The press is tracked by
+	 *  this widget (BeginDrag), so the click needs press + release on the button. */
+	TSharedRef<SWidget> MakeChromeButton(TSharedPtr<SBorder>& OutButton, TAttribute<EFoundryConsoleGlyph> Glyph)
+	{
+		const bool bClose = &OutButton == &CloseButton;
+		return SAssignNew(OutButton, SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+			.Padding(0.f)
+			.BorderBackgroundColor_Lambda([this, bClose]()
+			{
+				const TSharedPtr<SBorder>& Self = bClose ? CloseButton : ModeButton;
+				if (!Self.IsValid() || !Self->IsHovered())
+				{
+					return FSlateColor(FLinearColor::Transparent);
+				}
+				return FSlateColor(bClose ? FLinearColor(0.8f, 0.15f, 0.15f, 0.9f) : FLinearColor(1.f, 1.f, 1.f, 0.12f));
+			})
+			.OnMouseButtonDown_Lambda([this, bClose](const FGeometry&, const FPointerEvent& MouseEvent)
+			{
+				return BeginDrag(bClose ? EDrag::PressClose : EDrag::PressMode, MouseEvent);
+			})
+			[
+				SNew(SBox)
+				.WidthOverride(34.f)
+				.HeightOverride(24.f)
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
+				[
+					SNew(SFoundryConsoleGlyph)
+					.Glyph(Glyph)
+				]
+			];
+	}
+
+	/** Every handled press keeps typing in the input box - an unanswered click would
+	 *  hand keyboard focus to the game viewport behind the console. */
+	FReply KeepInputFocus(FReply Reply) const
+	{
+		if (InputBox.IsValid())
+		{
+			Reply.SetUserFocus(InputBox.ToSharedRef(), EFocusCause::Mouse);
+		}
+		return Reply;
+	}
+
+	FReply BeginDrag(EDrag Kind, const FPointerEvent& MouseEvent)
+	{
+		if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
+		{
+			return FReply::Unhandled();
+		}
+		Drag = Kind;
+		const FGeometry Mine = GetTickSpaceGeometry();
+		DragStartMouse = FVector2f(Mine.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition()));
+		GetWindowRect(FVector2f(Mine.GetLocalSize()), DragStartPos, DragStartSize);
+		return KeepInputFocus(FReply::Handled().CaptureMouse(SharedThis(this)));
+	}
+
+	FReply HandleBodyMouseDown(const FGeometry&, const FPointerEvent&)
+	{
+		return KeepInputFocus(FReply::Handled());
+	}
+
+	FReply HandleTitleMouseDown(const FGeometry&, const FPointerEvent& MouseEvent)
+	{
+		return bWindowed ? BeginDrag(EDrag::Move, MouseEvent) : KeepInputFocus(FReply::Handled());
+	}
+
+	FReply HandleTitleDoubleClick(const FGeometry&, const FPointerEvent& MouseEvent)
+	{
+		if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
+		{
+			return FReply::Unhandled();
+		}
+		Drag = EDrag::None;
+		SetWindowed(!bWindowed);
+		return KeepInputFocus(FReply::Handled().ReleaseMouseCapture());
+	}
+
+	FReply HandleGripMouseDown(const FGeometry&, const FPointerEvent& MouseEvent)
+	{
+		return BeginDrag(EDrag::Resize, MouseEvent);
+	}
+
 	EActiveTimerReturnType FocusInputDeferred(double, float)
 	{
 		if (InputBox.IsValid() && FSlateApplication::IsInitialized())
@@ -421,6 +762,20 @@ private:
 	TSharedPtr<SScrollBox> ScrollBox;
 	TSharedPtr<STextBlock> LogText;
 	TSharedPtr<SEditableTextBox> InputBox;
+	TSharedPtr<SBorder> ModeButton;
+	TSharedPtr<SBorder> CloseButton;
+
+	// Window mode. Positions/sizes are in this widget's local (DPI-scaled) units.
+	inline static const FVector2f MinWindowSize = FVector2f(800.f, 600.f);
+	FVector2f WindowPos = FVector2f::ZeroVector;
+	FVector2f WindowSize = FVector2f::ZeroVector;
+	FVector2f DragStartMouse = FVector2f::ZeroVector;
+	FVector2f DragStartPos = FVector2f::ZeroVector;
+	FVector2f DragStartSize = FVector2f::ZeroVector;
+	EDrag Drag = EDrag::None;
+	bool bWindowed = false;
+	bool bHasWindowRect = false;
+
 	FString PendingInput;
 	int32 HistoryIndex = INDEX_NONE;
 	uint32 LastSerial = 0;

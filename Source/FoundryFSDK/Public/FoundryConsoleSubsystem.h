@@ -46,6 +46,10 @@ DECLARE_DYNAMIC_DELEGATE_RetVal_OneParam(FString, FFoundryConsoleHandlerBP, cons
  * own commands via RegisterCommand (C++) / RegisterConsoleCommand (Blueprint),
  * each gated by an EFoundryConsoleAccess level.
  *
+ * The console opens covering the viewport; its title bar shrinks it to a movable,
+ * corner-resizable window (minimum 800x600) and closes it. Window mode lasts for
+ * the run.
+ *
  * Session events (login, logout, matchmaking phases) are printed into the
  * scrollback automatically; games pipe their own lifecycle lines via Print().
  *
