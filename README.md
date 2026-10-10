@@ -569,12 +569,47 @@ All on `UFoundryFSDKSubsystem`, all Blueprint-callable, all riding the session f
 | Category | Calls |
 |---|---|
 | **Foundry \| Chat** | `JoinGlobalChat(GameSlug)`, `JoinPartyChat`, `JoinMatchChat(MatchId)`, `JoinTeamChat(MatchId)`, `SendChat`, `SendChatToChannel`, `LeaveChat`; events `OnChatMessage`, `OnChatStateChanged`. One socket, one subscription per channel. |
-| **Foundry \| Social** | friends (`RefreshFriends`, `SendFriendRequest(Username)`, accept/remove/block), friend codes, parties (`CreateParty`, `InviteToParty`, accept/decline/leave, `RefreshPartyInvites`), whispers. A party's id is the `partyId` attribute you pass to `FindMatchAuthenticated`. |
+| **Foundry \| Social** | friends (`RefreshFriends`, `SendFriendRequest(Username)`, accept/remove/block, `RefreshBlocked`), friend codes, parties (`CreateParty`, `InviteToParty`, accept/decline/leave, `RefreshPartyInvites`, join requests: `RequestToJoinParty(FriendId)`, `RefreshPartyJoinRequests`, `Accept/DeclinePartyJoinRequest`), whispers, `GetUsername()`. A party's id is the `partyId` attribute you pass to `FindMatchAuthenticated`. |
 | **Foundry \| FMMS** | `GetCurrentMatchId()` after travel — the key for match/team chat. |
 | **Foundry \| Console** | `UFoundryConsoleSubsystem`: `SetEnabled`, `SetConsoleKey` (default `~`), `SetOverlayKey` (default F9), `RegisterConsoleCommand`. The console dispatches a whitelist only — it never reaches the engine's `Exec`, so a Shipping build stays locked down. `-DevMode` on the command line forces it on. |
 
 Nothing here talks to an admin or operator route. The client SDK holds no secrets and is
 assumed fully reverse-engineered; every permission is enforced by the platform.
+
+### 5.1 Default UI - the `FoundryFSDKUI` module (opt-in)
+
+Since 0.7.0 the plugin ships a UMG default UI kit in Foundry colours (navy / cyan) so a game
+gets working social UI with zero widget work, and restyles only what it wants. The kit is a
+separate Runtime module, `FoundryFSDKUI`; a game that never references it pays nothing. First
+family shipped: the **social drawer** (account block, your party, online / offline / blocked
+friends, ADD FRIEND, a right-click menu per friend - Send Message, Invite, Request to Join,
+Remove Friend, Block Player - with confirms on the destructive ones). Chat, app bar,
+matchmaking cluster, pause + settings menus follow in the same shape.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `UFoundrySocialSubsystem` | `FoundryFSDK` (core) | The ONE social poller: cached friends / blocked / party / invites / pending count / own identity, a 10 s open / 30 s closed cadence (`SetPanelOpen`), every action (`SendFriendRequest`, `InviteByUsername`, `RemoveFriend`, `BlockPlayer`, `UnblockPlayer`, `RequestToJoin`, ...), `OnChanged` / `OnPartyChanged` / `OnActionFailed`, and `SetFixture` for dev fixtures. Your own model reads from it; never poll the subsystem twice. |
+| `UFoundrySocialDrawer`, `UFoundryFriendRow`, `UFoundryInviteRow`, `UFoundryFriendMenu` | `FoundryFSDKUI` | The C++ parents. They bind widgets BY NAME (`BindWidgetOptional` - a WBP with half the names still compiles) and push state; the look lives in the WBP. `GetMemberTint` is a `BlueprintNativeEvent` seam for your palette; `OnWhisperRequested(FoundryId, DisplayName)` is where Send Message hands off to your chat. |
+| `UFoundryUIWidgetBase` | `FoundryFSDKUI` | `Show` / `SetText` / `UseHandCursor` helpers and `PlayOrTween`: plays a bound `UWidgetAnimation` when the WBP has one, else a code tween - every default animates with no Sequencer work, and a hand-authored animation wins when present. |
+| `UFoundryUISettings` | Project Settings > Plugins > Foundry UI | `AccountUrl` (the Manage account link), the four default widget classes (`TSoftClassPtr`, point them at your copies to restyle), the palette (`FFoundryUIPalette`). |
+| `Content/UI/Social/WBP_Foundry*` | plugin Content | The default Widget Blueprints, GENERATED from a C++ spec by the editor commandlet below (trees in `Content/UI/Social/TREES.md`). Duplicate one into your project to restyle it; a duplicate keeps the parent class and every binding. |
+| `Content/UI/Icons/icon_*` | plugin Content | White glyphs tinted in UMG (paper plane, person +/-, block, group +/?, users, close, search, chevrons, check). Sources + generator: `Tools/icons/make_icons.py` (Pillow). |
+| `FoundryFSDKUIEditor` | editor module | `UnrealEditor-Cmd.exe <project> -run=FoundryUIBuild [-dump]` regenerates the default WBPs + imports the icons (idempotent; `-dump` prints the trees). Only needed when the kit's spec changes - a consumer never runs it. |
+
+`UFoundryUISettings`'s defaults are soft class references (`TSoftClassPtr`), so nothing in code
+hard-references `Content/UI/Social` for the cooker to find on its own - the plugin's own
+`Config/DefaultGame.ini` (`+DirectoriesToAlwaysCook=(Path="/FoundryFSDK/UI")`) keeps the generated
+WBPs and the icon set in every cook, with no project-side config needed.
+
+Zero-work path: a host widget that has no `Drawer` slot can create the default from
+`UFoundryUISettings::Get()->DefaultSocialDrawer` and add it to its root canvas (Goo Crew's lobby
+does exactly that - `UGooLobbyWidget::NativeOnInitialized`). Restyle path: duplicate
+`/FoundryFSDK/UI/Social/WBP_FoundrySocialDrawer` (and the row / menu WBPs) into your project,
+reparent the copy to your own subclass if you override a seam, set the classes in its Class
+Defaults (or the project settings), and change the brushes. Rules the kit follows and expects:
+a UI click never blocks on the SDK core (every subsystem call is a worker call), destructive
+actions confirm, a right-click is an explicit menu, the game never sets presence (the launcher
+owns it), and the game's own identity is the redacted read (foundryId, display name, username).
 
 ---
 
@@ -699,10 +734,15 @@ FoundryFSDK/
     Public/FMMSSubsystem.h                   # the matchmaking orchestrator: FindMatchAuthenticated -> travel
     Public/FoundryFSDKServer.h               # FFoundryFSDKServer: token gate + lifecycle (Server target only)
     Public/FoundryConsoleSubsystem.h         # the Shipping-safe developer console (~)
+    Public/FoundrySocialSubsystem.h          # the one social poller the UI kit + your model read
     Private/FoundryFSDKLauncherHandoff.cpp   # FOUNDRY_IPC: the launcher -> game session handoff
     Private/FoundryFSDKTransport.cpp         # engine HTTP + WebSockets behind the core's transport seams
     Private/FoundryFSDKVerifier.cpp          # OpenSSL RS256 + JWKS (server only)
     Private/FsdkCore/                        # vendored fsdk-core (C), compiled by UBT
+  Source/FoundryFSDKUI/                      # opt-in UMG default UI kit (social drawer first) - section 5.1
+  Source/FoundryFSDKUIEditor/                # -run=FoundryUIBuild: regenerates the default WBPs + icons
+  Content/UI/Social/, Content/UI/Icons/      # the generated default widgets + glyphs (TREES.md = the spec)
+  Tools/icons/make_icons.py                  # the glyph generator (Pillow); PNG sources under Content/UI/Icons/src
   LICENSE                                    # Apache-2.0
 ```
 

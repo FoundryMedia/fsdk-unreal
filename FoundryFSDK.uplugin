@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.6.0",
+	"VersionName": "0.7.0",
 	"FriendlyName": "Foundry FSDK",
 	"Description": "Unreal Engine binding for the Foundry SDK (FSDK). Wraps the shared fsdk-core C ABI (FID auth, FMMS matchmaking, FID-signed match tokens, Agones server lifecycle) with idiomatic UE - UGameInstanceSubsystem facades exposed to Blueprints, plus a Shipping-safe curated developer console (whitelist commands, stats overlay, net graph, log capture).",
 	"Category": "Foundry",
@@ -10,7 +10,7 @@
 	"DocsURL": "https://foundryplatform.app/docs/fsdk",
 	"MarketplaceURL": "",
 	"SupportURL": "https://foundryplatform.app/support",
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": true,
 	"IsExperimentalVersion": true,
 	"Installed": false,
@@ -18,6 +18,16 @@
 		{
 			"Name": "FoundryFSDK",
 			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "FoundryFSDKUI",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "FoundryFSDKUIEditor",
+			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}
 	]

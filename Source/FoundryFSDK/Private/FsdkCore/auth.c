@@ -70,6 +70,7 @@ fsdk_result fsdk_current_session(fsdk_client* client, fsdk_session* out) {
     }
     copy_bounded(out->foundry_id, sizeof(out->foundry_id), client->foundry_id);
     copy_bounded(out->display_name, sizeof(out->display_name), client->display_name);
+    copy_bounded(out->username, sizeof(out->username), client->username);
     return FSDK_OK;
 }
 
@@ -181,9 +182,12 @@ static fsdk_result apply_session(fsdk_client* client, const char* resp) {
     client->authenticated = 1;
 
     /* Identity (best-effort) from the nested "user" object - unique keys, so a
-     * flat lookup over "data" finds them. displayName may be null -> empty. */
+     * flat lookup over "data" finds them. displayName/username may be null/absent
+     * -> empty (json_extract_string always clears the buffer first, so a second
+     * account's sign-in never carries the prior account's username forward). */
     json_extract_string(data, "foundryId", client->foundry_id, sizeof(client->foundry_id));
     json_extract_string(data, "displayName", client->display_name, sizeof(client->display_name));
+    json_extract_string(data, "username", client->username, sizeof(client->username));
 
     /* Persist the rotated refresh token (best-effort; no store -> session only). */
     fsdk_secret_save(FSDK_SECRET_KEY_REFRESH, client->refresh_token);
@@ -320,6 +324,7 @@ fsdk_result fsdk_logout(fsdk_client* client) {
     client->authenticated = 0;
     client->foundry_id[0] = '\0';
     client->display_name[0] = '\0';
+    client->username[0] = '\0';
     fsdk_log(FSDK_LOG_INFO, "fsdk logout");
     return FSDK_OK;
 }

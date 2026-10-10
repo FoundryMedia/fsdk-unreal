@@ -411,6 +411,44 @@ fsdk_result fsdk_social_pending(fsdk_client* client,
     return FSDK_OK;
 }
 
+fsdk_result fsdk_social_blocked(fsdk_client* client,
+                                fsdk_friend* out, size_t capacity, size_t* out_count) {
+    char* body = NULL;
+    const char* cursor;
+    char* obj;
+    fsdk_result rc;
+    size_t n = 0;
+
+    if (out == NULL || capacity == 0 || out_count == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_count = 0;
+    rc = social_get(client, SOCIAL_FRIENDS_PATH "/blocks", &body);
+    if (rc != FSDK_OK) {
+        return rc;
+    }
+    obj = (char*)malloc(SOCIAL_OBJ_BUF);
+    if (obj == NULL) {
+        fsdk_string_free(body);
+        return FSDK_ERR_INTERNAL;
+    }
+    cursor = fsdk_json_array_start(body);
+    while (n < capacity && (cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
+        fsdk_friend* f = &out[n];
+        memset(f, 0, sizeof(*f));
+        (void)json_extract_string(obj, "foundryId", f->foundry_id, sizeof(f->foundry_id));
+        (void)json_extract_string(obj, "displayName", f->display_name, sizeof(f->display_name));
+        (void)json_extract_string(obj, "username", f->username, sizeof(f->username));
+        if (f->foundry_id[0] != '\0') {
+            n++;
+        }
+    }
+    free(obj);
+    fsdk_string_free(body);
+    *out_count = n;
+    return FSDK_OK;
+}
+
 fsdk_result fsdk_social_friend_request(fsdk_client* client, const char* username) {
     char payload[96];
     if (!valid_username(username)) {
@@ -659,4 +697,77 @@ fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id)
 
 fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id) {
     return party_verb(client, party_id, "leave");
+}
+
+/* ---- party join requests (leader-gated; parties stay invite-only) ----------- */
+
+fsdk_result fsdk_social_party_join_request(fsdk_client* client, const char* friend_foundry_id) {
+    char payload[96];
+    if (!valid_foundry_id(friend_foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(payload, sizeof(payload), "{\"friendFoundryId\":\"%s\"}", friend_foundry_id);
+    return social_post(client, SOCIAL_PARTIES_PATH "/join-requests", payload);
+}
+
+fsdk_result fsdk_social_party_join_requests(fsdk_client* client, const char* party_id,
+                                            fsdk_friend* out, size_t capacity, size_t* out_count) {
+    char path[160];
+    char* body = NULL;
+    const char* cursor;
+    char* obj;
+    fsdk_result rc;
+    size_t n = 0;
+
+    if (!valid_party_id(party_id) || out == NULL || capacity == 0 || out_count == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_count = 0;
+    (void)snprintf(path, sizeof(path), "%s/%s/join-requests", SOCIAL_PARTIES_PATH, party_id);
+    rc = social_get(client, path, &body);
+    if (rc != FSDK_OK) {
+        return rc;
+    }
+    obj = (char*)malloc(SOCIAL_OBJ_BUF);
+    if (obj == NULL) {
+        fsdk_string_free(body);
+        return FSDK_ERR_INTERNAL;
+    }
+    cursor = fsdk_json_array_start(body);
+    while (n < capacity && (cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
+        fsdk_friend* f = &out[n];
+        memset(f, 0, sizeof(*f));
+        (void)json_extract_string(obj, "requesterFoundryId", f->foundry_id, sizeof(f->foundry_id));
+        (void)json_extract_string(obj, "displayName", f->display_name, sizeof(f->display_name));
+        (void)json_extract_string(obj, "username", f->username, sizeof(f->username));
+        if (f->foundry_id[0] != '\0') {
+            n++;
+        }
+    }
+    free(obj);
+    fsdk_string_free(body);
+    *out_count = n;
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_social_party_join_accept(fsdk_client* client, const char* party_id,
+                                         const char* requester_foundry_id) {
+    char path[192];
+    if (!valid_party_id(party_id) || !valid_foundry_id(requester_foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/join-requests/%s/accept",
+                   SOCIAL_PARTIES_PATH, party_id, requester_foundry_id);
+    return social_post(client, path, "{}");
+}
+
+fsdk_result fsdk_social_party_join_decline(fsdk_client* client, const char* party_id,
+                                          const char* requester_foundry_id) {
+    char path[192];
+    if (!valid_party_id(party_id) || !valid_foundry_id(requester_foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/join-requests/%s/decline",
+                   SOCIAL_PARTIES_PATH, party_id, requester_foundry_id);
+    return social_post(client, path, "{}");
 }

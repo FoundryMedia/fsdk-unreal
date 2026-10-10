@@ -653,6 +653,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void UnblockPlayer(const FString& FoundryId);
 
+	/** Fetch the blocked-players list (name only - presence is never reported
+	 *  for a block, same row shape as friends/pending). Async: OnBlockedUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshBlocked();
+
 	/** The player's own share code (FDY-XXXXXX). Async: OnFriendCodeReady. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void GetMyFriendCode();
@@ -694,6 +699,30 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void LeaveParty(const FString& PartyId);
 
+	/** Ask to join a FRIEND's current party (parties stay invite-only - this
+	 *  stages a request the party's LEADER answers). Async:
+	 *  OnSocialActionComplete ("party.join_request"; NoMatch = not a friend,
+	 *  the friend has no party, you're already a member, or the party is full -
+	 *  a pending duplicate request is NOT an error). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RequestToJoinParty(const FString& FriendFoundryId);
+
+	/** Fetch pending join requests on the party YOU LEAD (oldest first;
+	 *  leader-only server-side). Async: OnPartyJoinRequestsUpdated. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshPartyJoinRequests(const FString& PartyId);
+
+	/** Accept a join request on the party you lead (adds the member, same
+	 *  capacity rule as an invite accept). Async: OnSocialActionComplete
+	 *  ("party.join_accept"), followed by an automatic RefreshParty. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void AcceptPartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId);
+
+	/** Decline a join request on the party you lead. Async:
+	 *  OnSocialActionComplete ("party.join_decline"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void DeclinePartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId);
+
 	/** Fetch whisper conversation summaries. Async: OnConversationsUpdated. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void RefreshConversations();
@@ -719,11 +748,19 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryFriendsEvent OnPendingUpdated;
 
+	/** Blocked players (RefreshBlocked). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFriendsEvent OnBlockedUpdated;
+
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryPartyEvent OnPartyUpdated;
 
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
 	FFoundryPartyInvitesEvent OnPartyInvitesUpdated;
+
+	/** Pending join requests on the party you lead (RefreshPartyJoinRequests). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryFriendsEvent OnPartyJoinRequestsUpdated;
 
 	/** One social mutation finished; Action names it ("friend.request", ...). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
@@ -815,6 +852,30 @@ public:
 	 *  reflected here too). */
 	UFUNCTION(BlueprintPure, Category = "Foundry|TextChat")
 	EFoundryTextChatChannel GetActiveChatChannel() const { return ActiveChatChannelMirror; }
+
+	/** The friend plain input goes to while the Whisper channel is active: the last
+	 *  /w target, or the last friend who whispered us. False when there is none yet
+	 *  (or the core is busy on a worker - TryLock, like GetChatHistory; ask again
+	 *  next frame). Local read, no network. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	bool GetWhisperTarget(FString& OutDisplayName, FString& OutFoundryId) const;
+
+	/** Point plain input at a friend the game already resolved from its own friends
+	 *  list (by foundry id - no lookup, no network): the active channel becomes
+	 *  Whisper. The lobby turns a typed "/w <friend> " into this. TryLock, never a blocking
+	 *  FScopeLock (see .claude/rules/fsdk-core-lock-ui.md): a worker may hold the core across a
+	 *  network round trip (the whisper poll, a send), so a contended call is STASHED and applied
+	 *  on the next ChatDriverTick once the lock frees - it always eventually lands, either way. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	void SetWhisperTarget(const FString& FriendFoundryId, const FString& FriendDisplayName);
+
+	/** Point plain input at the last friend who whispered us (what /r replies to).
+	 *  False when nobody has yet. TryLock (see SetWhisperTarget); returns true both when applied
+	 *  immediately and when queued for ChatDriverTick to apply - a caller that treats "true" as
+	 *  "now replying" and re-syncs its own cache off OnActiveChatChannelChanged (fired either way)
+	 *  never drifts from which case actually happened. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|TextChat")
+	bool SelectReplyTarget();
 
 	/**
 	 * Copy this channel's history (oldest -> newest) into OutLines, or every
@@ -954,6 +1015,11 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
 	FString GetFoundryId() const { return CachedFoundryId; }
 
+	/** Cached unique username from the identity probe (empty when unknown - a
+	 *  BYO token FID doesn't recognize, or an account with no username set). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
+	FString GetUsername() const { return CachedUsername; }
+
 	/** Login established/refreshed (DisplayName empty for BYO). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Auth")
 	FFoundryLoginEvent OnLoginComplete;
@@ -982,7 +1048,8 @@ private:
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> EnsureClient();
 
 	/** Apply a session result on the game thread: cache identity + broadcast OnLoginComplete. */
-	void ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName, const FString& FoundryId);
+	void ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName, const FString& FoundryId,
+		const FString& Username = FString());
 
 	/** AutoLoginFromLauncher's body; false when an attempt was already in flight. */
 	bool StartAutoLogin();
@@ -998,6 +1065,11 @@ private:
 	/** Game thread (the chat driver tick): drain inbound WS frames into the chat
 	 *  handle, run the keepalive, detect ready flips, drive the auto-rejoin. */
 	bool ChatDriverTick(float DeltaSeconds);
+
+	/** Applies a SetWhisperTarget/SelectReplyTarget call that TryLock had to queue (the core was
+	 *  busy on a worker) - called from ChatDriverTick with CoreState.CS already held, never takes
+	 *  the lock itself. See .claude/rules/fsdk-core-lock-ui.md. */
+	void ApplyPendingWhisperRequest(FFsdkCoreState& CoreState);
 
 	/** Kick one (re)join attempt on a worker (guarded by bChatJoinInFlight). */
 	void StartChatJoin();
@@ -1057,6 +1129,7 @@ private:
 	bool bLauncherSession = false; // token came from the daemon handoff (re-mintable)
 	FString CachedDisplayName;
 	FString CachedFoundryId;
+	FString CachedUsername;
 
 	// ── Chat state ──
 	// The fsdk_chat handle lives inside FFsdkCoreState (same lock as the client -
@@ -1079,4 +1152,12 @@ private:
 	bool bTextChatTickInFlight = false; // one KickTextChatTick worker at a time
 	EFoundryTextChatChannel ActiveChatChannelMirror = EFoundryTextChatChannel::Party;
 	FString TextChatPartyId;            // last party id applied (ApplyTextChatPartyId)
+
+	// -- whisper-target queue (TryLock contention; applied in ChatDriverTick once the core frees) --
+	FString PendingWhisperTargetId;
+	FString PendingWhisperTargetName;
+	bool bHasPendingWhisperTarget = false; // SetWhisperTarget queued
+	bool bPendingReplySelect = false;      // SelectReplyTarget queued
+	bool bForceActiveChannelBroadcast = false; // a queued request just applied - re-broadcast even
+	                                            // if the channel ENUM didn't change (the TARGET did)
 };

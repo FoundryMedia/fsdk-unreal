@@ -1,0 +1,17 @@
+// Copyright Foundry Media. FoundryFSDKUI module entry point.
+
+#include "Modules/ModuleManager.h"
+
+/**
+ * FoundryFSDKUI runtime module: the default UMG parent classes (UFoundrySocialDrawer and friends)
+ * and UFoundryUISettings. Nothing to install at startup - each parent resolves its default widget
+ * classes lazily (UFoundryUISettings::LoadWidgetClass) the first time a host constructs one.
+ */
+class FFoundryFSDKUIModule : public IModuleInterface
+{
+public:
+	virtual void StartupModule() override {}
+	virtual void ShutdownModule() override {}
+};
+
+IMPLEMENT_MODULE(FFoundryFSDKUIModule, FoundryFSDKUI)

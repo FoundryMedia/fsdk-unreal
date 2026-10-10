@@ -540,29 +540,29 @@ static void cmd_whisper(fsdk_textchat* tc, const char* rest) {
     resolve_status rs;
 
     if (tc->bind[FSDK_TEXTCHAT_WHISPER] == FSDK_TEXTCHAT_BIND_OFF) {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Whispers need Foundry social - not available here.");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Whispers need Foundry social - not available here.");
         return;
     }
     if (rest[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Usage: /w <friend> <message>");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Usage: /w <friend> <message>");
         return;
     }
     text = parse_first_token(rest, target, sizeof(target));
     if (target[0] == '\0' || text[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Usage: /w <friend> <message>");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Usage: /w <friend> <message>");
         return;
     }
     rs = resolve_friend(tc, target, peer_id, sizeof(peer_id), peer_name, sizeof(peer_name));
     if (rs == RESOLVE_AMBIGUOUS) {
         char msg[192];
         (void)snprintf(msg, sizeof(msg), "Several friends are named %s - use their @username.", target);
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, msg);
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, msg);
         return;
     }
     if (rs == RESOLVE_NOT_FOUND) {
         char msg[192];
         (void)snprintf(msg, sizeof(msg), "No friend named %s.", target);
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, msg);
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, msg);
         return;
     }
     if (send_whisper(tc, peer_id, peer_name, text) == FSDK_OK) {
@@ -573,11 +573,11 @@ static void cmd_whisper(fsdk_textchat* tc, const char* rest) {
 
 static void cmd_reply(fsdk_textchat* tc, const char* rest) {
     if (tc->reply_target_id[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Nobody has whispered you yet.");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Nobody has whispered you yet.");
         return;
     }
     if (rest[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Usage: /r <message>");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Usage: /r <message>");
         return;
     }
     (void)send_whisper(tc, tc->reply_target_id, tc->reply_target_name, rest);
@@ -625,7 +625,7 @@ static void dispatch_command(fsdk_textchat* tc, const char* cmd_line) {
     }
 
     if (name[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "Unknown command: /. Type /help.");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Unknown command: /. Type /help.");
         return;
     }
     if (is_whisper_alias(name)) {
@@ -647,7 +647,7 @@ static void dispatch_command(fsdk_textchat* tc, const char* cmd_line) {
     if (is_reserved_alias(name)) {
         char msg[64];
         (void)snprintf(msg, sizeof(msg), "/%s is not available in this game.", name);
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, msg);
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, msg);
         return;
     }
     for (k = 0; k < tc->command_count; k++) {
@@ -662,7 +662,7 @@ static void dispatch_command(fsdk_textchat* tc, const char* cmd_line) {
     {
         char msg[64];
         (void)snprintf(msg, sizeof(msg), "Unknown command: /%s. Type /help.", name);
-        note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, msg);
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, msg);
     }
 }
 
@@ -672,13 +672,13 @@ static fsdk_result send_active(fsdk_textchat* tc, const char* text) {
             return send_party(tc, text);
         case FSDK_TEXTCHAT_WHISPER:
             if (tc->whisper_target_id[0] == '\0') {
-                note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "No one to whisper. Use /w <friend> <message>.");
+                note(tc, FSDK_TEXTCHAT_LINE_ERROR, "No one to whisper. Use /w <friend> <message>.");
                 return FSDK_ERR_INVALID_ARG;
             }
             return send_whisper(tc, tc->whisper_target_id, tc->whisper_target_name, text);
         case FSDK_TEXTCHAT_SYSTEM:
         default:
-            note(tc, FSDK_TEXTCHAT_LINE_SYSTEM, "The system channel is read-only.");
+            note(tc, FSDK_TEXTCHAT_LINE_ERROR, "The system channel is read-only.");
             return FSDK_ERR_INVALID_ARG;
     }
 }
@@ -933,6 +933,48 @@ fsdk_result fsdk_textchat_set_active(fsdk_textchat* tc, fsdk_textchat_channel ch
 
 fsdk_textchat_channel fsdk_textchat_active(const fsdk_textchat* tc) {
     return tc != NULL ? tc->active_channel : FSDK_TEXTCHAT_PARTY;
+}
+
+int fsdk_textchat_whisper_target(const fsdk_textchat* tc, char* id, size_t id_cap,
+                                 char* name, size_t name_cap) {
+    if (tc == NULL || tc->whisper_target_id[0] == '\0') {
+        return 0;
+    }
+    if (id != NULL && id_cap > 0) {
+        copy_bounded(id, id_cap, tc->whisper_target_id);
+    }
+    if (name != NULL && name_cap > 0) {
+        copy_bounded(name, name_cap, tc->whisper_target_name);
+    }
+    return 1;
+}
+
+fsdk_result fsdk_textchat_set_whisper_target(fsdk_textchat* tc, const char* friend_id,
+                                             const char* friend_name) {
+    if (tc == NULL || friend_id == NULL || friend_id[0] == '\0') {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    if (tc->bind[FSDK_TEXTCHAT_WHISPER] == FSDK_TEXTCHAT_BIND_OFF) {
+        return FSDK_ERR_UNAVAILABLE;
+    }
+    copy_bounded(tc->whisper_target_id, sizeof(tc->whisper_target_id), friend_id);
+    copy_bounded(tc->whisper_target_name, sizeof(tc->whisper_target_name),
+                 friend_name != NULL ? friend_name : "");
+    tc->active_channel = FSDK_TEXTCHAT_WHISPER;
+    return FSDK_OK;
+}
+
+fsdk_result fsdk_textchat_select_reply(fsdk_textchat* tc) {
+    if (tc == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    if (tc->reply_target_id[0] == '\0') {
+        return FSDK_ERR_NO_MATCH;
+    }
+    copy_bounded(tc->whisper_target_id, sizeof(tc->whisper_target_id), tc->reply_target_id);
+    copy_bounded(tc->whisper_target_name, sizeof(tc->whisper_target_name), tc->reply_target_name);
+    tc->active_channel = FSDK_TEXTCHAT_WHISPER;
+    return FSDK_OK;
 }
 
 fsdk_result fsdk_textchat_set_party(fsdk_textchat* tc, const char* party_id_or_null) {

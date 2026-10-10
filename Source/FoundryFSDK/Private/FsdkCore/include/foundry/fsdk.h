@@ -331,6 +331,7 @@ fsdk_result fsdk_refresh_session(fsdk_client* client);
 typedef struct fsdk_session {
     char foundry_id[64];     /* Player's FID, NUL-terminated.                  */
     char display_name[128];  /* Display name (may be empty), NUL-terminated.   */
+    char username[64];       /* Account handle (empty when none/unknown).      */
 } fsdk_session;
 
 /* Override the auth host (e.g. a local auth-efga for dev). auth_base is copied. */
@@ -621,6 +622,11 @@ fsdk_result fsdk_social_friends(fsdk_client* client,
 fsdk_result fsdk_social_pending(fsdk_client* client,
                                 fsdk_friend* out, size_t capacity, size_t* out_count);
 
+/* Players the caller has blocked. Same row shape as the friends list; the
+ * presence fields are empty strings (fid sends none for a blocked row). */
+fsdk_result fsdk_social_blocked(fsdk_client* client,
+                                fsdk_friend* out, size_t capacity, size_t* out_count);
+
 /* Friend-graph mutations - server-authorized as the player themselves. A
  * non-friend/unknown target is a uniform FSDK_ERR_NO_MATCH. */
 fsdk_result fsdk_social_friend_request(fsdk_client* client, const char* username);
@@ -674,6 +680,27 @@ fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
 fsdk_result fsdk_social_party_accept(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
+
+/* Ask to join the party a FRIEND is currently in (parties stay invite-only -
+ * this files a request the party's LEADER answers). fid resolves the friend's
+ * CURRENT party itself. FSDK_ERR_NO_MATCH on the uniform 404 (not a friend,
+ * friend has no party, caller already a member, or the party is full). A
+ * pending duplicate request is not an error - the existing request stands. */
+fsdk_result fsdk_social_party_join_request(fsdk_client* client, const char* friend_foundry_id);
+
+/* Pending join requests on MY party (leader only - FSDK_ERR_NO_MATCH when the
+ * caller doesn't lead that party). Row shape = fsdk_friend; presence fields are
+ * empty strings (fid sends none). Oldest first. */
+fsdk_result fsdk_social_party_join_requests(fsdk_client* client, const char* party_id,
+                                            fsdk_friend* out, size_t capacity, size_t* out_count);
+
+/* Leader-only: accept seats the requester (same capacity rule as an invite
+ * accept - a full party refuses); decline just drops the request. Both retire
+ * the leader's join-request notification server-side. */
+fsdk_result fsdk_social_party_join_accept(fsdk_client* client, const char* party_id,
+                                         const char* requester_foundry_id);
+fsdk_result fsdk_social_party_join_decline(fsdk_client* client, const char* party_id,
+                                          const char* requester_foundry_id);
 
 /* Longest accepted whisper body (server caps at 2000 chars; +NUL headroom). */
 #define FSDK_DM_BODY_MAX 2048
@@ -885,6 +912,24 @@ fsdk_result fsdk_textchat_submit(fsdk_textchat* tc, const char* line);
 /* Which channel plain (non-slash) input targets. */
 fsdk_result fsdk_textchat_set_active(fsdk_textchat* tc, fsdk_textchat_channel channel);
 fsdk_textchat_channel fsdk_textchat_active(const fsdk_textchat* tc);
+
+/* The friend plain input goes to while the WHISPER channel is active: the last
+ * /w target, or the last friend who whispered us. Copies id / name into the
+ * buffers given (either may be NULL) and returns 1; returns 0 when there is
+ * none yet. Local read, no network. */
+int fsdk_textchat_whisper_target(const fsdk_textchat* tc, char* id, size_t id_cap,
+                                 char* name, size_t name_cap);
+
+/* Point plain input at a friend the HOST already resolved (its own friends list;
+ * no name lookup, no network): the active channel becomes WHISPER. The host
+ * uses it to turn a typed "/w <friend> " into a sticky whisper channel.
+ * FSDK_ERR_UNAVAILABLE when whispers are bound OFF. */
+fsdk_result fsdk_textchat_set_whisper_target(fsdk_textchat* tc, const char* friend_id,
+                                             const char* friend_name);
+
+/* Point plain input at the last friend who whispered us (what /r replies to):
+ * the active channel becomes WHISPER. FSDK_ERR_NO_MATCH when nobody has yet. */
+fsdk_result fsdk_textchat_select_reply(fsdk_textchat* tc);
 
 /* Join/leave the PARTY channel's room (PLATFORM binding) or just remember the
  * id (HOST/LOCAL binding, no network). NULL/empty leaves. */

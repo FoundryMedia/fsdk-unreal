@@ -1259,6 +1259,48 @@ void UFoundryFSDKSubsystem::UnblockPlayer(const FString& FoundryId)
 	});
 }
 
+void UFoundryFSDKSubsystem::RefreshBlocked()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnBlockedUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		TArray<fsdk_friend> Buf;
+		Buf.SetNum(64);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_blocked(CoreRef->Client, Buf.GetData(),
+				static_cast<size_t>(Buf.Num()), &Count);
+		}
+		// Presence is never reported for a block (fid sends empty strings) -
+		// leave F.Presence/F.PresenceGame at their default-empty value.
+		TArray<FFoundryFriend> Blocked;
+		Blocked.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryFriend F;
+			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+			F.Username = UTF8_TO_TCHAR(Buf[i].username);
+			Blocked.Add(MoveTemp(F));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Blocked = MoveTemp(Blocked)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnBlockedUpdated.Broadcast(ToBlueprintResult(Result), Blocked);
+			}
+		});
+	});
+}
+
 void UFoundryFSDKSubsystem::GetMyFriendCode()
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
@@ -1334,6 +1376,76 @@ void UFoundryFSDKSubsystem::LeaveParty(const FString& PartyId)
 	RunSocialAction(TEXT("party.leave"), true, [PartyId](FFsdkCoreState& State)
 	{
 		return (int32)fsdk_social_party_leave(State.Client, TCHAR_TO_UTF8(*PartyId));
+	});
+}
+
+void UFoundryFSDKSubsystem::RequestToJoinParty(const FString& FriendFoundryId)
+{
+	// No RefreshParty chain: a request only stages a row on the FRIEND's party -
+	// it never changes the caller's own party shape.
+	RunSocialAction(TEXT("party.join_request"), false, [FriendFoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_join_request(State.Client, TCHAR_TO_UTF8(*FriendFoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshPartyJoinRequests(const FString& PartyId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnPartyJoinRequestsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
+		return;
+	}
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, PartyId, WeakThis]()
+	{
+		TArray<fsdk_friend> Buf;
+		Buf.SetNum(64);
+		size_t Count = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = fsdk_social_party_join_requests(CoreRef->Client, TCHAR_TO_UTF8(*PartyId),
+				Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+		}
+		TArray<FFoundryFriend> Requests;
+		Requests.Reserve(static_cast<int32>(Count));
+		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
+		{
+			FFoundryFriend F;
+			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
+			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
+			F.Username = UTF8_TO_TCHAR(Buf[i].username);
+			Requests.Add(MoveTemp(F));
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Requests = MoveTemp(Requests)]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPartyJoinRequestsUpdated.Broadcast(ToBlueprintResult(Result), Requests);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::AcceptPartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId)
+{
+	// Adds the member to the party I lead - same shape as AcceptPartyInvite.
+	RunSocialAction(TEXT("party.join_accept"), true, [PartyId, RequesterFoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_join_accept(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*RequesterFoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::DeclinePartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId)
+{
+	// Only deletes the pending request row - the party I lead is unchanged.
+	RunSocialAction(TEXT("party.join_decline"), false, [PartyId, RequesterFoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_join_decline(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*RequesterFoundryId));
 	});
 }
 
@@ -1647,6 +1759,100 @@ void UFoundryFSDKSubsystem::SetActiveChatChannel(EFoundryTextChatChannel Channel
 	(void)fsdk_textchat_set_active(CoreRef->TextChat, CoreChannel);
 }
 
+bool UFoundryFSDKSubsystem::GetWhisperTarget(FString& OutDisplayName, FString& OutFoundryId) const
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr || !CoreRef->CS.TryLock())
+	{
+		return false;
+	}
+	char Id[64] = {0};
+	char Name[128] = {0};
+	const int Have = fsdk_textchat_whisper_target(CoreRef->TextChat, Id, sizeof(Id), Name, sizeof(Name));
+	CoreRef->CS.Unlock();
+	if (!Have)
+	{
+		return false;
+	}
+	OutFoundryId = UTF8_TO_TCHAR(Id);
+	OutDisplayName = UTF8_TO_TCHAR(Name);
+	return true;
+}
+
+void UFoundryFSDKSubsystem::SetWhisperTarget(const FString& FriendFoundryId, const FString& FriendDisplayName)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return;
+	}
+	if (!CoreRef->CS.TryLock())
+	{
+		// A worker holds the core (mid whisper-poll/send) - never block the game thread for this.
+		// Stash it; ChatDriverTick applies it once the lock frees (ApplyPendingWhisperRequest).
+		PendingWhisperTargetId = FriendFoundryId;
+		PendingWhisperTargetName = FriendDisplayName;
+		bHasPendingWhisperTarget = true;
+		return;
+	}
+	const bool bOk = fsdk_textchat_set_whisper_target(CoreRef->TextChat, TCHAR_TO_UTF8(*FriendFoundryId), TCHAR_TO_UTF8(*FriendDisplayName)) == FSDK_OK;
+	CoreRef->CS.Unlock();
+	if (bOk)
+	{
+		ActiveChatChannelMirror = EFoundryTextChatChannel::Whisper; // optimistic - ChatDriverTick reconciles
+		OnActiveChatChannelChanged.Broadcast(ActiveChatChannelMirror); // the direct path fires too now - see ApplyPendingWhisperRequest
+	}
+}
+
+bool UFoundryFSDKSubsystem::SelectReplyTarget()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->TextChat == nullptr)
+	{
+		return false;
+	}
+	if (!CoreRef->CS.TryLock())
+	{
+		// Stashed and applied once the lock frees; the caller treats "true" as applied-or-queued
+		// and re-syncs off OnActiveChatChannelChanged (fired either way).
+		bPendingReplySelect = true;
+		return true;
+	}
+	const bool bOk = fsdk_textchat_select_reply(CoreRef->TextChat) == FSDK_OK;
+	CoreRef->CS.Unlock();
+	if (bOk)
+	{
+		ActiveChatChannelMirror = EFoundryTextChatChannel::Whisper;
+		OnActiveChatChannelChanged.Broadcast(ActiveChatChannelMirror);
+	}
+	return bOk;
+}
+
+void UFoundryFSDKSubsystem::ApplyPendingWhisperRequest(FFsdkCoreState& CoreState)
+{
+	// Called from ChatDriverTick with CoreState.CS ALREADY held (TryLock succeeded there) - never
+	// takes the lock itself. Applies a request SetWhisperTarget/SelectReplyTarget stashed earlier
+	// because a worker held the core at the time, and reports it so the caller force-broadcasts
+	// OnActiveChatChannelChanged even when the channel ENUM doesn't change (e.g. already Whisper to
+	// someone else - the TARGET changed and a subscriber's cached name/id must still re-sync).
+	if (CoreState.TextChat == nullptr)
+	{
+		return;
+	}
+	if (bHasPendingWhisperTarget)
+	{
+		(void)fsdk_textchat_set_whisper_target(CoreState.TextChat, TCHAR_TO_UTF8(*PendingWhisperTargetId), TCHAR_TO_UTF8(*PendingWhisperTargetName));
+		bHasPendingWhisperTarget = false;
+		bForceActiveChannelBroadcast = true;
+	}
+	if (bPendingReplySelect)
+	{
+		(void)fsdk_textchat_select_reply(CoreState.TextChat);
+		bPendingReplySelect = false;
+		bForceActiveChannelBroadcast = true;
+	}
+}
+
 void UFoundryFSDKSubsystem::GetChatHistory(EFoundryTextChatChannel Channel, bool bAllChannels,
 	TArray<FFoundryChatLine>& OutLines)
 {
@@ -1926,6 +2132,7 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 			bTeamReadyNow =
 				fsdk_chat_channel_ready(CoreRef->Chat, FSDK_CHAT_CHANNEL_TEAM) != 0;
 		}
+		ApplyPendingWhisperRequest(*CoreRef);
 		if (CoreRef->TextChat != nullptr)
 		{
 			// Cheap local read (no network) - catches a bare "/p" switching the
@@ -1964,11 +2171,12 @@ bool UFoundryFSDKSubsystem::ChatDriverTick(float /*DeltaSeconds*/)
 		}
 	}
 
-	if (ActiveChannelNow != ActiveChatChannelMirror)
+	if (ActiveChannelNow != ActiveChatChannelMirror || bForceActiveChannelBroadcast)
 	{
 		ActiveChatChannelMirror = ActiveChannelNow;
 		OnActiveChatChannelChanged.Broadcast(ActiveChatChannelMirror);
 	}
+	bForceActiveChannelBroadcast = false;
 
 	if (bPartyReadyNow != bPartyChatReady)
 	{
@@ -2030,7 +2238,7 @@ TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> UFoundryFSDKSubsystem::EnsureCli
 }
 
 void UFoundryFSDKSubsystem::ApplyLoginResult(EFoundryFsdkResult Result, const FString& DisplayName,
-                                             const FString& FoundryId)
+                                             const FString& FoundryId, const FString& Username)
 {
 	bAutoLoginInFlight = false;
 	const bool bStartup = bStartupAutoLoginInFlight;
@@ -2040,6 +2248,7 @@ void UFoundryFSDKSubsystem::ApplyLoginResult(EFoundryFsdkResult Result, const FS
 		bIsLoggedIn = true;
 		CachedDisplayName = DisplayName;
 		CachedFoundryId = FoundryId;
+		CachedUsername = Username;
 	}
 	else if (bStartup && StartupAutoLoginRetriesLeft > 0
 		&& (Result == EFoundryFsdkResult::Network || Result == EFoundryFsdkResult::Timeout))
@@ -2094,7 +2303,7 @@ void UFoundryFSDKSubsystem::Login(const FString& EmailOrUsername, const FString&
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, Eou, Pw, RememberInt]()
 	{
 		fsdk_result R;
-		FString DisplayName, FoundryId;
+		FString DisplayName, FoundryId, Username;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			const FTCHARToUTF8 EouUtf8(*Eou);
@@ -2107,15 +2316,16 @@ void UFoundryFSDKSubsystem::Login(const FString& EmailOrUsername, const FString&
 				{
 					DisplayName = UTF8_TO_TCHAR(S.display_name);
 					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+					Username = UTF8_TO_TCHAR(S.username);
 				}
 			}
 		}
 		const EFoundryFsdkResult Result = ToBlueprintResult(R);
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId, Username]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId, Username);
 			}
 		});
 	});
@@ -2134,7 +2344,7 @@ void UFoundryFSDKSubsystem::Refresh()
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
 		fsdk_result R;
-		FString DisplayName, FoundryId;
+		FString DisplayName, FoundryId, Username;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			R = fsdk_refresh(CoreRef->Client);
@@ -2145,15 +2355,16 @@ void UFoundryFSDKSubsystem::Refresh()
 				{
 					DisplayName = UTF8_TO_TCHAR(S.display_name);
 					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+					Username = UTF8_TO_TCHAR(S.username);
 				}
 			}
 		}
 		const EFoundryFsdkResult Result = ToBlueprintResult(R);
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId, Username]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId, Username);
 			}
 		});
 	});
@@ -2172,7 +2383,7 @@ void UFoundryFSDKSubsystem::TryResumeSession()
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
 		fsdk_result R;
-		FString DisplayName, FoundryId;
+		FString DisplayName, FoundryId, Username;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			R = fsdk_try_resume(CoreRef->Client);
@@ -2183,15 +2394,16 @@ void UFoundryFSDKSubsystem::TryResumeSession()
 				{
 					DisplayName = UTF8_TO_TCHAR(S.display_name);
 					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+					Username = UTF8_TO_TCHAR(S.username);
 				}
 			}
 		}
 		const EFoundryFsdkResult Result = ToBlueprintResult(R);
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, DisplayName, FoundryId, Username]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->ApplyLoginResult(Result, DisplayName, FoundryId);
+				Self->ApplyLoginResult(Result, DisplayName, FoundryId, Username);
 			}
 		});
 	});
@@ -2205,6 +2417,7 @@ void UFoundryFSDKSubsystem::Logout()
 		bIsLoggedIn = false;
 		CachedDisplayName.Empty();
 		CachedFoundryId.Empty();
+		CachedUsername.Empty();
 		OnLoggedOut.Broadcast();
 		return;
 	}
@@ -2223,6 +2436,7 @@ void UFoundryFSDKSubsystem::Logout()
 				Self->bIsLoggedIn = false;
 				Self->CachedDisplayName.Empty();
 				Self->CachedFoundryId.Empty();
+				Self->CachedUsername.Empty();
 				Self->OnLoggedOut.Broadcast();
 			}
 		});
@@ -2340,7 +2554,7 @@ void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
 	{
-		FString DisplayName, FoundryId;
+		FString DisplayName, FoundryId, Username;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			if (fsdk_refresh_session(CoreRef->Client) == FSDK_OK)
@@ -2350,14 +2564,15 @@ void UFoundryFSDKSubsystem::SetPlayerToken(const FString& PlayerToken)
 				{
 					DisplayName = UTF8_TO_TCHAR(S.display_name);
 					FoundryId = UTF8_TO_TCHAR(S.foundry_id);
+					Username = UTF8_TO_TCHAR(S.username);
 				}
 			}
 		}
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, DisplayName, FoundryId]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, DisplayName, FoundryId, Username]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->ApplyLoginResult(EFoundryFsdkResult::Ok, DisplayName, FoundryId);
+				Self->ApplyLoginResult(EFoundryFsdkResult::Ok, DisplayName, FoundryId, Username);
 			}
 		});
 	});

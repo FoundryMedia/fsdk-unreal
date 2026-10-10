@@ -208,6 +208,7 @@ static fsdk_result me_probe(fsdk_client* client) {
         const char* data = json_data_object(resp != NULL ? resp : "");
         json_extract_string(data, "foundryId", client->foundry_id, sizeof(client->foundry_id));
         json_extract_string(data, "displayName", client->display_name, sizeof(client->display_name));
+        json_extract_string(data, "username", client->username, sizeof(client->username));
         fsdk_string_free(resp);
         return FSDK_OK;
     }

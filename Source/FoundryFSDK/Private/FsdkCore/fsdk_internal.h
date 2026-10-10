@@ -247,6 +247,7 @@ struct fsdk_client {
     int   authenticated;  /* 0 = not authenticated, 1 = authenticated.         */
     char  foundry_id[64]; /* Logged-in player's FID (set by login/refresh).     */
     char  display_name[128]; /* Display name (may be empty).                    */
+    char  username[64]; /* Account handle (set by the /v1/me/user probe).       */
 
     /* Measured-region cache for fsdk_request_match_auto: repeated FindMatch
      * clicks must not re-ping every region. Refreshed when older than

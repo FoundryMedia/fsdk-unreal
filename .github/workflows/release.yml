@@ -22,10 +22,10 @@ name: SDK (package + release)
 
 on:
   pull_request:
-    paths: ['FoundryFSDK.uplugin', 'Source/**', 'README.md', 'LICENSE', '.github/workflows/release.yml']
+    paths: ['FoundryFSDK.uplugin', 'Source/**', 'Content/**', 'README.md', 'LICENSE', '.github/workflows/release.yml']
   push:
     branches: [release]
-    paths: ['FoundryFSDK.uplugin', 'Source/**', '.github/workflows/release.yml']
+    paths: ['FoundryFSDK.uplugin', 'Source/**', 'Content/**', '.github/workflows/release.yml']
   workflow_dispatch:
 
 concurrency:
@@ -67,12 +67,16 @@ jobs:
           STAGE="dist/FoundryFSDK"
           mkdir -p "$STAGE"
           # Ship only what a consumer drops into Plugins/FoundryFSDK/ - the
-          # descriptor, the source the engine compiles, and the license/readme.
-          # Build artifacts are gitignored (absent from a fresh checkout); the
-          # superseded ThirdParty/ stub and CI dir are intentionally excluded.
+          # descriptor, the source the engine compiles, the plugin Content (the
+          # FoundryFSDKUI default widgets + icons; CanContainContent is true since
+          # 0.7.0), and the license/readme. Build artifacts are gitignored (absent
+          # from a fresh checkout); the superseded ThirdParty/ stub, the CI dir and
+          # the icon contact sheets are intentionally excluded.
           cp FoundryFSDK.uplugin "$STAGE/"
           cp LICENSE README.md "$STAGE/"
           cp -r Source "$STAGE/"
+          cp -r Content "$STAGE/"
+          rm -f "$STAGE"/Content/UI/Icons/src/_contact_sheet*.png
           ZIP="FoundryFSDK-v$V.zip"
           (cd dist && zip -rq "../$ZIP" FoundryFSDK)
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
