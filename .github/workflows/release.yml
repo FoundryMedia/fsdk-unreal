@@ -76,6 +76,7 @@ jobs:
           cp LICENSE README.md "$STAGE/"
           cp -r Source "$STAGE/"
           cp -r Content "$STAGE/"
+          cp -r Config "$STAGE/"   # DefaultGame.ini: always-cook /FoundryFSDK/UI
           rm -f "$STAGE"/Content/UI/Icons/src/_contact_sheet*.png
           ZIP="FoundryFSDK-v$V.zip"
           (cd dist && zip -rq "../$ZIP" FoundryFSDK)
