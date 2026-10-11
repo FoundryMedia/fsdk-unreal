@@ -125,6 +125,7 @@ extern "C"
 		{
 			case FSDK_HTTP_POST:   Request->SetVerb(TEXT("POST"));   break;
 			case FSDK_HTTP_DELETE: Request->SetVerb(TEXT("DELETE")); break;
+			case FSDK_HTTP_PUT:    Request->SetVerb(TEXT("PUT"));    break;
 			case FSDK_HTTP_GET:
 			default:               Request->SetVerb(TEXT("GET"));    break;
 		}

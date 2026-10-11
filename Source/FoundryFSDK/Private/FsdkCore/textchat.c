@@ -420,6 +420,11 @@ static fsdk_result send_whisper(fsdk_textchat* tc, const char* peer_id, const ch
     if (rc == FSDK_OK) {
         record_line(tc, FSDK_TEXTCHAT_WHISPER, FSDK_TEXTCHAT_LINE_WHISPER_OUT,
                     self_foundry_id(tc), self_display_name(tc), peer_id, peer_name, body);
+        /* /r (and the sticky whisper channel) always targets the last whisper
+         * PARTNER, whichever direction the last whisper went - so a sent
+         * whisper updates reply_target the same way a received one does. */
+        copy_bounded(tc->reply_target_id, sizeof(tc->reply_target_id), peer_id);
+        copy_bounded(tc->reply_target_name, sizeof(tc->reply_target_name), peer_name);
         return FSDK_OK;
     }
     record_send_error(tc, rc);
@@ -573,7 +578,7 @@ static void cmd_whisper(fsdk_textchat* tc, const char* rest) {
 
 static void cmd_reply(fsdk_textchat* tc, const char* rest) {
     if (tc->reply_target_id[0] == '\0') {
-        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "Nobody has whispered you yet.");
+        note(tc, FSDK_TEXTCHAT_LINE_ERROR, "No one to reply to yet - whisper someone first.");
         return;
     }
     if (rest[0] == '\0') {

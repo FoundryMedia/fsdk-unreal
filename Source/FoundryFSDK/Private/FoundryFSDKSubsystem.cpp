@@ -1080,6 +1080,7 @@ void UFoundryFSDKSubsystem::RefreshParty()
 				M.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
 				M.Username = UTF8_TO_TCHAR(Buf[i].username);
 				M.State = UTF8_TO_TCHAR(Buf[i].state);
+				M.bReady = Buf[i].ready != 0;
 				Party.Members.Add(MoveTemp(M));
 			}
 		}
@@ -1376,6 +1377,14 @@ void UFoundryFSDKSubsystem::LeaveParty(const FString& PartyId)
 	RunSocialAction(TEXT("party.leave"), true, [PartyId](FFsdkCoreState& State)
 	{
 		return (int32)fsdk_social_party_leave(State.Client, TCHAR_TO_UTF8(*PartyId));
+	});
+}
+
+void UFoundryFSDKSubsystem::SetPartyReady(const FString& PartyId, bool bReady)
+{
+	RunSocialAction(TEXT("party.ready"), true, [PartyId, bReady](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_set_ready(State.Client, TCHAR_TO_UTF8(*PartyId), bReady ? 1 : 0);
 	});
 }
 

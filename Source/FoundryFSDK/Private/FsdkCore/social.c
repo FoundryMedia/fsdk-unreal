@@ -348,6 +348,26 @@ static fsdk_result social_delete(fsdk_client* client, const char* path) {
     return social_status_to_result(status);
 }
 
+/* PUT with a JSON body; maps status like social_post. */
+static fsdk_result social_put(fsdk_client* client, const char* path, const char* body_json) {
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result rc;
+    if (client == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    if (!client->authenticated || client->player_token == NULL) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+    rc = fsdk_http_request(client->base_url, FSDK_HTTP_PUT, path,
+                           client->player_token, body_json, &resp, &status);
+    if (rc != FSDK_OK) {
+        return rc;
+    }
+    fsdk_string_free(resp);
+    return social_status_to_result(status);
+}
+
 /* A username: the platform's ^[a-zA-Z0-9_-]{3,32}$ (body-embedded, still validated). */
 static int valid_username(const char* u) {
     size_t i;
@@ -628,6 +648,7 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
                                       sizeof(m->display_name));
             (void)json_extract_string(mobj, "username", m->username, sizeof(m->username));
             (void)json_extract_string(mobj, "state", m->state, sizeof(m->state));
+            (void)fsdk_json_extract_bool(mobj, "ready", &m->ready);
             if (m->foundry_id[0] != '\0') {
                 n++;
             }
@@ -697,6 +718,15 @@ fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id)
 
 fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id) {
     return party_verb(client, party_id, "leave");
+}
+
+fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready) {
+    char path[160];
+    if (!valid_party_id(party_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/members/me/ready", SOCIAL_PARTIES_PATH, party_id);
+    return social_put(client, path, ready ? "{\"ready\":true}" : "{\"ready\":false}");
 }
 
 /* ---- party join requests (leader-gated; parties stay invite-only) ----------- */

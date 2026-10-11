@@ -8,6 +8,9 @@
 #include "UObject/SoftObjectPtr.h"
 #include "FoundryUISettings.generated.h"
 
+class UInputMappingContext;
+class USoundClass;
+class USoundMix;
 class UUserWidget;
 
 /**
@@ -80,6 +83,12 @@ struct FOUNDRYFSDKUI_API FFoundryUIPalette
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
 	FLinearColor Error;
 
+	/** #0c1324 (same value as Surface by default) - the HostBadge label text, read against the
+	 *  Tertiary fill. A skin whose Tertiary isn't a light pill (e.g. Goo Crew's #F7DAD2 against a
+	 *  #A94D40 label) overrides this independently of Text/TextSecondary. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FLinearColor HostText;
+
 	// Party member tints by roster index: #94ccff #b6c4ff #4edea3 #f0c674 #ff9ecb #ffb27a.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
 	FLinearColor Member0;
@@ -128,6 +137,50 @@ public:
 	/** WBP_FoundryFriendMenu. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultFriendMenu;
+
+	/** WBP_FoundryPartyNameplate. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultPartyNameplate;
+
+	/** WBP_FoundryPauseMenu. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultPauseMenu;
+
+	/** WBP_FoundryConfirmDialog. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultConfirmDialog;
+
+	/** WBP_FoundrySettingsMenu. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultSettingsMenu;
+
+	/** WBP_FoundryKeybindRow. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultKeybindRow;
+
+	/** WBP_FoundryTooltip - the kit-styled pill UFoundryUIWidgetBase::ApplyKitTooltips / SetKitToolTip
+	 *  wrap plain tooltip text in, in place of the engine's own default tooltip style. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultTooltip;
+
+	/** The sound mix UFoundryGameUserSettings::ApplyAudio pushes. Unset = the volumes persist but
+	 *  are never applied - the same silent no-op posture as an unset default widget class. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Audio")
+	TSoftObjectPtr<USoundMix> SoundMix;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Audio")
+	TSoftObjectPtr<USoundClass> MasterSoundClass;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Audio")
+	TSoftObjectPtr<USoundClass> MusicSoundClass;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Audio")
+	TSoftObjectPtr<USoundClass> SFXSoundClass;
+
+	/** The mapping contexts whose player-mappable rows UFoundrySettingsMenu's Controls section
+	 *  lists. Empty -> the section shows "This game has no rebindable controls." */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Input")
+	TArray<TSoftObjectPtr<UInputMappingContext>> RebindableContexts;
 
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI")
 	FFoundryUIPalette Palette;

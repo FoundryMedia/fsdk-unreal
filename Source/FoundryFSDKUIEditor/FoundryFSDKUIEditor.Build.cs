@@ -31,6 +31,7 @@ public class FoundryFSDKUIEditor : ModuleRules
 			"FoundryFSDKUI",
 			"Slate",
 			"SlateCore",
+			"Json", // -profile JSON parsing (FJsonObject / FJsonSerializer)
 		});
 	}
 }

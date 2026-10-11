@@ -2,6 +2,10 @@
 
 #include "Modules/ModuleManager.h"
 
+#include "FoundryFSDKUILog.h"
+
+DEFINE_LOG_CATEGORY(LogFoundryFSDKUI);
+
 /**
  * FoundryFSDKUI runtime module: the default UMG parent classes (UFoundrySocialDrawer and friends)
  * and UFoundryUISettings. Nothing to install at startup - each parent resolves its default widget

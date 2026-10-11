@@ -40,7 +40,7 @@ public:
 	FFoundryFriendRowContextMenu OnContextMenuRequested;
 
 	void Setup(const FFoundryFriend& InFriend, EFoundryFriendRowKind InKind, bool bInHost, bool bInLocal,
-		bool bInJoined, const FLinearColor& InTint, const FString& InStatusOverride);
+		bool bInJoined, const FLinearColor& InTint, const FString& InStatusOverride, bool bInReady = false);
 
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI")
 	FFoundryFriend Friend;
@@ -57,6 +57,11 @@ public:
 	/** false = invited, not joined yet (never shown as present). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI")
 	bool bIsJoined = true;
+
+	/** Party rows only: the member's platform ready flag (ReadyIcon shows iff Kind == Party,
+	 *  bIsJoined, and this). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI")
+	bool bIsReady = false;
 
 	/** online | idle | away | dnd | offline | "" (unknown) - mirrors Friend.Presence at the
 	 *  top level for a WBP binding that doesn't want to reach into the struct. */
@@ -80,6 +85,8 @@ protected:
 	/** Hidden for a joined host (HostBadge shows instead). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> StatusText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> HostBadge;
+	/** Party rows only - hidden unless the member is joined AND ready. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> ReadyIcon;
 	/** Unused by the kit's own drawer (Collapsed in Setup); kept so a game can give a row its own
 	 *  inline action by overriding NativeOnInitialized and wiring it itself. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ActionButton;

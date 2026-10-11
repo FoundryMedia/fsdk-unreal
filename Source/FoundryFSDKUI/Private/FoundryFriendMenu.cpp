@@ -4,6 +4,7 @@
 #include "Components/TextBlock.h"
 #include "Engine/GameInstance.h"
 #include "FoundrySocialSubsystem.h"
+#include "FoundryUIWidgetBase.h"
 
 UFoundrySocialSubsystem* UFoundryFriendMenu::Subsystem() const
 {
@@ -24,7 +25,7 @@ void UFoundryFriendMenu::NativeOnInitialized()
 	if (CancelButton) { CancelButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleCancel); }
 }
 
-void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InName, bool bCanInvite, bool bCanRequestJoin)
+void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InName, bool bCanInvite, const FString& InInviteDisabledReason, bool bCanRequestJoin)
 {
 	Kind = InKind;
 	TargetName = InName;
@@ -48,6 +49,9 @@ void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InNa
 	if (InviteButton)
 	{
 		InviteButton->SetIsEnabled(bInviteEnabled);
+		// InInviteDisabledReason already accounts for offline (the drawer checks Row->Kind too) - a
+		// disabled UButton still shows its own tooltip, same as RequestJoinButton below.
+		SetKitToolTip(InviteButton, FText::FromString(bInviteEnabled ? FString() : InInviteDisabledReason));
 	}
 	const bool bRequestJoinEnabled = bOnline && bCanRequestJoin;
 	if (RequestJoinButton)
@@ -69,7 +73,7 @@ void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InNa
 				Reason = (Sdk && !Sdk->IsSignedIn()) ? TEXT("Sign in to ask to join a party.") : TEXT("You're already in a party.");
 			}
 		}
-		RequestJoinButton->SetToolTipText(FText::FromString(Reason));
+		SetKitToolTip(RequestJoinButton, FText::FromString(Reason));
 	}
 
 	Show(ItemsPanel, true, true);

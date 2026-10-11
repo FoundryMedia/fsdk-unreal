@@ -161,7 +161,8 @@ void fsdk_set_log_sink(fsdk_log_fn sink, void* user_data);
 typedef enum fsdk_http_method {
     FSDK_HTTP_GET = 0,
     FSDK_HTTP_POST = 1,
-    FSDK_HTTP_DELETE = 2
+    FSDK_HTTP_DELETE = 2,
+    FSDK_HTTP_PUT = 3
 } fsdk_http_method;
 
 /* Host-provided HTTP transport. The core builds every request (the full URL, the
@@ -651,6 +652,11 @@ typedef struct fsdk_party_member {
     char display_name[128];
     char username[64];
     char state[12];
+    /* Platform READY flag (fid party_member.ready_at != null) - 0/1. 0 when
+     * the member hasn't readied up or the field is absent (older servers).
+     * Cleared SERVER-side on leave/removal, leader change, and disband -
+     * never inferred client-side. */
+    int  ready;
 } fsdk_party_member;
 
 /* The party header (id empty when the player is not in a party). */
@@ -680,6 +686,12 @@ fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
 fsdk_result fsdk_social_party_accept(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
+
+/* Set/clear the CALLER's own READY flag on a party they have JOINED - the
+ * platform party-member flag the lobby's crown/host/ready UI reads (fid
+ * party_member.ready_at). Idempotent. FSDK_ERR_NO_MATCH on the uniform 404
+ * (caller is not a JOINED member of that party / the party doesn't exist). */
+fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready);
 
 /* Ask to join the party a FRIEND is currently in (parties stay invite-only -
  * this files a request the party's LEADER answers). fid resolves the friend's

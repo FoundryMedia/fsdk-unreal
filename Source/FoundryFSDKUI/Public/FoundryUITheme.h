@@ -22,4 +22,11 @@ namespace FoundryUITheme
 	 *  Palette.Member0..5 tokens by index (wraps). UFoundrySocialDrawer::GetMemberTint calls this as
 	 *  its native default; a game overrides the BlueprintNativeEvent with its own cast colours. */
 	FOUNDRYFSDKUI_API FLinearColor MemberTint(int32 RosterIndex, bool bLocal);
+
+	/** Blends Overlay into Base at OverlayAlpha ("Overlay at OverlayAlpha composited over Base"),
+	 *  keeping Base's own alpha - the kit's one hover-tint formula, so every hover reads as "this
+	 *  control, lit up" rather than a second flat colour. Shared by the WBP generator (combo/
+	 *  checkbox hover brushes, built once at generation time) and runtime code (the settings menu's
+	 *  slider hover, recomputed every tick a slider is hovered). */
+	FOUNDRYFSDKUI_API FLinearColor CompositeOver(const FLinearColor& Base, const FLinearColor& Overlay, float OverlayAlpha);
 }

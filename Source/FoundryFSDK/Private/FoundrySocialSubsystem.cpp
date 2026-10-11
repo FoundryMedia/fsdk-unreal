@@ -66,6 +66,10 @@ void UFoundrySocialSubsystem::BindOnce()
 
 void UFoundrySocialSubsystem::Tick(float /*DeltaTime*/)
 {
+	// Catches the 1.5s safety-timeout case even when no new poll handler lands this frame (e.g. one
+	// of the five reads never answers) - cheap no-op otherwise (bPollNotifyPending false).
+	MaybeFlushPollNotify();
+
 	if (!bBound && !bTriedBindOnFirstTick)
 	{
 		// Initialize() ran before UFoundryFSDKSubsystem existed - subsystem creation order beyond
@@ -135,12 +139,53 @@ void UFoundrySocialSubsystem::RefreshNow()
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		const double Now = FPlatformTime::Seconds();
+		if (PollReadsOutstanding > 0 && (Now - LastPollStartTime) < 2.0)
+		{
+			UE_LOG(LogFoundrySocial, Warning, TEXT("[Social] social poll storm: RefreshNow called again %.2fs after the last one, with %d read(s) from it still outstanding."),
+				Now - LastPollStartTime, PollReadsOutstanding);
+		}
+		LastPollStartTime = Now;
+		// RefreshParty + RefreshPartyInvites + RefreshFriends + RefreshPendingRequests + RefreshBlocked -
+		// NotePollAnswered (one per handler below) counts these five down and coalesces them into ONE
+		// OnChanged broadcast instead of up to five separate drawer rebuilds.
+		PollReadsOutstanding = 5;
+		bPollNotifyPending = false;
+		PollFirstAnswerTime = -1.0;
 		Sdk->RefreshParty();
 		Sdk->RefreshPartyInvites();
 		Sdk->RefreshFriends();
 		Sdk->RefreshPendingRequests();
 		Sdk->RefreshBlocked();
 	}
+}
+
+void UFoundrySocialSubsystem::NotePollAnswered()
+{
+	if (PollFirstAnswerTime < 0.0)
+	{
+		PollFirstAnswerTime = FPlatformTime::Seconds();
+	}
+	PollReadsOutstanding = FMath::Max(0, PollReadsOutstanding - 1);
+	bPollNotifyPending = true;
+	MaybeFlushPollNotify();
+}
+
+void UFoundrySocialSubsystem::MaybeFlushPollNotify()
+{
+	if (!bPollNotifyPending)
+	{
+		return;
+	}
+	const bool bAllAnswered = PollReadsOutstanding <= 0;
+	const bool bTimedOut = PollFirstAnswerTime >= 0.0 && (FPlatformTime::Seconds() - PollFirstAnswerTime) >= 1.5;
+	if (!bAllAnswered && !bTimedOut)
+	{
+		return;
+	}
+	bPollNotifyPending = false;
+	PollFirstAnswerTime = -1.0;
+	OnChanged.Broadcast();
 }
 
 bool UFoundrySocialSubsystem::IsLocalLeader() const
@@ -151,6 +196,33 @@ bool UFoundrySocialSubsystem::IsLocalLeader() const
 	}
 	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
 	return !LocalId.IsEmpty() && P.LeaderFoundryId == LocalId;
+}
+
+bool UFoundrySocialSubsystem::IsLeader(const FString& FoundryId) const
+{
+	if (!HasParty() || FoundryId.IsEmpty())
+	{
+		return false;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	return P.LeaderFoundryId == FoundryId;
+}
+
+bool UFoundrySocialSubsystem::IsSelfReady() const
+{
+	if (!HasParty() || LocalId.IsEmpty())
+	{
+		return false;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		if (M.FoundryId == LocalId)
+		{
+			return M.bReady;
+		}
+	}
+	return false;
 }
 
 int32 UFoundrySocialSubsystem::PartyCapacity() const
@@ -282,6 +354,18 @@ void UFoundrySocialSubsystem::LeaveParty()
 	}
 }
 
+void UFoundrySocialSubsystem::SetReady(bool bReady)
+{
+	if (Fixture.bActive || !HasParty())
+	{
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->SetPartyReady(CachedParty.PartyId, bReady);
+	}
+}
+
 void UFoundrySocialSubsystem::RemoveFriend(const FString& FoundryId)
 {
 	if (Fixture.bActive)
@@ -373,68 +457,75 @@ void UFoundrySocialSubsystem::HandleLoggedOut()
 
 void UFoundrySocialSubsystem::HandleParty(EFoundryFsdkResult Result, const FFoundryParty& Party)
 {
-	if (Result != EFoundryFsdkResult::Ok)
+	if (Result == EFoundryFsdkResult::Ok)
 	{
-		return; // a failed read keeps the last party: a network blip must not empty it on screen
-	}
-	const bool bHadParty = HasParty();
-	CachedParty = Party;
-	if (!bHadParty && HasParty())
-	{
-		bCreatePartyPending = false; // a party arrived - our own CreateParty (if any) is done
-		if (!PendingInviteUsername.IsEmpty())
+		const bool bHadParty = HasParty();
+		CachedParty = Party;
+		if (!bHadParty && HasParty())
 		{
-			// The invite InviteByUsername queued behind its CreateParty.
-			if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+			bCreatePartyPending = false; // a party arrived - our own CreateParty (if any) is done
+			if (!PendingInviteUsername.IsEmpty())
 			{
-				Sdk->InviteToParty(CachedParty.PartyId, PendingInviteUsername);
+				// The invite InviteByUsername queued behind its CreateParty.
+				if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+				{
+					Sdk->InviteToParty(CachedParty.PartyId, PendingInviteUsername);
+				}
+				PendingInviteUsername.Reset();
 			}
-			PendingInviteUsername.Reset();
 		}
+
+		TArray<FString> MemberLines;
+		for (const FFoundryPartyMember& M : CachedParty.Members)
+		{
+			MemberLines.Add(FString::Printf(TEXT("%s:%s"), *M.FoundryId, M.State.IsEmpty() ? TEXT("JOINED") : *M.State));
+		}
+		UE_LOG(LogFoundrySocial, Log, TEXT("[Social] party %s, leader %s, members [%s]"),
+			CachedParty.PartyId.IsEmpty() ? TEXT("none") : *CachedParty.PartyId,
+			CachedParty.LeaderFoundryId.IsEmpty() ? TEXT("none") : *CachedParty.LeaderFoundryId,
+			*FString::Join(MemberLines, TEXT(", ")));
+
+		OnPartyChanged.Broadcast();
 	}
-	OnPartyChanged.Broadcast();
-	OnChanged.Broadcast();
+	// a failed read keeps the last party: a network blip must not empty it on screen
+	NotePollAnswered();
 }
 
 void UFoundrySocialSubsystem::HandleInvites(EFoundryFsdkResult Result, const TArray<FFoundryParty>& InInvites)
 {
-	if (Result != EFoundryFsdkResult::Ok)
+	if (Result == EFoundryFsdkResult::Ok)
 	{
-		return;
+		CachedInvites = InInvites;
 	}
-	CachedInvites = InInvites;
-	OnChanged.Broadcast();
+	NotePollAnswered();
 }
 
 void UFoundrySocialSubsystem::HandleFriends(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& InFriends)
 {
-	if (Result != EFoundryFsdkResult::Ok)
+	if (Result == EFoundryFsdkResult::Ok)
 	{
-		return;
+		CachedFriends = InFriends;
+		OnPartyChanged.Broadcast(); // party-member presence is joined against the friends list downstream
 	}
-	CachedFriends = InFriends;
-	OnChanged.Broadcast();
-	OnPartyChanged.Broadcast(); // party-member presence is joined against the friends list downstream
+	NotePollAnswered();
 }
 
 void UFoundrySocialSubsystem::HandlePending(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& Pending)
 {
-	if (Result != EFoundryFsdkResult::Ok)
+	if (Result == EFoundryFsdkResult::Ok)
 	{
-		return;
+		CachedPendingRequests = Pending.Num();
 	}
-	CachedPendingRequests = Pending.Num();
-	OnChanged.Broadcast();
+	NotePollAnswered();
 }
 
 void UFoundrySocialSubsystem::HandleBlocked(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& InBlocked)
 {
-	if (Result != EFoundryFsdkResult::Ok)
+	if (Result == EFoundryFsdkResult::Ok)
 	{
-		return;
+		CachedBlocked = InBlocked;
 	}
-	CachedBlocked = InBlocked;
-	OnChanged.Broadcast();
+	NotePollAnswered();
 }
 
 void UFoundrySocialSubsystem::HandleSocialAction(EFoundryFsdkResult Result, const FString& Action)

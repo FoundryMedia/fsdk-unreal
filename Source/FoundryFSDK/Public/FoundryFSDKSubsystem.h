@@ -213,6 +213,11 @@ struct FFoundryPartyMember
 
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	FString State;
+
+	/** Platform party-member ready flag (fsdk_party_member.ready). Cleared server-side on leave /
+	 *  remove / leader-change / disband; a JOIN always starts not-ready. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bReady = false;
 };
 
 /** The player's current party (PartyId empty when not in one). */
@@ -698,6 +703,12 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void LeaveParty(const FString& PartyId);
+
+	/** Set your own ready flag on the party you're in. Async: OnSocialActionComplete
+	 *  ("party.ready"), followed by an automatic RefreshParty. Cleared server-side on leave/
+	 *  remove/leader-change/disband - never cleared by this subsystem itself. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void SetPartyReady(const FString& PartyId, bool bReady);
 
 	/** Ask to join a FRIEND's current party (parties stay invite-only - this
 	 *  stages a request the party's LEADER answers). Async:

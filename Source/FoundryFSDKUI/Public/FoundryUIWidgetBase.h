@@ -6,6 +6,10 @@
 #include "CoreMinimal.h"
 #include "FoundryUIWidgetBase.generated.h"
 
+class IMenu;
+class UComboBoxString;
+class UFoundryConfirmDialog;
+class UFoundryTooltip;
 class UTextBlock;
 class UWidget;
 class UWidgetAnimation;
@@ -25,8 +29,8 @@ class FOUNDRYFSDKUI_API UFoundryUIWidgetBase : public UUserWidget
 
 public:
 	/**
-	 * Every Button and ComboBox in the widget's tree takes the Hand cursor. Called from
-	 * NativeOnInitialized here; a plain (non-UFoundryUIWidgetBase) row widget calls it itself.
+	 * Every Button, ComboBox, CheckBox and Slider in the widget's tree takes the Hand cursor. Called
+	 * from NativeOnInitialized here; a plain (non-UFoundryUIWidgetBase) row widget calls it itself.
 	 */
 	static void UseHandCursor(UUserWidget* Widget);
 
@@ -53,6 +57,84 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
 	float TweenOffset = 0.0f;
 
+	/**
+	 * Eases Target's RenderTransformAngle from FromDeg to ToDeg over Seconds (ease-out cubic),
+	 * ticked alongside PlayOrTween's own fallback tween but tracked independently of it - several
+	 * widgets (e.g. a drawer's three section chevrons) can each be mid-rotation at once, and none of
+	 * them share state with the opacity/translation tween PlayOrTween drives. Calling it again for
+	 * the SAME Target restarts the tween from wherever it currently sits (so a rapid toggle reverses
+	 * smoothly instead of snapping). Target's RenderTransformPivot should be set to (0.5, 0.5) once
+	 * (e.g. in NativeOnInitialized) so the rotation spins in place rather than swinging an edge.
+	 */
+	void TweenAngle(UWidget* Target, float FromDeg, float ToDeg, float Seconds);
+
+	/**
+	 * Collapses the engine chrome FSlateApplication::PushMenu wraps around EVERY pushed menu:
+	 * FMenuStack::PrePush -> WrapContent(bShouldShowBackground = true, no flag on PushMenu) builds
+	 * SMenuContentWrapper -> SBox -> SOverlay [ SImage "Menu.Background", SImage "Menu.Outline",
+	 * SBorder(content) ] (MenuStack.cpp). The dark box brush shows at the corners of any rounded
+	 * content panel. Only the IMenuHost path (SMenuAnchor / combos) can switch it off, so a cursor-
+	 * placed menu hides the two images after the push instead. Structure-checked: a different
+	 * engine layout leaves the chrome alone (dark corners, nothing broken). Returns how many
+	 * images were collapsed (2 on UE 5.7).
+	 */
+	static int32 HideEngineMenuChrome(const TSharedPtr<IMenu>& Menu);
+
+	/**
+	 * Clears the dark background/outline frame a UComboBoxString's OWN internal popup draws by
+	 * default (SMenuAnchor/SComboButton's inherited IMenuHost::bShowMenuBackground, true unless
+	 * cleared) - the same family of "engine chrome around a hosted popup" problem
+	 * HideEngineMenuChrome solves above, but a combo's list is its own SMenuAnchor, never a
+	 * FSlateApplication::PushMenu, so it needs its own seam (see Source/GooCrew/UI/Lobby/
+	 * GooLobbyChatPanel.cpp ScrubChannelSelectBrushes/NativeConstruct for the same pattern against a
+	 * Designer-built combo). Call once per combo after Construct - TakeWidget() realizes the live
+	 * Slate tree the first time, which is when bShowMenuBackground becomes reachable. Does nothing
+	 * to the combo's OWN placement (below/above the anchor) - that stays the caller's call, when one
+	 * is needed.
+	 */
+	static void ScrubComboChrome(UComboBoxString* Combo);
+
+	/**
+	 * Walks Widget's tree and, for every descendant whose GetToolTipText() is non-empty and that
+	 * doesn't already carry a custom tooltip widget, wraps that text in a UFoundryTooltip (from
+	 * UFoundryUISettings::DefaultTooltip) via UWidget::SetToolTip - replacing the engine's own
+	 * tooltip bubble with the kit's pill for every tooltip the WBP or its parent class set BEFORE
+	 * this runs. Call once, after any such setup (e.g. right after UseHandCursor in
+	 * NativeOnInitialized, which every UFoundryUIWidgetBase does automatically - a game widget that
+	 * does NOT derive from this base, like Goo Crew's lobby, calls it explicitly instead). A later
+	 * runtime text change goes through SetKitToolTip, not a fresh ApplyKitTooltips pass.
+	 */
+	static void ApplyKitTooltips(UUserWidget* Widget);
+
+	/**
+	 * Sets or clears Target's tooltip, in the kit's own pill (never the engine's default tooltip
+	 * bubble) - the RUNTIME counterpart to ApplyKitTooltips, for a tooltip whose text changes after
+	 * construction (e.g. a status line re-set every poll). Empty Text clears the tooltip entirely
+	 * (SetToolTip(nullptr) + ToolTipText reset); otherwise an existing UFoundryTooltip is relabeled
+	 * in place, or a fresh one is created from UFoundryUISettings::DefaultTooltip (falling back to a
+	 * plain SetToolTipText when the class is unset, so the text is never silently lost).
+	 */
+	static void SetKitToolTip(UWidget* Target, const FText& Text);
+
+	/**
+	 * The owning player controller when it implements IFoundryMenuHost, else null (one WARN per
+	 * widget CLASS naming the controller class - the kit's menus then fall back to AddToViewport /
+	 * RemoveFromParent instead of asking the host).
+	 */
+	UObject* FindMenuHost() const;
+
+	/**
+	 * Creates + pushes a UFoundryConfirmDialog (ClassOverride, else UFoundryUISettings::
+	 * DefaultConfirmDialog) through the host when one is available, else AddToViewport(30) - the
+	 * shared "confirm before a destructive action" seam the pause menu's QUIT TO DESKTOP/LEAVE MATCH
+	 * and the settings menu's RESET ALL all go through. Null (+ a WARN naming this widget's class)
+	 * when no class resolves - the caller should refuse the action rather than skip confirmation.
+	 * The CALLER owns binding OnConfirmed/OnCancelled and holding a GC reference (UPROPERTY) to the
+	 * result while it is open, same as before this was factored out.
+	 */
+	UFoundryConfirmDialog* OpenConfirmDialog(const FText& Title, const FText& Body, const FText& ConfirmLabel,
+		const FText& CancelLabel, float CooldownSeconds, TSubclassOf<UFoundryConfirmDialog> ClassOverride = nullptr);
+
 	UFUNCTION(BlueprintImplementableEvent, Category = "Foundry UI")
 	void OnTransitionFinished(bool bForward);
 
@@ -64,6 +146,19 @@ protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 	virtual void OnAnimationFinished_Implementation(const UWidgetAnimation* Animation) override;
+
+	/**
+	 * When true, a mouse-down that lands on this widget while NEITHER it nor any descendant already
+	 * has keyboard focus (e.g. a click on a non-focusable backdrop) retakes keyboard focus for THIS
+	 * widget, so a later Escape still reaches it - a click that lands on an already-focusable
+	 * descendant (a combo, a slider) is left alone; that descendant takes focus on its own. Off by
+	 * default; the kit's modal menus (pause menu, confirm dialog, settings menu) turn it on in their
+	 * constructors.
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
+	bool bRetakeFocusOnClick = false;
+
+	virtual FReply NativeOnMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent) override;
 
 private:
 	// The animation (if any) the last PlayOrTween call drove, and which direction - so
@@ -78,4 +173,17 @@ private:
 	bool bTweenForward = false;
 	float TweenProgress = 0.0f;
 	float TweenDuration = 0.3f;
+
+	// TweenAngle state - one entry per widget currently mid-rotation. A repeat TweenAngle call for a
+	// widget already in this list replaces its entry (restarts Elapsed, keeps nothing else around)
+	// instead of stacking a second tween on the same widget.
+	struct FFoundryAngleTween
+	{
+		TWeakObjectPtr<UWidget> Widget;
+		float FromDeg = 0.0f;
+		float ToDeg = 0.0f;
+		float Duration = 0.15f;
+		float Elapsed = 0.0f;
+	};
+	TArray<FFoundryAngleTween> AngleTweens;
 };

@@ -185,8 +185,9 @@ def _badge_qmark(d, s, cx, cy, r, fill=WHITE):
 
 
 def draw_close(d, s):
-    w = s * 0.09
-    m = s * 0.22
+    # Smaller cross than the other glyphs on purpose (Justin, 2026-10-11: "the X icon all around the game is a bit too big").
+    w = s * 0.08
+    m = s * 0.30
     d.line([(m, m), (s - m, s - m)], fill=(255, 255, 255, 255), width=int(w))
     d.line([(s - m, m), (m, s - m)], fill=(255, 255, 255, 255), width=int(w))
 
@@ -226,33 +227,40 @@ def draw_users(d, s):
 
 
 def draw_send(d, s):
-    """Classic paper-plane send glyph: a tilted dart with a folded-wing crease."""
-    deg = -28
-    nose = (0.40, 0.0)
-    top = (-0.36, -0.30)
-    notch = (-0.10, 0.0)
-    bot = (-0.36, 0.30)
-    fold_b = ((nose[0] + top[0]) / 2.0, (nose[1] + top[1]) / 2.0)
-
-    dart = _rot([nose, top, notch, bot], 0, 0, deg)
-    dart = [(0.5 + x, 0.5 + y) for x, y in dart]
-    _poly(d, s, dart)
-
-    fold = _rot([notch, fold_b], 0, 0, deg)
-    fold = [(0.5 + x, 0.5 + y) for x, y in fold]
-    _line(d, s, fold, 0.035, CLEAR, caps=False)
+    """Plain filled right-pointing arrow (a triangular head + a stem, one solid polygon) -
+    Justin: the paper plane "has this weird streak through it" (the fold-crease cut), and a
+    straight-up filled arrow reads cleaner at small sizes anyway."""
+    x0, x1 = 0.10, 0.90  # ~80% of the canvas, centered
+    head_x = 0.58
+    hh = 0.30  # head half-height
+    sh = 0.14  # stem half-height
+    cy = 0.5
+    pts = [
+        (x0, cy - sh),
+        (head_x, cy - sh),
+        (head_x, cy - hh),
+        (x1, cy),
+        (head_x, cy + hh),
+        (head_x, cy + sh),
+        (x0, cy + sh),
+    ]
+    _poly(d, s, pts)
 
 
 def draw_person_plus(d, s):
-    _person(d, s, 0.40, 0.10, 0.76)
-    bx, by, br = 0.76, 0.76, 0.22
+    """Same full-size figure as draw_person (Justin: the old 0.76-scale, off-centre figure "looks
+    squeezed") - the plus badge sits bottom-right over the body; _badge_gap cuts a clean hole
+    first so the badge reads as its own emblem rather than fusing with the figure under it."""
+    _person(d, s, 0.5, 0.12, 1.0)
+    bx, by, br = 0.78, 0.80, 0.20
     _badge_gap(d, s, bx, by, br)
     _badge_plus(d, s, bx, by, br)
 
 
 def draw_person_minus(d, s):
-    _person(d, s, 0.40, 0.10, 0.76)
-    bx, by, br = 0.76, 0.76, 0.22
+    # Same full-size figure + badge geometry as draw_person_plus (one Remove / Add pair).
+    _person(d, s, 0.5, 0.12, 1.0)
+    bx, by, br = 0.78, 0.80, 0.20
     _badge_gap(d, s, bx, by, br)
     _badge_minus(d, s, bx, by, br)
 
@@ -278,6 +286,25 @@ def draw_group_question(d, s):
     bx, by, br = 0.78, 0.78, 0.21
     _badge_gap(d, s, bx, by, br)
     _badge_qmark(d, s, bx, by, br)
+
+
+def draw_crown(d, s):
+    """Three-point crown with a base band - the party-leader mark (lobby nameplate CrownIcon,
+    matches the drawer's HostBadge). Same drawing code as GooCrew/SourceAssets/icons/make_icons.py's
+    draw_crown (ported, not reinvented)."""
+    _poly(d, s, [(0.08, 0.28), (0.30, 0.50), (0.50, 0.18), (0.70, 0.50), (0.92, 0.28), (0.84, 0.72), (0.16, 0.72)], round_w=0.04)
+    for x, y in ((0.08, 0.28), (0.50, 0.18), (0.92, 0.28)):
+        _dot(d, s, x, y, 0.065)
+    _rrect(d, s, (0.16, 0.77, 0.84, 0.88), 0.03)
+
+
+def draw_external(d, s):
+    """Open-external-link glyph (Feather-style): a box open at its top-right corner, with a small
+    arrow breaking out through the gap toward the top-right - the usual "opens elsewhere" mark."""
+    w = 0.10
+    _line(d, s, [(0.75, 0.5417), (0.75, 0.7917), (0.2083, 0.7917), (0.2083, 0.25), (0.4583, 0.25)], w)
+    _line(d, s, [(0.625, 0.125), (0.875, 0.125), (0.875, 0.375)], w)
+    _line(d, s, [(0.4167, 0.5833), (0.875, 0.125)], w)
 
 
 # --------------------------------------------------------------------------------------
@@ -363,6 +390,8 @@ GLYPHS = [
     ("icon_chevron_down.png", draw_chevron_down),
     ("icon_chevron_up.png", draw_chevron_up),
     ("icon_check.png", draw_check),
+    ("icon_external.png", draw_external),
+    ("icon_crown.png", draw_crown),
 ]
 
 if __name__ == "__main__":

@@ -89,6 +89,10 @@ public:
 	bool HasParty() const { return Fixture.bActive ? Fixture.bHasParty : !CachedParty.PartyId.IsEmpty(); }
 	const FFoundryParty& Party() const { return Fixture.bActive ? Fixture.Party : CachedParty; }
 	bool IsLocalLeader() const;
+	/** True when FoundryId leads the current party; false when not in a party or FoundryId is empty. */
+	bool IsLeader(const FString& FoundryId) const;
+	/** The local player's own ready flag from the cached party (false when not in a party). */
+	bool IsSelfReady() const;
 	/** The server's MaxSize when known (in a party), else DefaultPartyCapacity. */
 	int32 PartyCapacity() const;
 	/** 1 when not in a party (you are your own one-person "party"); otherwise the number of JOINED
@@ -124,6 +128,8 @@ public:
 	void DeclineInvite(const FString& PartyId);
 	/** Leaves the CACHED party (Party().PartyId); a no-op when not in one. */
 	void LeaveParty();
+	/** Sets your own ready flag on the CACHED party (Party().PartyId); a no-op when not in one. */
+	void SetReady(bool bReady);
 	void RemoveFriend(const FString& FoundryId);
 	void BlockPlayer(const FString& FoundryId);
 	void UnblockPlayer(const FString& FoundryId);
@@ -160,6 +166,12 @@ private:
 	UFUNCTION() void HandleBlocked(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& InBlocked);
 	UFUNCTION() void HandleSocialAction(EFoundryFsdkResult Result, const FString& Action);
 
+	/** Called from the tail of every one of the five poll handlers (party/invites/friends/pending/
+	 *  blocked), success or failure - counts it answered and flushes the coalesced OnChanged once
+	 *  every outstanding read of the current poll has answered, or 1.5s after the first one has. */
+	void NotePollAnswered();
+	void MaybeFlushPollNotify();
+
 	bool bBound = false;
 	bool bTriedBindOnFirstTick = false; // Initialize() can race UFoundryFSDKSubsystem's own creation
 	                                     // despite InitializeDependency on some platforms/modes; retry
@@ -189,4 +201,13 @@ private:
 	bool bPanelOpen = false;
 	double NextPollTime = 0.0;
 	int32 ConsumerCount = 0; // RegisterConsumer/UnregisterConsumer - Tick polls only while > 0
+
+	// OnChanged coalescing: RefreshNow fires 5 async reads (party/invites/friends/pending/blocked),
+	// each landing on its own frame - without this, one poll cycle rebuilt the drawer up to 5 times
+	// in a row, and a row (e.g. YOUR PARTY) could render a half-updated in-between state on one of
+	// those rebuilds before the next handler's answer caught it up - the "flicker".
+	int32 PollReadsOutstanding = 0; // 0 = no poll in flight
+	bool bPollNotifyPending = false; // at least one handler landed and wants OnChanged to fire
+	double PollFirstAnswerTime = -1.0; // FPlatformTime::Seconds() of this poll's first answer; -1 = none yet
+	double LastPollStartTime = -1000.0; // for the "RefreshNow called again before the last poll landed" warning
 };

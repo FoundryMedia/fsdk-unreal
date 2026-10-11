@@ -583,18 +583,57 @@ gets working social UI with zero widget work, and restyles only what it wants. T
 separate Runtime module, `FoundryFSDKUI`; a game that never references it pays nothing. First
 family shipped: the **social drawer** (account block, your party, online / offline / blocked
 friends, ADD FRIEND, a right-click menu per friend - Send Message, Invite, Request to Join,
-Remove Friend, Block Player - with confirms on the destructive ones). Chat, app bar,
-matchmaking cluster, pause + settings menus follow in the same shape.
+Remove Friend, Block Player - with confirms on the destructive ones). Second family (S3a): the
+**pause menu** (relabels itself for Lobby/Match - MENU/QUIT TO DESKTOP/CANCEL or PAUSED/LEAVE
+MATCH/RESUME - plus a SETTINGS button) and the **confirm dialog** it opens for its destructive
+action, optionally cooldown-gated (LEAVE MATCH; QUIT TO DESKTOP has none). Third family (S3b): the
+**settings menu** (Video/Audio/Interface/Controls) and its **keybind row**, both built on the kit's
+own persistence base, `UFoundryGameUserSettings`. S3c reshaped the settings menu into a full-screen
+TWO-PANE layout (left: the scrolling sections; right: a description pane that reads whatever the
+left side is hovering - Fortnite-style) and made Video STAGED (the four combos + VSync stage into a
+pending struct; an APPLY button commits them all at once - Audio/Interface/Controls stay immediate).
+It also gave the whole kit its own **tooltip pill** (`UFoundryTooltip`), replacing the engine's
+default tooltip bubble wherever a kit widget (or a game widget that opts in) sets `ToolTipText`.
+Neither the menus nor the dialog add/remove themselves from the viewport - they ask the host
+through `IFoundryMenuHost` (below). S4 added a platform READY flag to party membership (fid party
+member -> fsdk-core `fsdk_party_member.ready` -> `UFoundryFSDKSubsystem::SetPartyReady` ->
+`UFoundrySocialSubsystem::SetReady`/`IsSelfReady`/`IsLeader`) and the **party nameplate** family
+(`UFoundryPartyNameplate`): the drawer's party rows show a ready check next to the name
+(`UFoundryFriendRow::ReadyIcon`), the drawer header grows a READY/UNREADY toggle
+(`ReadyToggleButton`/`ReadyToggleText`, visible only while in a party), and a floating/anchored
+name plate (crown + name + ready check in a pill, a HOST badge underneath - crown AND the badge
+both mark the LEADER) is a new default asset alongside the drawer's rows. Chat, app bar and a
+matchmaking cluster follow in the same shape.
 
 | Piece | Where | What it does |
 |---|---|---|
-| `UFoundrySocialSubsystem` | `FoundryFSDK` (core) | The ONE social poller: cached friends / blocked / party / invites / pending count / own identity, a 10 s open / 30 s closed cadence (`SetPanelOpen`), every action (`SendFriendRequest`, `InviteByUsername`, `RemoveFriend`, `BlockPlayer`, `UnblockPlayer`, `RequestToJoin`, ...), `OnChanged` / `OnPartyChanged` / `OnActionFailed`, and `SetFixture` for dev fixtures. Your own model reads from it; never poll the subsystem twice. |
-| `UFoundrySocialDrawer`, `UFoundryFriendRow`, `UFoundryInviteRow`, `UFoundryFriendMenu` | `FoundryFSDKUI` | The C++ parents. They bind widgets BY NAME (`BindWidgetOptional` - a WBP with half the names still compiles) and push state; the look lives in the WBP. `GetMemberTint` is a `BlueprintNativeEvent` seam for your palette; `OnWhisperRequested(FoundryId, DisplayName)` is where Send Message hands off to your chat. |
-| `UFoundryUIWidgetBase` | `FoundryFSDKUI` | `Show` / `SetText` / `UseHandCursor` helpers and `PlayOrTween`: plays a bound `UWidgetAnimation` when the WBP has one, else a code tween - every default animates with no Sequencer work, and a hand-authored animation wins when present. |
-| `UFoundryUISettings` | Project Settings > Plugins > Foundry UI | `AccountUrl` (the Manage account link), the four default widget classes (`TSoftClassPtr`, point them at your copies to restyle), the palette (`FFoundryUIPalette`). |
-| `Content/UI/Social/WBP_Foundry*` | plugin Content | The default Widget Blueprints, GENERATED from a C++ spec by the editor commandlet below (trees in `Content/UI/Social/TREES.md`). Duplicate one into your project to restyle it; a duplicate keeps the parent class and every binding. |
-| `Content/UI/Icons/icon_*` | plugin Content | White glyphs tinted in UMG (paper plane, person +/-, block, group +/?, users, close, search, chevrons, check). Sources + generator: `Tools/icons/make_icons.py` (Pillow). |
-| `FoundryFSDKUIEditor` | editor module | `UnrealEditor-Cmd.exe <project> -run=FoundryUIBuild [-dump]` regenerates the default WBPs + imports the icons (idempotent; `-dump` prints the trees). Only needed when the kit's spec changes - a consumer never runs it. |
+| `UFoundrySocialSubsystem` | `FoundryFSDK` (core) | The ONE social poller: cached friends / blocked / party / invites / pending count / own identity, a 10 s open / 30 s closed cadence (`SetPanelOpen`), every action (`SendFriendRequest`, `InviteByUsername`, `RemoveFriend`, `BlockPlayer`, `UnblockPlayer`, `RequestToJoin`, `SetReady`, ...), `IsSelfReady()`/`IsLeader(FoundryId)` reads, `OnChanged` / `OnPartyChanged` / `OnActionFailed`, and `SetFixture` for dev fixtures. Your own model reads from it; never poll the subsystem twice. |
+| `UFoundrySocialDrawer`, `UFoundryFriendRow`, `UFoundryInviteRow`, `UFoundryFriendMenu` | `FoundryFSDKUI` | The C++ parents. They bind widgets BY NAME (`BindWidgetOptional` - a WBP with half the names still compiles) and push state; the look lives in the WBP. `GetMemberTint` is a `BlueprintNativeEvent` seam for your palette; `OnWhisperRequested(FoundryId, DisplayName)` is where Send Message hands off to your chat. A party row's `ReadyIcon` (`UFoundryFriendRow`) shows iff the member is joined and ready; the drawer's `ReadyToggleButton`/`ReadyToggleText` (visible only while in a party) toggles your own ready flag via `UFoundrySocialSubsystem::SetReady`. |
+| `UFoundryPartyNameplate` | `FoundryFSDKUI` | A floating/anchored party-member label - `NameText` (tinted via the `GetNameTint` `BlueprintNativeEvent` seam, default Primary for the local player), `CrownIcon` + `HostBadge` (both mark the party LEADER), `ReadyIcon` (the member's ready flag). One call, `Setup(Name, bLeader, bReady, bLocal)`; `OnPlateUpdated()` fires after every Setup. No motion. |
+| `UFoundryPauseMenu`, `UFoundryConfirmDialog` | `FoundryFSDKUI` | The pause menu / confirm dialog C++ parents - same bind-by-name-and-push-state contract. `SetContext(Lobby\|Match)` relabels the pause menu (or it resolves the context itself, from the host, at Construct); its destructive action opens the confirm through `UFoundryUIWidgetBase::OpenConfirmDialog`; `OnPrimaryConfirmed(Context)` fires once it is confirmed. |
+| `UFoundrySettingsMenu`, `UFoundryKeybindRow` | `FoundryFSDKUI` | The settings menu: a full-screen two-pane layout (left: Video/Audio/Interface/Controls, scrolling; right: a description pane - hover a row, read what it does, with an optional `Previews` image per row) and one Controls-section row. Video is STAGED into a pending struct and committed by `ApplyButton` (`SetFullscreenMode`/`SetScreenResolution`/`SetOverallScalabilityLevel`/`SetFrameRateLimit`/`SetVSyncEnabled` + `ApplySettings(false)` + `SaveSettings()`, all at once); Back/Escape with changes pending just discards them (nothing was ever written); the top-right `CloseButton` (X) does exactly the same thing. Audio/Interface read/write `UFoundryGameUserSettings` (applying live, saving on release) and hide themselves when the project isn't using one; Controls lists `UFoundryUISettings::RebindableContexts`' player-mappable rows via Enhanced Input user settings, applying immediately, and `ResetAllKeysButton` confirms ("Reset all controls?") through `OpenConfirmDialog` before resetting - see "Persistence + rebinding" below. Every combo/checkbox/slider takes the Hand cursor and lights up (`FoundryUITheme::CompositeOver`) on hover - the checkbox/combo brushes are built once by the generator, the slider's is recomputed every tick it is hovered (`SetSliderHandleColor`/`SetSliderBarColor` have no static hover state). |
+| `UFoundryGameUserSettings` | `FoundryFSDKUI` | The kit's persistence base (`UGameUserSettings` subclass - set it as your project's `GameUserSettingsClassName`): volumes, `UIScale`, `bReducedMotion`, `ApplyAudio(WorldContextObject)` (pushes `UFoundryUISettings::SoundMix` + overrides the three sound classes), `OnInterfaceSettingsChanged`. Subclass it to add your own fields (developer mode, keybind defaults, ...) - `Get()` always resolves the one true `GEngine->GetGameUserSettings()` object, never a cached copy. |
+| `IFoundryMenuHost` | `FoundryFSDKUI` | The seam between the kit's menus and your player controller - see below. |
+| `UFoundryUIWidgetBase` | `FoundryFSDKUI` | `Show` / `SetText` / `UseHandCursor` helpers, `PlayOrTween` (plays a bound `UWidgetAnimation` when the WBP has one, else a code tween - every default animates with no Sequencer work, and a hand-authored animation wins when present), `FindMenuHost()` (the owning player controller when it implements `IFoundryMenuHost`, else null + a one-time WARN), `ApplyKitTooltips(Widget)` (wraps every ToolTipText already set on Widget's tree in a `UFoundryTooltip` pill - called automatically from here for every kit widget; call it yourself for a non-kit widget, e.g. Goo Crew's lobby), `SetKitToolTip(Target, Text)` (the runtime counterpart, for a tooltip whose text changes later), `bRetakeFocusOnClick` (protected - a click on a non-focusable backdrop still lets Escape close the widget afterward; the pause menu, confirm dialog and settings menu turn it on), and `OpenConfirmDialog(...)` (creates + pushes a `UFoundryConfirmDialog` through the host - the shared "confirm before a destructive action" seam the pause menu and the settings menu's RESET ALL both go through; the caller binds `OnConfirmed`/`OnCancelled`). |
+| `UFoundryTooltip` | `FoundryFSDKUI` | The kit's own tooltip pill - a small `LabelText` (`SetLabel`) wrapped around whatever `ApplyKitTooltips`/`SetKitToolTip` are asked to show, replacing the engine's default tooltip bubble everywhere in the kit. |
+| `UFoundryUISettings` | Project Settings > Plugins > Foundry UI | `AccountUrl` (the Manage account link), the ten default widget classes incl. `DefaultPartyNameplate`/`DefaultTooltip` (`TSoftClassPtr`, point them at your copies to restyle), the palette (`FFoundryUIPalette`), the audio refs (`SoundMix`/`MasterSoundClass`/`MusicSoundClass`/`SFXSoundClass`), `RebindableContexts` (the Enhanced Input mapping contexts the Controls section lists). |
+| `Content/UI/Social/WBP_Foundry*` | plugin Content | The default Widget Blueprints (drawer, friend row, invite row, friend menu, party nameplate), GENERATED from a C++ spec by the editor commandlet below (trees in `Content/UI/Social/TREES.md`). Duplicate one into your project to restyle it; a duplicate keeps the parent class and every binding. |
+| `Content/UI/Menus/WBP_Foundry*` | plugin Content | `WBP_FoundryPauseMenu` / `WBP_FoundryConfirmDialog` / `WBP_FoundrySettingsMenu` / `WBP_FoundryKeybindRow` / `WBP_FoundryTooltip`, generated the same way (trees in `Content/UI/Menus/TREES.md`). |
+| `Content/UI/Icons/icon_*` | plugin Content | White glyphs tinted in UMG (paper plane, person +/-, block, group +/?, users, close, search, chevrons, check, crown). Sources + generator: `Tools/icons/make_icons.py` (Pillow). |
+| `FoundryFSDKUIEditor` | editor module | `UnrealEditor-Cmd.exe <project> -run=FoundryUIBuild [-dump] [-verifyicons] [-profile=<json>]` regenerates the default WBPs + imports the icons (idempotent; `-dump` prints the trees; `-verifyicons` proves the imported icons' mip/filter settings; `-profile` builds a GAME's own skinned copies - see below). Only needed when the kit's spec (or a game's profile) changes - a player-facing build never runs it. |
+
+**`IFoundryMenuHost`** is the seam between the kit's menus and your player controller: five
+`BlueprintNativeEvent`s - `RequestPushMenu(Menu)`, `RequestPopMenu()`, `RequestOpenSettings()`,
+`RequestLeaveMatch()`, `GetPauseContext()` (`EFoundryPauseContext::Lobby` or `Match`). The pause
+menu and confirm dialog never call `AddToViewport` / `RemoveFromParent` themselves when a host is
+available - they ask it, through `UFoundryUIWidgetBase::FindMenuHost()` (the owning player
+controller, cast to the interface; null + a one-time-per-class WARN when it doesn't implement it,
+falling back to `AddToViewport`/`RemoveFromParent` so the kit still works with no host at all). The
+`Request` prefix exists so a game whose controller already has its own `PushMenu` / `PopTopMenu` /
+`OpenSettingsMenu` / `LeaveMatch` (Goo Crew's `AGooCrewPlayerControllerBase`) can implement the
+interface by forwarding to them, with no name clash. Goo Crew's match controller
+(`AGooCrewPlayerController`) overrides `GetPauseContext_Implementation` to `Match`; the shared base
+defaults to `Lobby`.
 
 `UFoundryUISettings`'s defaults are soft class references (`TSoftClassPtr`), so nothing in code
 hard-references `Content/UI/Social` for the cooker to find on its own - the plugin's own
@@ -610,6 +649,65 @@ Defaults (or the project settings), and change the brushes. Rules the kit follow
 a UI click never blocks on the SDK core (every subsystem call is a worker call), destructive
 actions confirm, a right-click is an explicit menu, the game never sets presence (the launcher
 owns it), and the game's own identity is the redacted read (foundryId, display name, username).
+
+**`-profile` automates the restyle path.** Instead of duplicating the navy WBPs by hand and
+reparenting/recolouring them in the Designer, point the commandlet at a JSON file
+(`{out, prefix, drawerParent, nameplateParent, palette{}, fonts{regular,bold,heading},
+radii{panel,input,button}}`, every field optional and additive over the plugin's own
+navy/Roboto/24-16-16 defaults) and it generates your game's own skinned copies directly -
+`<out>/<prefix>Drawer` (reparented to `drawerParent` when given), `<prefix>FriendRow`,
+`<prefix>InviteRow`, `<prefix>FriendMenu`, `<prefix>Nameplate` (reparented to `nameplateParent`
+when given - the other three always parent to the plugin's own row/menu classes). It also prints
+the matching `[/Script/FoundryFSDKUI.FoundryUISettings]` ini block (`DefaultSocialDrawer`/
+`DefaultFriendRow`/`DefaultInviteRow`/`DefaultFriendMenu`/`DefaultPartyNameplate` + the resolved
+`Palette=(...)` in linear floats) so pointing
+your project's `DefaultGame.ini` at the copies is a paste, never a hand-derivation - see Goo Crew's
+own `SourceAssets/design/foundry-ui-profile.json` + `Config/DefaultGame.ini` for a worked example.
+You still restyle the GENERATED copies in the Designer afterward (DrawerAnim, anything beyond the
+profile's own knobs) - `-profile` only replaces the duplicate-and-recolour step, never the kit's
+"the look lives in the WBP" contract. Run with no `-profile` at all and the output (and `-out`'s
+existing behavior) is byte-identical to before this flag existed.
+
+The same file also carries `menus: {out, prefix}` for the pause menu / confirm dialog / settings
+menu / keybind row (absent - falls back to the social `out`/`prefix` above, so a profile with no
+`menus` object still gets all four generated right alongside the drawer) and
+`pauseParent`/`confirmParent`/`settingsParent`/`keybindRowParent` (each resolved exactly like
+`drawerParent`), producing `<menusPrefix>PauseMenu` / `<menusPrefix>ConfirmDialog` /
+`<menusPrefix>SettingsMenu` / `<menusPrefix>KeybindRow` and the matching `DefaultPauseMenu` /
+`DefaultConfirmDialog` / `DefaultSettingsMenu` / `DefaultKeybindRow` ini lines. Goo Crew's own
+profile points `menus.out` at `/Game/UI/Menus` with `prefix: "WBP_Goo"`.
+
+### Persistence + rebinding — `UFoundryGameUserSettings` and three Enhanced Input prerequisites
+
+The settings menu's Video tab needs nothing beyond the engine's own `UGameUserSettings`. Audio,
+Interface and Controls each need a small amount of project wiring first:
+
+- **`GameUserSettingsClassName` must point at a `UFoundryGameUserSettings` subclass**
+  (`Config/DefaultEngine.ini` `[/Script/Engine.Engine] GameUserSettingsClassName=/Script/
+  YourGame.YourGameUserSettings`) - without it `UFoundryGameUserSettings::Get()` returns null (one
+  WARN per process), and the Audio + Interface sections hide themselves. Goo Crew's subclass,
+  `UGooCrewGameUserSettings`, also shows the migration shape: add your own fields, and if a project
+  is migrating off its own ad-hoc `USaveGame` persistence, import it once from `LoadSettings`
+  (`Settings/GooCrewGameUserSettings.cpp` copies the old slot's fields in on first load, then never
+  touches it again).
+- **`bEnableUserSettings=True` under `[/Script/EnhancedInput.EnhancedInputDeveloperSettings]`**
+  (`Config/DefaultInput.ini`) turns on Enhanced Input's player-mappable-key system at all; without
+  it `GetUserSettings()` returns null and the Controls section shows its "disabled for this
+  project" note instead of a list.
+- **`UFoundryUISettings::RebindableContexts` must name at least one `UInputMappingContext`** (Project
+  Settings -> Game -> Foundry UI) - empty means "This game has no rebindable controls." The context
+  itself still needs its individual mappings marked player-mappable (see the next paragraph) or the
+  list comes back empty even with a context configured.
+
+A mapping only shows up as a row once it carries a `UPlayerMappableKeySettings` (Setting Behavior =
+Override Settings, with a `Name` + `DisplayName`) - that is an asset-editing step, not a Project
+Settings toggle, so it is done once per mapping via editor Python rather than by hand per mapping in
+the Designer. `SourceAssets/tools/set_mappable_keys.py` is Goo Crew's worked example: run headless
+(`UnrealEditor-Cmd.exe GooCrew.uproject -run=pythonscript -script=SourceAssets/tools/
+set_mappable_keys.py -unattended -nopause -stdout`), it names IA_Jump and the four IA_Move key
+mappings (W/A/S/D) and leaves the gamepad stick axes and IA_Look/IA_MouseLook alone - adapt the
+`NAMED_MAPPINGS` table for your own context. `UFoundryKeybindRow` only ever shows slot
+`EPlayerMappableKeySlot::First` (keyboard/mouse) rows; gamepad slots are a v2 follow-on.
 
 ---
 

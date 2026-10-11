@@ -1,9 +1,8 @@
 #include "FoundryUISettings.h"
 
 #include "Blueprint/UserWidget.h"
+#include "FoundryFSDKUILog.h"
 #include "UObject/SoftObjectPath.h"
-
-DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDKUI, Log, All);
 
 namespace
 {
@@ -28,6 +27,7 @@ FFoundryUIPalette::FFoundryUIPalette()
 	, Online(Hex(TEXT("#4edea3")))
 	, Idle(Hex(TEXT("#f0c674")))
 	, Error(Hex(TEXT("#ff6b7f")))
+	, HostText(Hex(TEXT("#0c1324"))) // same value as Surface - the navy kit's current HostBadge look
 	, Member0(Hex(TEXT("#94ccff")))
 	, Member1(Hex(TEXT("#b6c4ff")))
 	, Member2(Hex(TEXT("#4edea3")))
@@ -46,6 +46,12 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultFriendRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Social/WBP_FoundryFriendRow.WBP_FoundryFriendRow_C")));
 	DefaultInviteRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Social/WBP_FoundryInviteRow.WBP_FoundryInviteRow_C")));
 	DefaultFriendMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Social/WBP_FoundryFriendMenu.WBP_FoundryFriendMenu_C")));
+	DefaultPartyNameplate = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Social/WBP_FoundryPartyNameplate.WBP_FoundryPartyNameplate_C")));
+	DefaultPauseMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryPauseMenu.WBP_FoundryPauseMenu_C")));
+	DefaultConfirmDialog = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryConfirmDialog.WBP_FoundryConfirmDialog_C")));
+	DefaultSettingsMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundrySettingsMenu.WBP_FoundrySettingsMenu_C")));
+	DefaultKeybindRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryKeybindRow.WBP_FoundryKeybindRow_C")));
+	DefaultTooltip = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryTooltip.WBP_FoundryTooltip_C")));
 }
 
 TSubclassOf<UUserWidget> UFoundryUISettings::LoadWidgetClass(const TSoftClassPtr<UUserWidget>& Soft, const TCHAR* SettingName)

@@ -41,6 +41,8 @@ class FOUNDRYFSDKUI_API UFoundrySocialDrawer : public UFoundryUIWidgetBase
 	GENERATED_BODY()
 
 public:
+	UFoundrySocialDrawer(const FObjectInitializer& ObjectInitializer);
+
 	DECLARE_MULTICAST_DELEGATE(FFoundrySocialDrawerEvent);
 	DECLARE_MULTICAST_DELEGATE_TwoParams(FFoundryWhisperRequested, const FString& /*FoundryId*/, const FString& /*DisplayName*/);
 
@@ -66,9 +68,20 @@ public:
 	 */
 	bool OpenFirstRowMenuForTesting();
 
-	/** Tells UFoundrySocialSubsystem::SetPanelOpen - call this whenever the HOST shows/hides the
-	 *  drawer, so a host that wants one call doesn't have to reach the subsystem itself. */
-	void SetOpen(bool bOpen);
+	/**
+	 * Tells UFoundrySocialSubsystem::SetPanelOpen - call this whenever the HOST shows/hides the
+	 * drawer, so a host that wants one call doesn't have to reach the subsystem itself.
+	 *
+	 * The drawer ANIMATES ITSELF by default: bAnimate=true (the default) plays DrawerAnim when the
+	 * drawer's OWN WBP binds one, else tweens its own RenderTranslation X (TweenOffset, default 448)
+	 * and RenderOpacity over 0.22s via PlayOrTween (reversible mid-flight) - opening sets Visibility
+	 * to SelfHitTestInvisible up front, closing collapses once the transition finishes
+	 * (NativeOnTransitionFinished(false)). Pass bAnimate=false when a HOST plays its own motion on
+	 * the drawer instead (e.g. its own DrawerAnim authored on a Drawer child in the HOST's own
+	 * widget tree) - the drawer then only calls SetPanelOpen and snaps straight to the end state
+	 * (visibility/opacity/translation), leaving any timed reveal/collapse to the host.
+	 */
+	void SetOpen(bool bOpen, bool bAnimate = true);
 
 	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
 	TSubclassOf<UFoundryFriendRow> FriendRowClass;
@@ -79,8 +92,10 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
 	TSubclassOf<UFoundryFriendMenu> FriendMenuClass;
 
-	/** Played by the HOST (e.g. PlayOrTween(DrawerAnim, bOpen, ...)) around opening/closing the
-	 *  drawer; the drawer itself never plays it. */
+	/** Optional - an animation authored on the drawer's OWN WBP (its own Sequencer, not the host's).
+	 *  When bound, SetOpen's PlayOrTween plays THIS instead of its code-tween fallback; the drawer
+	 *  plays it itself, on open/close, never the host. Leave unbound to use the default code tween
+	 *  (TweenOffset slide + opacity fade). */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetAnimOptional))
 	TObjectPtr<UWidgetAnimation> DrawerAnim;
 
@@ -105,6 +120,9 @@ protected:
 	virtual void NativeConstruct() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 	virtual void NativeDestruct() override;
+	/** Collapses the drawer once the CLOSE transition finishes (bForward=false); the OPEN side is
+	 *  handled up front by SetOpen itself (SelfHitTestInvisible before the tween/animation starts). */
+	virtual void NativeOnTransitionFinished(bool bForward) override;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> CloseButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UEditableTextBox> SearchBox;
@@ -114,6 +132,10 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ManageAccountButton;
 	/** "YOUR PARTY   3 / 8". */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> PartyHeaderText;
+	/** Toggles your own ready flag (SetReady); visible only while in a party. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ReadyToggleButton;
+	/** "READY" / "UNREADY" - mirrors UFoundrySocialSubsystem::IsSelfReady(). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> ReadyToggleText;
 	/** Shown only when the server reports a party cap that differs from the subsystem's default. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> CapConflictText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> PartyList;
@@ -124,14 +146,20 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> OnlineToggleButton;
 	/** "ONLINE   2". */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> OnlineHeaderText;
+	/** Rotates 0<->180 (TweenAngle) as the ONLINE section expands/collapses. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> OnlineChevron;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> OnlineList;
 	/** "No friends online right now." / "Sign in to see your friends." */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> OnlineEmptyText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> OfflineToggleButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> OfflineHeaderText;
+	/** Rotates 0<->180 (TweenAngle) as the OFFLINE section expands/collapses. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> OfflineChevron;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> OfflineList;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> BlockedToggleButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> BlockedHeaderText;
+	/** Rotates 0<->180 (TweenAngle) as the BLOCKED section expands/collapses. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> BlockedChevron;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> BlockedList;
 	/** The username field + Send button row; collapsed until ADD FRIEND opens it. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> AddFriendEntry;
@@ -157,6 +185,7 @@ private:
 	UFUNCTION() void HandleAddFriendSend();
 	UFUNCTION() void HandleAddFriendCommitted(const FText& Text, ETextCommit::Type Commit);
 	UFUNCTION() void HandleLeaveParty();
+	UFUNCTION() void HandleReadyToggle();
 	void HandleActionFailed(const FString& Action, const FString& Message);
 
 	/** Sets bDirty; the actual rebuild runs at most once per frame, from NativeTick, and only while
@@ -199,4 +228,14 @@ private:
 	FString PendingActionFoundryId;
 	FString PendingActionUsername;
 	EFoundryFriendMenuItem PendingAction = EFoundryFriendMenuItem::SendMessage;
+
+	// Row reuse: Rebuild() updates an EXISTING row in place (Setup again + reorder) instead of
+	// destroying and recreating every widget on every poll - keyed by a stable identity per list
+	// (a FoundryId for friend rows, a party id for invite rows). See the free SyncRowList helper at
+	// the top of FoundrySocialDrawer.cpp.
+	TMap<FString, TObjectPtr<UFoundryFriendRow>> PartyRowsByFoundryId;
+	TMap<FString, TObjectPtr<UFoundryFriendRow>> OnlineRowsByFoundryId;
+	TMap<FString, TObjectPtr<UFoundryFriendRow>> OfflineRowsByFoundryId;
+	TMap<FString, TObjectPtr<UFoundryFriendRow>> BlockedRowsByFoundryId;
+	TMap<FString, TObjectPtr<UFoundryInviteRow>> InviteRowsByPartyId;
 };

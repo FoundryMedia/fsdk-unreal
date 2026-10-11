@@ -42,4 +42,13 @@ namespace FoundryUITheme
 		const FLinearColor Cast[] = { P.Member0, P.Member1, P.Member2, P.Member3, P.Member4, P.Member5 };
 		return Cast[FMath::Abs(RosterIndex) % UE_ARRAY_COUNT(Cast)];
 	}
+
+	FLinearColor CompositeOver(const FLinearColor& Base, const FLinearColor& Overlay, float OverlayAlpha)
+	{
+		return FLinearColor(
+			FMath::Lerp(Base.R, Overlay.R, OverlayAlpha),
+			FMath::Lerp(Base.G, Overlay.G, OverlayAlpha),
+			FMath::Lerp(Base.B, Overlay.B, OverlayAlpha),
+			Base.A);
+	}
 }

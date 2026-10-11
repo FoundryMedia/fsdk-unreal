@@ -1,5 +1,6 @@
 #include "FoundrySocialDrawer.h"
 
+#include "Animation/WidgetAnimation.h"
 #include "Components/Button.h"
 #include "Components/EditableTextBox.h"
 #include "Components/Image.h"
@@ -9,6 +10,7 @@
 #include "Engine/World.h"
 #include "Framework/Application/IMenu.h"
 #include "Framework/Application/SlateApplication.h"
+#include "FoundryFSDKUILog.h"
 #include "FoundryInviteRow.h"
 #include "FoundrySocialSubsystem.h"
 #include "FoundryUISettings.h"
@@ -16,7 +18,75 @@
 #include "HAL/PlatformProcess.h"
 #include "TimerManager.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDKUI, Log, All);
+namespace
+{
+	// The drawer's default slide distance (slate units): the Lobby's own canvas slot for the
+	// placed-by-default drawer is 416 wide + a 32px inset from the edge it's anchored to (see
+	// GooLobbyWidget.cpp) - 448 slides it fully clear of that edge.
+	constexpr float DefaultDrawerTweenOffset = 448.0f;
+	constexpr float DefaultDrawerTweenSeconds = 0.22f;
+	constexpr float ChevronTweenSeconds = 0.15f;
+
+	/**
+	 * Reconciles RowMap/List down to exactly WantedKeys, in that order, REUSING an existing row for a
+	 * key that's still wanted instead of destroying and recreating it (the drawer rebuilds on every
+	 * poll landing - recreating every row each time flashed/lost state and was needlessly expensive).
+	 * Keys no longer wanted are removed from the panel (and the map); keys not yet present are created
+	 * via CreateRow and appended; every wanted row is then ShiftChild'd into its final index only if
+	 * it isn't already there. The caller still calls Setup() on each row afterwards (this only handles
+	 * identity/order, never content) - RowMap.Find(Key) after this call is always the right widget.
+	 */
+	template <typename TRow>
+	void SyncRowList(TMap<FString, TObjectPtr<TRow>>& RowMap, UPanelWidget* List,
+		const TArray<FString>& WantedKeys, TFunctionRef<TRow*()> CreateRow)
+	{
+		if (!List)
+		{
+			RowMap.Reset();
+			return;
+		}
+		for (auto It = RowMap.CreateIterator(); It; ++It)
+		{
+			if (!WantedKeys.Contains(It.Key()))
+			{
+				if (TRow* Row = It.Value())
+				{
+					List->RemoveChild(Row);
+				}
+				It.RemoveCurrent();
+			}
+		}
+		for (const FString& Key : WantedKeys)
+		{
+			if (!RowMap.Contains(Key))
+			{
+				if (TRow* Row = CreateRow())
+				{
+					RowMap.Add(Key, Row);
+				}
+			}
+		}
+		for (int32 i = 0; i < WantedKeys.Num(); ++i)
+		{
+			if (TObjectPtr<TRow>* Found = RowMap.Find(WantedKeys[i]))
+			{
+				if (TRow* Row = *Found)
+				{
+					if (List->GetChildIndex(Row) != i)
+					{
+						List->ShiftChild(i, Row);
+					}
+				}
+			}
+		}
+	}
+}
+
+UFoundrySocialDrawer::UFoundrySocialDrawer(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	TweenOffset = DefaultDrawerTweenOffset;
+}
 
 UFoundrySocialSubsystem* UFoundrySocialDrawer::Subsystem()
 {
@@ -59,10 +129,29 @@ void UFoundrySocialDrawer::NativeOnInitialized()
 	if (AddFriendSendButton) { AddFriendSendButton->OnClicked.AddDynamic(this, &UFoundrySocialDrawer::HandleAddFriendSend); }
 	if (AddFriendInput) { AddFriendInput->OnTextCommitted.AddDynamic(this, &UFoundrySocialDrawer::HandleAddFriendCommitted); }
 	if (LeaveButton) { LeaveButton->OnClicked.AddDynamic(this, &UFoundrySocialDrawer::HandleLeaveParty); }
+	if (ReadyToggleButton) { ReadyToggleButton->OnClicked.AddDynamic(this, &UFoundrySocialDrawer::HandleReadyToggle); }
+	// Pivot once, in place - TweenAngle then spins each chevron about its own centre instead of an
+	// edge. bOnlineExpanded starts true (see below), so OnlineChevron starts pointing UP (180).
+	if (OnlineChevron) { OnlineChevron->SetRenderTransformPivot(FVector2D(0.5f, 0.5f)); OnlineChevron->SetRenderTransformAngle(180.0f); }
+	if (OfflineChevron) { OfflineChevron->SetRenderTransformPivot(FVector2D(0.5f, 0.5f)); }
+	if (BlockedChevron) { BlockedChevron->SetRenderTransformPivot(FVector2D(0.5f, 0.5f)); }
 	Show(AddFriendEntry, false);
 	Show(AddFriendNote, false);
 	Show(OfflineList, false);
 	Show(BlockedList, false);
+
+	// A freshly created drawer starts at its HIDDEN resting pose (opacity 0, translated off by
+	// TweenOffset) instead of the WBP's default (opacity 1, translation 0) - so the very first
+	// SetOpen(true) never shows a frame of the "open" pose before the tween's first tick corrects
+	// it (TweenProgress's own default, 0, already means "hidden"; this just makes the RENDER state
+	// agree with it from the start). A host that shows the drawer open by default should call
+	// SetOpen(true, false) itself to snap it forward.
+	SetRenderOpacity(0.0f);
+	{
+		FWidgetTransform T = GetRenderTransform();
+		T.Translation.X = TweenOffset;
+		SetRenderTransform(T);
+	}
 }
 
 void UFoundrySocialDrawer::NativeConstruct()
@@ -103,11 +192,67 @@ void UFoundrySocialDrawer::NativeDestruct()
 	Super::NativeDestruct();
 }
 
-void UFoundrySocialDrawer::SetOpen(bool bOpen)
+void UFoundrySocialDrawer::SetOpen(bool bOpen, bool bAnimate)
 {
 	if (UFoundrySocialSubsystem* Sdk = Subsystem())
 	{
 		Sdk->SetPanelOpen(bOpen);
+	}
+
+	// Opening must be visible BEFORE the tween/animation starts (it animates a visible widget's
+	// opacity/translation, not a collapsed one's) - and must already SIT at the hidden pose the
+	// instant it becomes visible, or the first paint shows a frame of the resting state (opacity 1,
+	// translation 0) before the tween's first tick corrects it. NativeOnInitialized leaves a fresh
+	// drawer hidden too, but snap again here regardless of how this drawer got into this state (a
+	// host that snapped it open with bAnimate=false earlier, then closes and reopens animated).
+	if (bOpen)
+	{
+		if (bAnimate)
+		{
+			SetRenderOpacity(0.0f);
+			FWidgetTransform T = GetRenderTransform();
+			T.Translation.X = TweenOffset;
+			SetRenderTransform(T);
+		}
+		SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+
+		// The first visible frame shows real rows, not an empty list that pops in a tick later -
+		// NativeTick only rebuilds a dirty drawer that is already Visible, which would otherwise be
+		// this same tick at the earliest and the frame after at the latest.
+		if (bDirty)
+		{
+			bDirty = false;
+			Rebuild();
+		}
+	}
+
+	if (bAnimate)
+	{
+		PlayOrTween(DrawerAnim, bOpen, DefaultDrawerTweenSeconds, this);
+		return; // NativeOnTransitionFinished(false) collapses on the close side, once it lands
+	}
+
+	// No motion wanted (a host playing its OWN animation on this drawer, or reduced motion with no
+	// host animation) - snap straight to the end state; no tween, no DrawerAnim playback.
+	if (DrawerAnim)
+	{
+		StopAnimation(DrawerAnim);
+	}
+	SetRenderOpacity(bOpen ? 1.0f : 0.0f);
+	FWidgetTransform T = GetRenderTransform();
+	T.Translation.X = bOpen ? 0.0f : TweenOffset;
+	SetRenderTransform(T);
+	if (!bOpen)
+	{
+		SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+void UFoundrySocialDrawer::NativeOnTransitionFinished(bool bForward)
+{
+	if (!bForward)
+	{
+		SetVisibility(ESlateVisibility::Collapsed);
 	}
 }
 
@@ -227,47 +372,82 @@ void UFoundrySocialDrawer::Rebuild()
 	}
 	ApplyAddFriendEntry();
 
-	// -- party rows (every member - joined AND pending/invited; local + pending rows open no menu)
+	// -- party rows (every member - joined AND pending/invited; local + pending rows open no menu).
+	// Rows are REUSED (PartyRowsByFoundryId), never destroyed and recreated, so a party read that
+	// lands a moment apart from the friends-presence read it's joined against can't flash a half-
+	// updated row in between (the two-states-per-poll flicker).
 	if (PartyList)
 	{
-		PartyList->ClearChildren();
-		if (Sdk)
+		TArray<FString> WantedPartyKeys;
+		int32 RawJoinedCount = 0;
+		if (Sdk && bInParty)
 		{
-			if (bInParty)
+			for (const FFoundryPartyMember& M : Sdk->Party().Members)
 			{
-				const FFoundryParty& Party = Sdk->Party();
-				for (int32 i = 0; i < Party.Members.Num(); ++i)
+				WantedPartyKeys.Add(M.FoundryId);
+				if (M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase))
 				{
-					const FFoundryPartyMember& M = Party.Members[i];
-					const bool bJoinedMember = M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
-					const bool bLocal = !Sdk->LocalFoundryId().IsEmpty() && M.FoundryId == Sdk->LocalFoundryId();
-					const bool bHost = !Party.LeaderFoundryId.IsEmpty() && M.FoundryId == Party.LeaderFoundryId;
+					++RawJoinedCount;
+				}
+			}
+		}
+		else if (Sdk)
+		{
+			// Not in a party: a single "you" row - key on the local foundry id, or a fixed sentinel
+			// when signed out (so the dev-fixture / signed-out state still gets a stable key).
+			WantedPartyKeys.Add(Sdk->LocalFoundryId().IsEmpty() ? TEXT("__me__") : Sdk->LocalFoundryId());
+		}
+		SyncRowList<UFoundryFriendRow>(PartyRowsByFoundryId, PartyList, WantedPartyKeys,
+			[this]() { return AddFriendRow(PartyList); });
 
-					FFoundryFriend F;
-					F.FoundryId = M.FoundryId;
-					F.DisplayName = M.DisplayName.IsEmpty() ? M.Username : M.DisplayName;
-					F.Username = M.Username;
-					// The party read carries no presence; the friends list does - join them by id.
-					for (const FFoundryFriend& Fr : Sdk->Friends())
-					{
-						if (Fr.FoundryId == M.FoundryId)
-						{
-							F.Presence = Fr.Presence;
-							F.PresenceGame = Fr.PresenceGame;
-							break;
-						}
-					}
-					if (bLocal)
-					{
-						F.Presence = TEXT("online");
-					}
+		if (Sdk && bInParty)
+		{
+			const FFoundryParty& Party = Sdk->Party();
+			for (int32 i = 0; i < Party.Members.Num(); ++i)
+			{
+				const FFoundryPartyMember& M = Party.Members[i];
+				const bool bLocal = !Sdk->LocalFoundryId().IsEmpty() && M.FoundryId == Sdk->LocalFoundryId();
+				// The local player is always joined from THEIR OWN perspective - never render your
+				// own row as "Invited - not joined" off a momentarily-stale/transitional party read.
+				const bool bJoinedMember = bLocal || M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
+				bool bHost = !Party.LeaderFoundryId.IsEmpty() && M.FoundryId == Party.LeaderFoundryId;
+				if (Party.LeaderFoundryId.IsEmpty() && bLocal && RawJoinedCount == 1)
+				{
+					// Leader not reported yet (transitional) and you're the party's one truly-joined
+					// member - you're obviously the host.
+					bHost = true;
+				}
 
-					if (UFoundryFriendRow* Row = AddFriendRow(PartyList))
+				FFoundryFriend F;
+				F.FoundryId = M.FoundryId;
+				F.DisplayName = M.DisplayName.IsEmpty() ? M.Username : M.DisplayName;
+				F.Username = M.Username;
+				// The party read carries no presence; the friends list does - join them by id.
+				for (const FFoundryFriend& Fr : Sdk->Friends())
+				{
+					if (Fr.FoundryId == M.FoundryId)
+					{
+						F.Presence = Fr.Presence;
+						F.PresenceGame = Fr.PresenceGame;
+						break;
+					}
+				}
+				if (bLocal)
+				{
+					F.Presence = TEXT("online");
+				}
+
+				if (TObjectPtr<UFoundryFriendRow>* Found = PartyRowsByFoundryId.Find(M.FoundryId))
+				{
+					if (UFoundryFriendRow* Row = *Found)
 					{
 						const FString Status = bJoinedMember ? FString() : TEXT("Invited - not joined");
 						Row->Setup(F, EFoundryFriendRowKind::Party, bHost, bLocal, bJoinedMember,
-							GetMemberTint(F.FoundryId, i, bLocal), Status);
-						// The local player's own row and a pending-invited row never open a menu.
+							GetMemberTint(F.FoundryId, i, bLocal), Status, M.bReady);
+						// The local player's own row and a pending-invited row never open a menu -
+						// cleared first since this row may be REUSED from a prior poll where the
+						// condition was different (e.g. an invited member just joined).
+						Row->OnContextMenuRequested.RemoveAll(this);
 						if (!bLocal && bJoinedMember)
 						{
 							Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos)
@@ -278,33 +458,57 @@ void UFoundrySocialDrawer::Rebuild()
 					}
 				}
 			}
-			else if (UFoundryFriendRow* Row = AddFriendRow(PartyList))
+		}
+		else if (Sdk)
+		{
+			const FString MeKey = Sdk->LocalFoundryId().IsEmpty() ? TEXT("__me__") : Sdk->LocalFoundryId();
+			if (TObjectPtr<UFoundryFriendRow>* Found = PartyRowsByFoundryId.Find(MeKey))
 			{
-				FFoundryFriend Me;
-				Me.FoundryId = Sdk->LocalFoundryId();
-				Me.DisplayName = bSignedIn ? Sdk->LocalDisplayName() : TEXT("Not signed in");
-				Me.Username = Sdk->LocalUsername();
-				Me.Presence = bSignedIn ? TEXT("online") : TEXT("offline");
-				Row->Setup(Me, EFoundryFriendRowKind::Party, true, true, true, GetMemberTint(Me.FoundryId, 0, true), FString());
+				if (UFoundryFriendRow* Row = *Found)
+				{
+					FFoundryFriend Me;
+					Me.FoundryId = Sdk->LocalFoundryId();
+					Me.DisplayName = bSignedIn ? Sdk->LocalDisplayName() : TEXT("Not signed in");
+					Me.Username = Sdk->LocalUsername();
+					Me.Presence = bSignedIn ? TEXT("online") : TEXT("offline");
+					Row->Setup(Me, EFoundryFriendRowKind::Party, true, true, true, GetMemberTint(Me.FoundryId, 0, true), FString());
+					Row->OnContextMenuRequested.RemoveAll(this); // solo row never opens a menu
+				}
 			}
 		}
 	}
 
-	// -- incoming party invites
+	// -- incoming party invites (reused by party id, same reuse pattern as friend rows)
 	const int32 NumInvites = Sdk ? Sdk->Invites().Num() : 0;
 	Show(InvitesSection, NumInvites > 0);
 	if (InvitesList)
 	{
-		InvitesList->ClearChildren();
+		TArray<FString> WantedInviteKeys;
 		if (Sdk && InviteRowClass)
 		{
 			for (const FFoundryParty& Inv : Sdk->Invites())
 			{
-				UFoundryInviteRow* Row = CreateWidget<UFoundryInviteRow>(this, InviteRowClass);
-				InvitesList->AddChild(Row);
-				Row->Setup(Inv.LeaderDisplayName, Inv.PartyId);
-				Row->OnAccept.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->AcceptInvite(Id); } });
-				Row->OnDecline.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->DeclineInvite(Id); } });
+				WantedInviteKeys.Add(Inv.PartyId);
+			}
+		}
+		SyncRowList<UFoundryInviteRow>(InviteRowsByPartyId, InvitesList, WantedInviteKeys,
+			[this]() { return InviteRowClass ? CreateWidget<UFoundryInviteRow>(this, InviteRowClass) : nullptr; });
+
+		if (Sdk)
+		{
+			for (const FFoundryParty& Inv : Sdk->Invites())
+			{
+				if (TObjectPtr<UFoundryInviteRow>* Found = InviteRowsByPartyId.Find(Inv.PartyId))
+				{
+					if (UFoundryInviteRow* Row = *Found)
+					{
+						Row->Setup(Inv.LeaderDisplayName, Inv.PartyId);
+						Row->OnAccept.RemoveAll(this);
+						Row->OnDecline.RemoveAll(this);
+						Row->OnAccept.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->AcceptInvite(Id); } });
+						Row->OnDecline.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->DeclineInvite(Id); } });
+					}
+				}
 			}
 		}
 	}
@@ -313,14 +517,12 @@ void UFoundrySocialDrawer::Rebuild()
 	SetText(RequestsNote, PendingRequests > 0 ? FString::Printf(TEXT("%d friend request%s waiting - accept them in the Foundry launcher."), PendingRequests, PendingRequests == 1 ? TEXT("") : TEXT("s")) : FString());
 	Show(RequestsNote, PendingRequests > 0);
 
-	// -- online / offline friends (search filters both; blocked is never filtered)
+	// -- online / offline friends (search filters both; blocked is never filtered) - reused by id
 	int32 OnlineCount = 0;
 	int32 OfflineCount = 0;
 	int32 OnlineListed = 0;
-	int32 OnlineTintIndex = 0;
-	int32 OfflineTintIndex = 0;
-	if (OnlineList) { OnlineList->ClearChildren(); }
-	if (OfflineList) { OfflineList->ClearChildren(); }
+	TArray<FString> WantedOnlineKeys;
+	TArray<FString> WantedOfflineKeys;
 	if (Sdk)
 	{
 		for (const FFoundryFriend& F : Sdk->Friends())
@@ -332,13 +534,7 @@ void UFoundrySocialDrawer::Rebuild()
 				++OnlineCount;
 				if (bOnlineExpanded && bMatchesFilter)
 				{
-					if (UFoundryFriendRow* Row = AddFriendRow(OnlineList))
-					{
-						const FString Status = F.PresenceGame.IsEmpty() ? FString() : FString::Printf(TEXT("Playing %s"), *F.PresenceGame);
-						Row->Setup(F, EFoundryFriendRowKind::Online, false, false, true, GetMemberTint(F.FoundryId, OnlineTintIndex++, false), Status);
-						Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos) { OpenFriendMenu(R, Pos); });
-						++OnlineListed;
-					}
+					WantedOnlineKeys.Add(F.FoundryId);
 				}
 			}
 			else
@@ -346,9 +542,48 @@ void UFoundrySocialDrawer::Rebuild()
 				++OfflineCount;
 				if (bOfflineExpanded && bMatchesFilter)
 				{
-					if (UFoundryFriendRow* Row = AddFriendRow(OfflineList))
+					WantedOfflineKeys.Add(F.FoundryId);
+				}
+			}
+		}
+	}
+	SyncRowList<UFoundryFriendRow>(OnlineRowsByFoundryId, OnlineList, WantedOnlineKeys,
+		[this]() { return AddFriendRow(OnlineList); });
+	SyncRowList<UFoundryFriendRow>(OfflineRowsByFoundryId, OfflineList, WantedOfflineKeys,
+		[this]() { return AddFriendRow(OfflineList); });
+	if (Sdk)
+	{
+		int32 OnlineTintIndex = 0;
+		int32 OfflineTintIndex = 0;
+		for (const FFoundryFriend& F : Sdk->Friends())
+		{
+			const bool bMatchesFilter = Filter.IsEmpty() || F.DisplayName.Contains(Filter) || F.Username.Contains(Filter);
+			const bool bOnline = !(F.Presence == TEXT("offline") || F.Presence.IsEmpty());
+			if (bOnline)
+			{
+				if (bOnlineExpanded && bMatchesFilter)
+				{
+					if (TObjectPtr<UFoundryFriendRow>* Found = OnlineRowsByFoundryId.Find(F.FoundryId))
+					{
+						if (UFoundryFriendRow* Row = *Found)
+						{
+							const FString Status = F.PresenceGame.IsEmpty() ? FString() : FString::Printf(TEXT("Playing %s"), *F.PresenceGame);
+							Row->Setup(F, EFoundryFriendRowKind::Online, false, false, true, GetMemberTint(F.FoundryId, OnlineTintIndex++, false), Status);
+							Row->OnContextMenuRequested.RemoveAll(this);
+							Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos) { OpenFriendMenu(R, Pos); });
+							++OnlineListed;
+						}
+					}
+				}
+			}
+			else if (bOfflineExpanded && bMatchesFilter)
+			{
+				if (TObjectPtr<UFoundryFriendRow>* Found = OfflineRowsByFoundryId.Find(F.FoundryId))
+				{
+					if (UFoundryFriendRow* Row = *Found)
 					{
 						Row->Setup(F, EFoundryFriendRowKind::Offline, false, false, true, GetMemberTint(F.FoundryId, OfflineTintIndex++, false), FString());
+						Row->OnContextMenuRequested.RemoveAll(this);
 						Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos) { OpenFriendMenu(R, Pos); });
 					}
 				}
@@ -362,19 +597,29 @@ void UFoundrySocialDrawer::Rebuild()
 	SetText(OfflineHeaderText, FString::Printf(TEXT("OFFLINE   %d"), OfflineCount));
 	Show(OfflineList, bOfflineExpanded);
 
-	// -- blocked (never filtered)
+	// -- blocked (never filtered) - reused by id
 	const int32 BlockedCount = Sdk ? Sdk->Blocked().Num() : 0;
 	SetText(BlockedHeaderText, FString::Printf(TEXT("BLOCKED   %d"), BlockedCount));
-	if (BlockedList)
+	TArray<FString> WantedBlockedKeys;
+	if (Sdk && bBlockedExpanded)
 	{
-		BlockedList->ClearChildren();
-		if (Sdk && bBlockedExpanded)
+		for (const FFoundryFriend& F : Sdk->Blocked())
 		{
-			for (const FFoundryFriend& F : Sdk->Blocked())
+			WantedBlockedKeys.Add(F.FoundryId);
+		}
+	}
+	SyncRowList<UFoundryFriendRow>(BlockedRowsByFoundryId, BlockedList, WantedBlockedKeys,
+		[this]() { return AddFriendRow(BlockedList); });
+	if (Sdk && bBlockedExpanded)
+	{
+		for (const FFoundryFriend& F : Sdk->Blocked())
+		{
+			if (TObjectPtr<UFoundryFriendRow>* Found = BlockedRowsByFoundryId.Find(F.FoundryId))
 			{
-				if (UFoundryFriendRow* Row = AddFriendRow(BlockedList))
+				if (UFoundryFriendRow* Row = *Found)
 				{
 					Row->Setup(F, EFoundryFriendRowKind::Blocked, false, false, true, GetMemberTint(F.FoundryId, 0, false), FString());
+					Row->OnContextMenuRequested.RemoveAll(this);
 					Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos) { OpenFriendMenu(R, Pos); });
 				}
 			}
@@ -383,6 +628,11 @@ void UFoundrySocialDrawer::Rebuild()
 	Show(BlockedList, bBlockedExpanded);
 
 	Show(LeaveButton, bInParty && !bFixture, true);
+
+	// -- ready toggle (visible only while in a party; mirrors your own ready flag)
+	const bool bSelfReady = Sdk && !bFixture && Sdk->IsSelfReady();
+	SetText(ReadyToggleText, bSelfReady ? TEXT("UNREADY") : TEXT("READY"));
+	Show(ReadyToggleButton, bInParty && !bFixture, true);
 }
 
 void UFoundrySocialDrawer::ApplyAddFriendEntry()
@@ -413,6 +663,10 @@ void UFoundrySocialDrawer::HandleSearchChanged(const FText& Text)
 void UFoundrySocialDrawer::HandleToggleOnline()
 {
 	bOnlineExpanded = !bOnlineExpanded;
+	if (OnlineChevron)
+	{
+		TweenAngle(OnlineChevron, bOnlineExpanded ? 0.0f : 180.0f, bOnlineExpanded ? 180.0f : 0.0f, ChevronTweenSeconds);
+	}
 	OnOnlineExpandedChanged(bOnlineExpanded);
 	MarkDirty();
 }
@@ -420,6 +674,10 @@ void UFoundrySocialDrawer::HandleToggleOnline()
 void UFoundrySocialDrawer::HandleToggleOffline()
 {
 	bOfflineExpanded = !bOfflineExpanded;
+	if (OfflineChevron)
+	{
+		TweenAngle(OfflineChevron, bOfflineExpanded ? 0.0f : 180.0f, bOfflineExpanded ? 180.0f : 0.0f, ChevronTweenSeconds);
+	}
 	OnOfflineExpandedChanged(bOfflineExpanded);
 	MarkDirty();
 }
@@ -427,6 +685,10 @@ void UFoundrySocialDrawer::HandleToggleOffline()
 void UFoundrySocialDrawer::HandleToggleBlocked()
 {
 	bBlockedExpanded = !bBlockedExpanded;
+	if (BlockedChevron)
+	{
+		TweenAngle(BlockedChevron, bBlockedExpanded ? 0.0f : 180.0f, bBlockedExpanded ? 180.0f : 0.0f, ChevronTweenSeconds);
+	}
 	OnBlockedExpandedChanged(bBlockedExpanded);
 	MarkDirty();
 }
@@ -490,6 +752,14 @@ void UFoundrySocialDrawer::HandleLeaveParty()
 	}
 }
 
+void UFoundrySocialDrawer::HandleReadyToggle()
+{
+	if (UFoundrySocialSubsystem* Sdk = Subsystem())
+	{
+		Sdk->SetReady(!Sdk->IsSelfReady());
+	}
+}
+
 // -- context menu --------------------------------------------------------------------------------------
 
 void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2D& ScreenPosition)
@@ -521,8 +791,35 @@ void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2
 	const bool bCanInvite = bSignedIn && !bFull && bLocalLeader && !bAlreadyInParty;
 	const bool bCanRequestJoin = bSignedIn && Sdk && !Sdk->HasParty();
 
+	// Same precedence Setup applies when it folds Row->Kind into the enabled check (!bOnline also
+	// disables Invite there) - checked here too so the reason matches why it's actually disabled.
+	FString InviteDisabledReason;
+	if (!bCanInvite || Row->Kind != EFoundryFriendRowKind::Online)
+	{
+		if (Row->Kind == EFoundryFriendRowKind::Offline)
+		{
+			InviteDisabledReason = TEXT("They're offline.");
+		}
+		else if (!bSignedIn)
+		{
+			InviteDisabledReason = TEXT("Sign in to invite friends.");
+		}
+		else if (bAlreadyInParty)
+		{
+			InviteDisabledReason = TEXT("They're already in your party.");
+		}
+		else if (bFull)
+		{
+			InviteDisabledReason = TEXT("Party is full.");
+		}
+		else if (!bLocalLeader)
+		{
+			InviteDisabledReason = TEXT("Only the host can invite.");
+		}
+	}
+
 	ActiveMenu = CreateWidget<UFoundryFriendMenu>(this, FriendMenuClass);
-	ActiveMenu->Setup(Row->Kind, Row->Friend.DisplayName, bCanInvite, bCanRequestJoin);
+	ActiveMenu->Setup(Row->Kind, Row->Friend.DisplayName, bCanInvite, InviteDisabledReason, bCanRequestJoin);
 	ActiveMenu->OnItem.AddUObject(this, &UFoundrySocialDrawer::HandleMenuItem);
 	ActiveMenu->OnConfirm.AddUObject(this, &UFoundrySocialDrawer::HandleMenuConfirm);
 	ActiveMenu->OnCancel.AddUObject(this, &UFoundrySocialDrawer::HandleMenuCancel);
@@ -552,6 +849,10 @@ void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2
 	{
 		ActiveMenuHandle = Menu;
 		Menu->GetOnMenuDismissed().AddUObject(this, &UFoundrySocialDrawer::HandleMenuDismissed);
+		// The engine draws its dark Menu.Background box under every pushed menu - black corners
+		// around the rounded menu panel until it is hidden (see HideEngineMenuChrome).
+		const int32 Hidden = HideEngineMenuChrome(Menu);
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[SocialDrawer] engine menu chrome hidden: %d image(s)"), Hidden);
 	}
 }
 

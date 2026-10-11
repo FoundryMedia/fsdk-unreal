@@ -47,7 +47,11 @@ public:
 	/** Cancel in the confirm step. */
 	FFoundryFriendMenuEvent OnCancel;
 
-	void Setup(EFoundryFriendRowKind InKind, const FString& InName, bool bCanInvite, bool bCanRequestJoin);
+	/** InInviteDisabledReason is shown as InviteButton's tooltip whenever Invite ends up disabled
+	 *  (offline target, or !bCanInvite) - the caller (the drawer) computes it from whichever of
+	 *  party-full / host-only / already-in-party / not-signed-in applies; empty when enabled.
+	 *  RequestJoinButton's own reason is still computed in here, same as before. */
+	void Setup(EFoundryFriendRowKind InKind, const FString& InName, bool bCanInvite, const FString& InInviteDisabledReason, bool bCanRequestJoin);
 
 	/** Collapses ItemsPanel, shows ConfirmPanel with Text + a ButtonLabel'd ConfirmButton. */
 	void ShowConfirm(const FString& Text, const FString& ButtonLabel);

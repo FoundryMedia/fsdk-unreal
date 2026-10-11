@@ -29,9 +29,19 @@ public class FoundryFSDKUI : ModuleRules
 		// PRIVATE dependency) - that is enough to COMPILE against EKeys (UFoundryFriendRow's
 		// right-click detection), but LINKING needs InputCore listed here too, or the build fails
 		// LNK2019 on EKeys::RightMouseButton.
+		//
+		// EnhancedInput is private too: UFoundrySettingsMenu's Controls section is the only
+		// consumer (UEnhancedInputLocalPlayerSubsystem / UEnhancedInputUserSettings), and no PUBLIC
+		// kit header exposes a complete Enhanced Input type (UFoundryUISettings::RebindableContexts
+		// only needs the UInputMappingContext forward declaration already in that header). GameplayTags
+		// is EnhancedInput's own PRIVATE dependency (FMapPlayerKeyArgs/FGameplayTagContainer are only
+		// reachable through its public headers) - listed explicitly here too, same InputCore lesson
+		// above: a transitively-visible header is not the same as a linkable/always-resolvable one.
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"InputCore",
+			"EnhancedInput",
+			"GameplayTags",
 		});
 	}
 }
