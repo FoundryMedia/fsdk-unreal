@@ -299,8 +299,8 @@ A game that wants to own the moment of sign-in (a splash first, say) passes
 `FindMatchAuthenticated(Queue, AttributesJson)` runs the whole player loop on the session from
 3.1: submit a ticket, poll, resolve the connection, and `ClientTravel` to
 `<ip>:<port>?token=<matchToken>`. You never touch the token or the endpoint. Phases arrive on
-`OnFMMSStatus`: `Authenticating → Requesting → Searching → Connecting → Traveling`, or `Failed`
-with a message.
+`OnFMMSStatus`: `Authenticating → Requesting → Searching → (WaitingForCapacity) → Connecting →
+Traveling`, or `Failed` with a message.
 
 - `Queue` is the queue **name** from the console: `<game-slug>/<mode>` (Conquest's is
   `conquest/classic`). The full FRN also works.
@@ -314,6 +314,54 @@ with a message.
 The lower-level calls (`InitializeClient` / `Authenticate` / `RequestMatch` / `PollMatch` /
 `GetConnection` on `UFoundryFSDKSubsystem`) are still public for games that want to own the
 loop; `UFMMSSubsystem` is the recommended surface.
+
+#### Matchmaking wait — the server tells you *why*, not just "still searching"
+
+While a ticket is `QUEUED`, fid attaches a `wait` object to every poll response (`fsdk_ticket_wait`
+in the C ABI, `FFoundryTicketWait` on `UFoundryFSDKSubsystem::OnPollMatchComplete`):
+
+| `EFoundryWaitReason` | Meaning | `UFMMSSubsystem` phase |
+|---|---|---|
+| `Searching` | Capacity exists; actively matchmaking. | `Searching` |
+| `CapacityStarting` | A scale-up is in flight for this queue's fleet. | `WaitingForCapacity` |
+| `NoCapacity` | Fleet at its ceiling; no scale-up left. | `WaitingForCapacity` |
+| `NoFleet` | No fleet hosts this game at all. | `Failed` |
+
+`FFoundryTicketWait` also carries `EstimateSeconds` (CapacityStarting's remaining-boot estimate),
+`RetryAfterSeconds` (how soon to poll again — the server, not a fixed 2s loop, sets the cadence
+from here on), and `ExpiresAtUnix` (the ticket's own TTL). `UFMMSSubsystem` re-arms its poll timer
+with `RetryAfterSeconds` (clamped 2–60s) after every poll, and gives up with "No match found in
+time. Try again." once that TTL (or 25 minutes, if the server never reports one) passes — a search
+never waits on a dead ticket forever.
+
+A poll that arrives sooner than the server's own `RetryAfterSeconds` answers **429 / RateLimited**,
+not a failure — `UFMMSSubsystem` just re-arms with the refreshed `RetryAfterSeconds` (recovered from
+the response's `Retry-After` header via the optional `fsdk_set_http_retry_after_fn` seam) and keeps
+waiting.
+
+Every player-facing sentence — for a wait reason OR a terminal failure — comes from ONE table,
+`FoundryMatchmakingCopy::ForWait(Reason, EstimateSeconds)` / `::ForResult(Result)` (plus `::Expired()`
+for the ticket-TTL/status-Expired case): no numeric result or wait-reason code ever reaches the
+player, only the log line (`UE_LOG(LogFMMS, ...)`) does. Default English copy:
+
+| Case | Default text |
+|---|---|
+| `Searching` | "Searching for players..." |
+| `CapacityStarting` | "Low traffic right now - we're starting a server for you. This usually takes up to 15 minutes. Keep this open or check back later." *(+ "(~N min left)" once an estimate is known)* |
+| `NoCapacity` | "All servers are full right now. We'll keep trying - or check back in a few minutes." |
+| `NoFleet` | "This game has no servers in your region yet." |
+| ticket expired / TTL ceiling | "No match found in time. Try again." |
+| `Network` / `Timeout` | "Can't reach matchmaking. Check your connection and try again." |
+| `RateLimited` (on submit) | "Slow down - try again in a moment." |
+| `Unauthorized` / `NotAuthenticated` | "Sign in again to play online." |
+| `Unavailable` (503 at submit, before any ticket) | "No game servers are available for this queue right now. Please try again shortly." |
+| anything else | "Matchmaking hit a snag. Try again." |
+
+Override any of these per game: `UFoundryUISettings` (the `FoundryFSDKUI` module) has
+`MatchmakingWaitCopyOverrides` / `MatchmakingResultCopyOverrides` (Project Settings → Game →
+Foundry UI → Matchmaking), pushed into `FoundryMatchmakingCopy` once at module startup. A game
+that never links `FoundryFSDKUI` still gets the default copy — `FoundryFSDKSubsystem`/`FMMSSubsystem`
+never depend on the UI module.
 
 ### 3.3 Admit the player — the server half
 

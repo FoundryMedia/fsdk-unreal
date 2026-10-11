@@ -2,6 +2,7 @@
 
 #include "Blueprint/UserWidget.h"
 #include "FoundryFSDKUILog.h"
+#include "FoundryMatchmakingCopy.h"
 #include "UObject/SoftObjectPath.h"
 
 namespace
@@ -52,6 +53,23 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultSettingsMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundrySettingsMenu.WBP_FoundrySettingsMenu_C")));
 	DefaultKeybindRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryKeybindRow.WBP_FoundryKeybindRow_C")));
 	DefaultTooltip = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryTooltip.WBP_FoundryTooltip_C")));
+}
+
+void UFoundryUISettings::ApplyMatchmakingCopyOverrides()
+{
+	const UFoundryUISettings* Settings = Get();
+	if (Settings == nullptr)
+	{
+		return;
+	}
+	for (const TPair<EFoundryWaitReason, FText>& Pair : Settings->MatchmakingWaitCopyOverrides)
+	{
+		FoundryMatchmakingCopy::SetWaitOverride(Pair.Key, Pair.Value);
+	}
+	for (const TPair<EFoundryFsdkResult, FText>& Pair : Settings->MatchmakingResultCopyOverrides)
+	{
+		FoundryMatchmakingCopy::SetResultOverride(Pair.Key, Pair.Value);
+	}
 }
 
 TSubclassOf<UUserWidget> UFoundryUISettings::LoadWidgetClass(const TSoftClassPtr<UUserWidget>& Soft, const TCHAR* SettingName)

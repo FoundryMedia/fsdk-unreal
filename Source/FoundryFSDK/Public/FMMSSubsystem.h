@@ -16,6 +16,10 @@ enum class EFMMSPhase : uint8
 	Authenticating UMETA(DisplayName = "Authenticating"),
 	Requesting     UMETA(DisplayName = "Requesting Match"),
 	Searching      UMETA(DisplayName = "Searching"),
+	/** The server told us why the wait continues (no free capacity / a scale-up is in flight) - the
+	 *  ticket stays alive, polling continues at the server's own cadence. See
+	 *  FFoundryTicketWait / EFoundryWaitReason (S5 "matchmaking wait"). */
+	WaitingForCapacity UMETA(DisplayName = "Waiting For Capacity"),
 	Connecting     UMETA(DisplayName = "Connecting"),
 	Traveling      UMETA(DisplayName = "Joining Server"),
 	Failed         UMETA(DisplayName = "Failed"),
@@ -111,20 +115,33 @@ public:
 private:
 	UFUNCTION() void HandleAuth(EFoundryFsdkResult Result);
 	UFUNCTION() void HandleRequest(EFoundryFsdkResult Result);
-	UFUNCTION() void HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status);
+	UFUNCTION() void HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status, FFoundryTicketWait Wait);
 	UFUNCTION() void HandleConnection(EFoundryFsdkResult Result, FFoundryConnection Connection);
 	UFUNCTION() void HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat);
 
 	void Poll();
-	void StartPolling();
+	/** (Re)arm the poll timer as a ONE-SHOT, IntervalSeconds from now - every poll re-arms its own
+	 *  next tick (S5: the server dictates the cadence via FFoundryTicketWait::RetryAfterSeconds), so
+	 *  there is no looping timer to fall back on. */
+	void StartPolling(float IntervalSeconds);
 	void StopPolling();
 	void AbandonReconnectSeat();
 	void SetPhase(EFMMSPhase NewPhase, const FString& Message);
 	void Fail(const FString& Message);
+	/** Fail() with the player text resolved from FoundryMatchmakingCopy::ForResult(Result) - logs the
+	 *  numeric Result separately (never in the player-facing string). */
+	void FailWithResult(EFoundryFsdkResult Result);
 	UFoundryFSDKSubsystem* Fsdk() const;
 	void BindOnce(UFoundryFSDKSubsystem* Sdk);
 	/** Anti-spam: true if enough time has passed since the last attempt (and stamps it); else false. */
 	bool ThrottleFindMatch();
+	/** Clamp a server-told (or fallback) retry interval to a sane range - never hammer fid, never go
+	 *  quiet for minutes on a bad/absurd value. */
+	static float ClampPollInterval(int32 RetryAfterSeconds);
+	/** The client-side wait ceiling (S5): true once we've been waiting on this ticket past its known
+	 *  expiresAt, or past NoExpiryWaitCeilingSeconds when that was never reported - never wait on a
+	 *  QUEUED ticket forever, even while the server keeps answering QUEUED. */
+	bool HasExceededWaitCeiling() const;
 
 	EFMMSPhase Phase = EFMMSPhase::Idle;
 	FString PendingQueue;
@@ -140,7 +157,22 @@ private:
 	// "no servers", returns to Idle/Failed, from which a re-click would otherwise submit again).
 	double LastFindMatchSeconds = 0.0;
 
+	// -- S5 client-side wait ceiling --
+	// Wall-clock (FPlatformTime::Seconds) when the CURRENT search started - the fallback ceiling
+	// when the ticket has never reported an expiresAt. Set in HandleRequest's success branch, read
+	// by HasExceededWaitCeiling.
+	double SearchStartedSeconds = 0.0;
+	/** Last-known ticket TTL (Unix seconds, UTC) from FFoundryTicketWait::ExpiresAtUnix; 0 = unknown
+	 *  (fall back to SearchStartedSeconds + NoExpiryWaitCeilingSeconds). */
+	int64 TicketExpiresAtUnix = 0;
+
 	static constexpr float PollIntervalSeconds = 2.0f;
 	/** Minimum seconds between FindMatch attempts; sooner re-clicks are ignored (anti-spam). */
 	static constexpr double FindMatchMinIntervalSeconds = 2.0;
+	/** Poll re-arm clamp (S5): never faster than 2s (anti-spam toward fid), never slower than 60s
+	 *  (a player must never look abandoned for minutes between pings). */
+	static constexpr int32 MinPollIntervalSeconds = 2;
+	static constexpr int32 MaxPollIntervalSeconds = 60;
+	/** The client-side wait ceiling when the ticket has never reported an expiresAt (25 minutes). */
+	static constexpr double NoExpiryWaitCeilingSeconds = 1500.0;
 };

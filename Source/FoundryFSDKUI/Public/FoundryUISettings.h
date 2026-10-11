@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
+#include "FoundryFSDKSubsystem.h" // EFoundryFsdkResult / EFoundryWaitReason (Matchmaking copy overrides)
 #include "Templates/SubclassOf.h"
 #include "UObject/SoftObjectPtr.h"
 #include "FoundryUISettings.generated.h"
@@ -185,7 +186,30 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI")
 	FFoundryUIPalette Palette;
 
+	/**
+	 * S5 "matchmaking wait": player-facing copy overrides, keyed by the server-told wait reason
+	 * (while a ticket is QUEUED) - replaces FoundryMatchmakingCopy::ForWait's base sentence for that
+	 * reason (the "~N min left" suffix is still appended by code when EstimateSeconds is known). An
+	 * empty entry (or no entry) falls back to the kit's default English copy. Pushed into
+	 * FoundryMatchmakingCopy once at FoundryFSDKUI module startup
+	 * (ApplyMatchmakingCopyOverrides, called from FFoundryFSDKUIModule::StartupModule) - the core
+	 * FoundryFSDK module never references UFoundryUISettings directly (see FoundryFSDKUI.Build.cs:
+	 * UI modules depend on the core, never the reverse).
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI|Matchmaking")
+	TMap<EFoundryWaitReason, FText> MatchmakingWaitCopyOverrides;
+
+	/** Same, keyed by the terminal fsdk result a matchmaking Fail() reports. */
+	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI|Matchmaking")
+	TMap<EFoundryFsdkResult, FText> MatchmakingResultCopyOverrides;
+
 	static const UFoundryUISettings* Get() { return GetDefault<UFoundryUISettings>(); }
+
+	/** Push MatchmakingWaitCopyOverrides / MatchmakingResultCopyOverrides into
+	 *  FoundryMatchmakingCopy. Call once, at startup (see FFoundryFSDKUIModule::StartupModule) -
+	 *  before any matchmaking flow runs (FoundryMatchmakingCopy's override hooks are "set once",
+	 *  not thread-safe for repeated calls). */
+	static void ApplyMatchmakingCopyOverrides();
 
 	/** Synchronous load of a soft widget class. Null (and a log line naming the setting) when unset
 	 *  or missing. */

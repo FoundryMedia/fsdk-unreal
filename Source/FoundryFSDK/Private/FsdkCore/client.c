@@ -21,6 +21,7 @@
 
 #include "fsdk_internal.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,12 @@ static fsdk_result http_status_to_result(long status) {
         /* No server capacity for the queue - the search can never succeed right now, so the caller
          * should stop searching and surface "no servers, try later" rather than poll forever. */
         return FSDK_ERR_UNAVAILABLE;
+    }
+    if (status == 429) {
+        /* Polled sooner than the server's own retryAfterSeconds (the S5 poll backstop) - "keep
+         * waiting, poll later", never a failure. fsdk_poll_match recovers the real wait interval
+         * via the optional fsdk_set_http_retry_after_fn seam when the host installed one. */
+        return FSDK_ERR_RATE_LIMITED;
     }
     return FSDK_ERR_PROTOCOL;
 }
@@ -113,6 +120,149 @@ static int json_extract_int(const char* body, const char* key, long* out) {
         return 0;
     }
     *out = n;
+    return 1;
+}
+
+/* Extract a nested JSON OBJECT field's raw text (brace-matched, string-aware so
+ * a quoted "}" inside a value never ends the walk early) into out (bounded,
+ * NUL-terminated, includes the braces). Returns 1 on success, 0 if the key is
+ * absent / not an object / the object overflows out_sz - used for the S5
+ * matchmaking-wait "wait": {...} sub-object (see wait_reason_from_string /
+ * fsdk_poll_match below). */
+static int json_extract_object(const char* body, const char* key, char* out, size_t out_sz) {
+    const char* v = json_value_after(body, key);
+    if (out_sz > 0) {
+        out[0] = '\0';
+    }
+    if (v == NULL || *v != '{') {
+        return 0;
+    }
+    int depth = 0;
+    int in_string = 0;
+    const char* p = v;
+    for (; *p != '\0'; p++) {
+        char c = *p;
+        if (in_string) {
+            if (c == '\\' && p[1] != '\0') {
+                p++;
+            } else if (c == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = 1;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                size_t n = (size_t)(p - v) + 1;
+                if (n + 1 > out_sz) {
+                    return 0; /* oversized object - never a partial/garbled copy */
+                }
+                memcpy(out, v, n);
+                out[n] = '\0';
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Map a server "wait.reason" string to fsdk_wait_reason. Anything unrecognized
+ * (incl. a future reason an older SDK doesn't know yet) reads as SEARCHING -
+ * never invent a harsher wait than the server actually said. */
+static int wait_reason_from_string(const char* s) {
+    if (s == NULL) {
+        return FSDK_WAIT_SEARCHING;
+    }
+    if (strcmp(s, "CAPACITY_STARTING") == 0) {
+        return FSDK_WAIT_CAPACITY_STARTING;
+    }
+    if (strcmp(s, "NO_CAPACITY") == 0) {
+        return FSDK_WAIT_NO_CAPACITY;
+    }
+    if (strcmp(s, "NO_FLEET") == 0) {
+        return FSDK_WAIT_NO_FLEET;
+    }
+    return FSDK_WAIT_SEARCHING;
+}
+
+/* Days since 1970-01-01 for a UTC civil date (y/m/d) - Howard Hinnant's
+ * days_from_civil algorithm (pure integer arithmetic, no libc timezone calls,
+ * so the conversion is identical on every platform regardless of local tz).
+ * Valid for any proleptic-Gregorian y/m/d; only ever fed values the regex in
+ * parse_iso8601_utc already bounds. */
+static long long days_from_civil(long long y, int m, int d) {
+    y -= (m <= 2);
+    long long era = (y >= 0 ? y : y - 399) / 400;
+    long long yoe = y - era * 400;                                 /* [0, 399]    */
+    long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; /* [0, 365]    */
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;          /* [0, 146096] */
+    return era * 146097 + doe - 719468;
+}
+
+/* Read exactly `width` ASCII digits starting at *pp into *out and advance *pp
+ * past them. Returns 1 on success; on failure *pp/*out are left untouched (not
+ * even partial digits are consumed). */
+static int read_fixed_digits(const char** pp, int width, int* out) {
+    const char* p = *pp;
+    int v = 0;
+    int i;
+    for (i = 0; i < width; i++) {
+        if (p[i] < '0' || p[i] > '9') {
+            return 0;
+        }
+        v = v * 10 + (p[i] - '0');
+    }
+    *out = v;
+    *pp = p + width;
+    return 1;
+}
+
+/* Best-effort parse of an ISO-8601 UTC "YYYY-MM-DDTHH:MM:SS" prefix (fractional
+ * seconds and the trailing 'Z'/offset, if any, are ignored, and never even
+ * read) into Unix epoch seconds - manual field-by-field parsing (no scanf
+ * family: this core stays free of the MSVC "unsafe CRT function" warning
+ * class, matching json_extract_int's strtol-based style). Returns 1 on
+ * success; 0 on anything that doesn't match - the caller treats that as
+ * "unknown" (never a hard failure over a field the server may format
+ * differently someday). */
+static int parse_iso8601_utc(const char* s, long long* out_unix) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    const char* p = s;
+    if (s == NULL || out_unix == NULL) {
+        return 0;
+    }
+    if (!read_fixed_digits(&p, 4, &y) || *p != '-') {
+        return 0;
+    }
+    p++;
+    if (!read_fixed_digits(&p, 2, &mo) || *p != '-') {
+        return 0;
+    }
+    p++;
+    if (!read_fixed_digits(&p, 2, &d) || *p != 'T') {
+        return 0;
+    }
+    p++;
+    if (!read_fixed_digits(&p, 2, &h) || *p != ':') {
+        return 0;
+    }
+    p++;
+    if (!read_fixed_digits(&p, 2, &mi) || *p != ':') {
+        return 0;
+    }
+    p++;
+    if (!read_fixed_digits(&p, 2, &se)) {
+        return 0;
+    }
+    if (mo < 1 || mo > 12 || d < 1 || d > 31
+            || h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 60) {
+        return 0;
+    }
+    *out_unix = days_from_civil(y, mo, d) * 86400LL + h * 3600LL + mi * 60LL + se;
     return 1;
 }
 
@@ -309,6 +459,9 @@ fsdk_result fsdk_request_match(fsdk_client* client,
         fsdk_string_free(resp);
         return FSDK_ERR_INTERNAL;
     }
+    /* Default wait cadence until the first real poll refreshes it from the
+     * server (reason/estimate/expiry default to the calloc'd zero already). */
+    ticket->wait.retry_after_seconds = 2;
 
     const char* data = json_data_object(resp);
     char id_buf[128];
@@ -602,14 +755,66 @@ fsdk_result fsdk_poll_match(fsdk_client* client,
     }
     if (status < 200 || status >= 300) {
         fsdk_string_free(resp);
-        *out_status = ticket->status;
+        *out_status = ticket->status; /* unchanged - a 429 is a throttle, not a status change */
+        if (status == 429) {
+            /* The server's poll backstop: we arrived sooner than its own
+             * retryAfterSeconds. Recover the real interval from the optional
+             * Retry-After reader when the host installed one; otherwise keep
+             * whatever cadence the ticket already had (still a sane wait). */
+            long retry_seconds = -1;
+            if (fsdk_dispatch_http_retry_after(&retry_seconds) && retry_seconds >= 0) {
+                ticket->wait.retry_after_seconds =
+                    retry_seconds > INT_MAX ? INT_MAX : (int)retry_seconds;
+            }
+            fsdk_log(FSDK_LOG_DEBUG, "fsdk poll_match rate limited - keep waiting, poll later");
+        }
         return http_status_to_result(status);
     }
 
+    const char* data = json_data_object(resp);
     char state_buf[32];
-    if (json_extract_string(json_data_object(resp), "state", state_buf, sizeof(state_buf))) {
+    int got_state = json_extract_string(data, "state", state_buf, sizeof(state_buf));
+    if (got_state) {
         ticket->status = ticket_state_to_status(state_buf);
     }
+
+    /* "expiresAt" is a top-level ISO-8601 field independent of state - parsed
+     * best-effort; a miss leaves the ticket's previously-known value (0 if
+     * there never was one) rather than clobbering it with "expired". */
+    char expires_buf[40];
+    long long expires_unix = 0;
+    if (json_extract_string(data, "expiresAt", expires_buf, sizeof(expires_buf))
+            && parse_iso8601_utc(expires_buf, &expires_unix)) {
+        ticket->wait.expires_at_unix = expires_unix;
+    }
+
+    /* "wait" rides the wire ONLY while state == QUEUED. Off QUEUED (or state
+     * missing/unrecognized), there is nothing to wait on - reset to the same
+     * default an unpolled ticket starts with. */
+    if (got_state && strcmp(state_buf, "QUEUED") == 0) {
+        char wait_obj[256];
+        if (json_extract_object(data, "wait", wait_obj, sizeof(wait_obj))) {
+            char reason_buf[32];
+            long estimate = 0;
+            long retry = 0;
+            json_extract_string(wait_obj, "reason", reason_buf, sizeof(reason_buf));
+            ticket->wait.reason = wait_reason_from_string(reason_buf);
+            ticket->wait.estimate_seconds = json_extract_int(wait_obj, "estimateSeconds", &estimate)
+                                                 ? (int)estimate : 0;
+            ticket->wait.retry_after_seconds = json_extract_int(wait_obj, "retryAfterSeconds", &retry)
+                                                   ? (int)retry : 2;
+        } else {
+            /* Older fid, no "wait" object yet - degrade to a plain search. */
+            ticket->wait.reason = FSDK_WAIT_SEARCHING;
+            ticket->wait.estimate_seconds = 0;
+            ticket->wait.retry_after_seconds = 2;
+        }
+    } else {
+        ticket->wait.reason = FSDK_WAIT_SEARCHING;
+        ticket->wait.estimate_seconds = 0;
+        ticket->wait.retry_after_seconds = 2;
+    }
+
     fsdk_string_free(resp);
     *out_status = ticket->status;
     return FSDK_OK;
@@ -716,6 +921,14 @@ void fsdk_ticket_destroy(fsdk_ticket* ticket) {
     free(ticket);
 }
 
+fsdk_result fsdk_ticket_wait_info(const fsdk_ticket* ticket, fsdk_ticket_wait* out) {
+    if (ticket == NULL || out == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out = ticket->wait;
+    return FSDK_OK;
+}
+
 fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out) {
     if (client == NULL || out == NULL) {
         return FSDK_ERR_INVALID_ARG;
@@ -781,6 +994,8 @@ fsdk_result fsdk_resume_ticket(fsdk_client* client,
     /* FOUND: the seat came from my_session, so get_connection can resolve now
      * (fid re-mints a fresh token bound to the same match + persisted team). */
     ticket->status = FSDK_MATCH_FOUND;
+    /* Not QUEUED - wait never applies; seed the same sane default anyway. */
+    ticket->wait.retry_after_seconds = 2;
     *out_ticket = ticket;
     return FSDK_OK;
 }

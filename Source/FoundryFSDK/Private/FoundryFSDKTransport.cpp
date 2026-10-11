@@ -51,6 +51,41 @@ namespace
 
 namespace
 {
+	/** The most recent HTTP response's Retry-After header (S5 fsdk_set_http_retry_after_fn seam -
+	 *  see FoundryFSDKTransport.h). WRITTEN from FoundryFSDKHttpTransport's completion lambda, which
+	 *  fires on the GAME thread (Unreal's HTTP manager only completes a request while ticked, and
+	 *  only the game thread ticks it - see the THREADING note above); READ from
+	 *  FoundryFSDKHttpRetryAfter, which the core calls on whichever thread is driving the client
+	 *  (e.g. a PollMatch worker, immediately after the blocking HTTP call above returns on that
+	 *  SAME thread) - a genuine cross-thread handoff, hence its own lock. */
+	FCriticalSection GFsdkRetryAfterLock;
+	bool GFsdkRetryAfterKnown = false;
+	long GFsdkRetryAfterSeconds = 0;
+
+	/** Parse a Retry-After header value in SECONDS form (ASCII digits only). An HTTP-date form (or
+	 *  anything else non-numeric) is "unknown" per the fsdk_http_retry_after_fn contract - the core
+	 *  falls back to its own default retry cadence rather than guessing at a date parse. */
+	bool ParseRetryAfterSeconds(const FString& HeaderValue, long& OutSeconds)
+	{
+		const FString Trimmed = HeaderValue.TrimStartAndEnd();
+		if (Trimmed.IsEmpty())
+		{
+			return false;
+		}
+		for (const TCHAR Ch : Trimmed)
+		{
+			if (Ch < TEXT('0') || Ch > TEXT('9'))
+			{
+				return false;
+			}
+		}
+		OutSeconds = FCString::Atoi(*Trimmed);
+		return true;
+	}
+}
+
+namespace
+{
 	/** Result captured by the completion lambda; heap-owned (shared) so it safely
 	 *  outlives a timed-out request that completes later. bDone is the atomic
 	 *  release/acquire barrier: the completing thread writes Code/Body, THEN sets
@@ -151,6 +186,17 @@ extern "C"
 				{
 					State->Code = Response->GetResponseCode();
 					State->Body = Response->GetContentAsString();
+
+					// S5: capture the Retry-After header (if any) for the optional seam below - this
+					// IS the "most recent response delivered through fsdk_http_fn" (a transport
+					// failure, the !bOk branch, never reaches here, so it never clobbers this with
+					// "unknown"). Runs on whichever thread completed the request - the game thread,
+					// per the THREADING note above - matching FoundryFSDKHttpRetryAfter's own lock.
+					long RetrySeconds = 0;
+					const bool bHasRetry = ParseRetryAfterSeconds(Response->GetHeader(TEXT("Retry-After")), RetrySeconds);
+					FScopeLock RetryLock(&GFsdkRetryAfterLock);
+					GFsdkRetryAfterKnown = bHasRetry;
+					GFsdkRetryAfterSeconds = bHasRetry ? RetrySeconds : 0;
 				}
 				State->bDone = true; // release: set LAST, after Code/Body
 			});
@@ -206,6 +252,25 @@ extern "C"
 			*OutBody = Buffer;
 		}
 		return FSDK_OK;
+	}
+} // extern "C"
+
+extern "C"
+{
+	/** fsdk_http_retry_after_fn (S5): the most recent HTTP response's Retry-After header, captured
+	 *  by FoundryFSDKHttpTransport's completion lambda above. See FoundryFSDKTransport.h. */
+	static int FoundryFSDKHttpRetryAfter(long* OutSeconds, void* /*UserData*/)
+	{
+		FScopeLock Lock(&GFsdkRetryAfterLock);
+		if (!GFsdkRetryAfterKnown)
+		{
+			return 0;
+		}
+		if (OutSeconds != nullptr)
+		{
+			*OutSeconds = GFsdkRetryAfterSeconds;
+		}
+		return 1;
 	}
 } // extern "C"
 
@@ -439,6 +504,7 @@ void FoundryFSDKClearWsSink()
 void FoundryFSDKInstallHttpTransport()
 {
 	fsdk_set_http_transport(&FoundryFSDKHttpTransport, nullptr);
+	fsdk_set_http_retry_after_fn(&FoundryFSDKHttpRetryAfter, nullptr); // S5: optional, additive seam
 }
 
 void FoundryFSDKInstallLogSink()
@@ -461,6 +527,7 @@ void FoundryFSDKClearAuxLogSink()
 void FoundryFSDKShutdownBridges()
 {
 	fsdk_set_http_transport(nullptr, nullptr);
+	fsdk_set_http_retry_after_fn(nullptr, nullptr);
 	fsdk_set_ws_transport(nullptr, nullptr, nullptr, nullptr);
 	fsdk_set_log_sink(nullptr, nullptr);
 }

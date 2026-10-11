@@ -2,9 +2,15 @@
 
 #include "FMMSSubsystem.h"
 
+#include "FoundryMatchmakingCopy.h"
+#include "foundry/fsdk.h" // fsdk_wait_reason_str (diagnostics only - never player-facing text)
+
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/PlatformTime.h"
+#include "Math/UnrealMathUtility.h"
+#include "Misc/DateTime.h"
 #include "TimerManager.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFMMS, Log, All);
@@ -131,7 +137,8 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 void UFMMSSubsystem::Cancel()
 {
 	StopPolling();
-	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching || Phase == EFMMSPhase::Connecting)
+	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching
+		|| Phase == EFMMSPhase::WaitingForCapacity || Phase == EFMMSPhase::Connecting)
 	{
 		if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 		{
@@ -164,7 +171,7 @@ void UFMMSSubsystem::CheckActiveSession()
 	// network loss) the local phase is STALE - Traveling/Connecting with no flow
 	// actually running - so ask the PLATFORM, the only party that knows whether
 	// the match is still live. Never clobber a genuinely in-flight search.
-	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching)
+	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching || Phase == EFMMSPhase::WaitingForCapacity)
 	{
 		return;
 	}
@@ -206,7 +213,8 @@ void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionS
 	{
 		CurrentMatchId = Seat.MatchId;
 	}
-	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching || Phase == EFMMSPhase::Connecting)
+	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching
+		|| Phase == EFMMSPhase::WaitingForCapacity || Phase == EFMMSPhase::Connecting)
 	{
 		return; // a live flow started meanwhile - its handlers own the phase
 	}
@@ -237,7 +245,7 @@ void UFMMSSubsystem::HandleAuth(EFoundryFsdkResult Result)
 	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
-		Fail(FString::Printf(TEXT("Authentication failed (%d)."), (int32)Result));
+		FailWithResult(Result);
 		return;
 	}
 	UFoundryFSDKSubsystem* Sdk = Fsdk();
@@ -256,38 +264,70 @@ void UFMMSSubsystem::HandleRequest(EFoundryFsdkResult Result)
 	{
 		return;
 	}
-	if (Result == EFoundryFsdkResult::Unavailable)
-	{
-		// The server rejected the search up front (503): no capacity for this queue. Stop here with a
-		// human message rather than searching forever - a match could never form right now.
-		Fail(TEXT("No game servers are available for this queue right now. Please try again shortly."));
-		return;
-	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
-		Fail(FString::Printf(TEXT("Match request failed (%d)."), (int32)Result));
+		// Covers the server rejecting the search up front too (503/Unavailable: no capacity for this
+		// queue) - stop here with a human message rather than searching forever, a match could never
+		// form right now. FoundryMatchmakingCopy::ForResult carries that exact sentence.
+		FailWithResult(Result);
 		return;
 	}
-	SetPhase(EFMMSPhase::Searching, TEXT("Searching for a match..."));
-	StartPolling();
-	Poll(); // immediate first poll
+	// A fresh ticket: reset the client-side wait ceiling's clock (S5) - HasExceededWaitCeiling falls
+	// back to this when the server hasn't told us an expiresAt yet.
+	SearchStartedSeconds = FPlatformTime::Seconds();
+	TicketExpiresAtUnix = 0;
+	SetPhase(EFMMSPhase::Searching, FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::Searching, 0).ToString());
+	Poll(); // immediate first poll - its OWN completion decides the next poll's cadence (S5)
 }
 
-void UFMMSSubsystem::HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status)
+void UFMMSSubsystem::HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status, FFoundryTicketWait Wait)
 {
-	if (Phase != EFMMSPhase::Searching)
+	if (Phase != EFMMSPhase::Searching && Phase != EFMMSPhase::WaitingForCapacity)
 	{
+		return;
+	}
+
+	// Track the ticket's own TTL as soon as the server reports one (S5) - the wait ceiling below
+	// prefers it over the flat NoExpiryWaitCeilingSeconds fallback.
+	if (Wait.ExpiresAtUnix > 0)
+	{
+		TicketExpiresAtUnix = Wait.ExpiresAtUnix;
+	}
+
+	// Log level, every poll: the numeric result/status/wait-reason + its diagnostic string - NEVER
+	// the player-facing text below, which comes from FoundryMatchmakingCopy alone.
+	UE_LOG(LogFMMS, Log, TEXT("[FMMS] poll result=%d status=%d wait_reason=%s(%d) estimate=%ds retry=%ds"),
+		(int32)Result, (int32)Status,
+		UTF8_TO_TCHAR(fsdk_wait_reason_str((int32)Wait.Reason)), (int32)Wait.Reason,
+		Wait.EstimateSeconds, Wait.RetryAfterSeconds);
+
+	// The client-side ceiling (S5): never wait on a QUEUED ticket forever, even while the server
+	// keeps answering QUEUED/RateLimited.
+	if (HasExceededWaitCeiling())
+	{
+		Fail(FoundryMatchmakingCopy::Expired().ToString());
+		return;
+	}
+
+	if (Result == EFoundryFsdkResult::RateLimited)
+	{
+		// The server's poll backstop (we arrived sooner than its own retryAfterSeconds) - keep
+		// waiting, re-arm with ITS cadence (Wait.RetryAfterSeconds was just refreshed from the
+		// response's Retry-After header). Never a failure.
+		StartPolling(ClampPollInterval(Wait.RetryAfterSeconds));
 		return;
 	}
 	if (Result == EFoundryFsdkResult::Network || Result == EFoundryFsdkResult::Timeout)
 	{
-		return; // transient - keep polling
+		StartPolling(PollIntervalSeconds); // transient - keep polling at the default cadence
+		return;
 	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
-		Fail(FString::Printf(TEXT("Polling failed (%d)."), (int32)Result));
+		Fail(FoundryMatchmakingCopy::ForResult(Result).ToString());
 		return;
 	}
+
 	switch (Status)
 	{
 	case EFoundryMatchStatus::Found:
@@ -301,21 +341,40 @@ void UFMMSSubsystem::HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus S
 		}
 		SetPhase(EFMMSPhase::Connecting, TEXT("Match found - getting connection..."));
 		Sdk->GetConnection();
-		break;
+		return;
 	}
 	case EFoundryMatchStatus::Searching:
 	case EFoundryMatchStatus::Pending:
-		break; // keep waiting
+		break; // keep waiting - the wait-reason dispatch below picks the exact phase/message
 	case EFoundryMatchStatus::Cancelled:
 		Fail(TEXT("Match was cancelled."));
-		break;
+		return;
 	case EFoundryMatchStatus::Expired:
-		Fail(TEXT("Matchmaking ticket expired."));
-		break;
+		Fail(FoundryMatchmakingCopy::Expired().ToString());
+		return;
 	default:
 		Fail(TEXT("Matchmaking failed."));
+		return;
+	}
+
+	// Still QUEUED: the server-told wait reason decides whether this reads as a plain search, a
+	// calmer "we're starting a server for you" wait, or an outright refusal (no fleet at all).
+	switch (Wait.Reason)
+	{
+	case EFoundryWaitReason::NoFleet:
+		Fail(FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::NoFleet, 0).ToString());
+		return;
+	case EFoundryWaitReason::CapacityStarting:
+	case EFoundryWaitReason::NoCapacity:
+		SetPhase(EFMMSPhase::WaitingForCapacity, FoundryMatchmakingCopy::ForWait(Wait.Reason, Wait.EstimateSeconds).ToString());
+		break;
+	case EFoundryWaitReason::Searching:
+	default:
+		SetPhase(EFMMSPhase::Searching, FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::Searching, 0).ToString());
 		break;
 	}
+
+	StartPolling(ClampPollInterval(Wait.RetryAfterSeconds));
 }
 
 void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnection Connection)
@@ -326,14 +385,15 @@ void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnect
 	}
 	if (Result == EFoundryFsdkResult::NoMatch)
 	{
-		// Endpoint not ready yet (match forming) - resume polling.
+		// Endpoint not ready yet (match forming) - resume polling at the default cadence (we have no
+		// fresh FFoundryTicketWait here; the next poll resumes server-driven cadence as normal).
 		SetPhase(EFMMSPhase::Searching, TEXT("Match forming - waiting for server..."));
-		StartPolling();
+		StartPolling(PollIntervalSeconds);
 		return;
 	}
 	if (Result != EFoundryFsdkResult::Ok || Connection.Ip.IsEmpty() || Connection.Port <= 0)
 	{
-		Fail(FString::Printf(TEXT("Could not get a connection (%d)."), (int32)Result));
+		FailWithResult(Result);
 		return;
 	}
 	UGameInstance* GI = GetGameInstance();
@@ -377,11 +437,13 @@ void UFMMSSubsystem::Poll()
 	}
 }
 
-void UFMMSSubsystem::StartPolling()
+void UFMMSSubsystem::StartPolling(float IntervalSeconds)
 {
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		GI->GetTimerManager().SetTimer(PollTimer, this, &UFMMSSubsystem::Poll, PollIntervalSeconds, true);
+		// ONE-SHOT (bLoop=false): every poll re-arms its own next tick with the cadence IT decided
+		// (S5 server-driven retry), so there is no fixed loop interval to fall back on.
+		GI->GetTimerManager().SetTimer(PollTimer, this, &UFMMSSubsystem::Poll, IntervalSeconds, false);
 	}
 }
 
@@ -408,4 +470,26 @@ void UFMMSSubsystem::Fail(const FString& Message)
 {
 	StopPolling();
 	SetPhase(EFMMSPhase::Failed, Message);
+}
+
+void UFMMSSubsystem::FailWithResult(EFoundryFsdkResult Result)
+{
+	// The numeric code is diagnostics-only - it goes here, never into the player-facing text below.
+	UE_LOG(LogFMMS, Log, TEXT("[FMMS] result=%d"), (int32)Result);
+	Fail(FoundryMatchmakingCopy::ForResult(Result).ToString());
+}
+
+float UFMMSSubsystem::ClampPollInterval(int32 RetryAfterSeconds)
+{
+	return static_cast<float>(FMath::Clamp(RetryAfterSeconds, MinPollIntervalSeconds, MaxPollIntervalSeconds));
+}
+
+bool UFMMSSubsystem::HasExceededWaitCeiling() const
+{
+	if (TicketExpiresAtUnix > 0)
+	{
+		const int64 NowUnix = FDateTime::UtcNow().ToUnixTimestamp();
+		return NowUnix >= TicketExpiresAtUnix;
+	}
+	return (FPlatformTime::Seconds() - SearchStartedSeconds) >= NoExpiryWaitCeilingSeconds;
 }

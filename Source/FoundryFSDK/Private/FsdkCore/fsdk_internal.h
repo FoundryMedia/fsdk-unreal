@@ -303,6 +303,13 @@ struct fsdk_server {
 struct fsdk_ticket {
     char*             ticket_id; /* Server-assigned ticket id (copied).        */
     fsdk_match_status status;    /* Last known status.                         */
+    fsdk_ticket_wait  wait;      /* Server-told wait guidance, refreshed by
+                                  * every fsdk_poll_match call while QUEUED
+                                  * (fsdk_ticket_wait_info reads this). Ticket
+                                  * creation seeds retry_after_seconds=2 (the
+                                  * default cadence) - everything else starts
+                                  * zeroed (SEARCHING, no estimate, unknown
+                                  * expiry) until the first real poll.         */
 };
 
 /* -------------------------------------------------------------------------- */
@@ -347,6 +354,12 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
                                const char* body_json,
                                char** out_body,
                                long* out_status);
+
+/* Query the optional host-installed Retry-After reader (fsdk_set_http_retry_after_fn)
+ * for the MOST RECENT response. Implemented in fsdk.c. *out_seconds is always
+ * set (to -1 when unknown/not installed). Returns 1 when a value was reported,
+ * 0 otherwise - mirrors the host callback's own return contract. */
+int fsdk_dispatch_http_retry_after(long* out_seconds);
 
 /* Agones sidecar first-contact retry tuning (defined in server.c). The sidecar's
  * HTTP gateway races the game server boot; until the sidecar has answered once,

@@ -34,7 +34,7 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 #define FSDK_VERSION_MAJOR 0
-#define FSDK_VERSION_MINOR 3
+#define FSDK_VERSION_MINOR 4
 #define FSDK_VERSION_PATCH 0
 
 /* Returns a static, NUL-terminated semantic version string (e.g. "0.1.0").
@@ -65,6 +65,11 @@ typedef enum fsdk_result {
 
 /* Returns a static human-readable string for a result code (for logging). */
 const char* fsdk_result_str(fsdk_result result);
+
+/* Returns a static human-readable string for an fsdk_wait_reason value (for
+ * logging/diagnostics only - player-facing copy must come from a game's own
+ * reason -> text table, never this string or the numeric code). */
+const char* fsdk_wait_reason_str(int reason);
 
 /* -------------------------------------------------------------------------- */
 /* Opaque handles                                                             */
@@ -102,6 +107,33 @@ typedef enum fsdk_match_status {
     FSDK_MATCH_FAILED = 4,     /* Matchmaking failed / timed out.              */
     FSDK_MATCH_EXPIRED = 5     /* Ticket TTL elapsed.                          */
 } fsdk_match_status;
+
+/* Server-told reason a ticket is still QUEUED (S5 "matchmaking wait"). Present
+ * only while the ticket is QUEUED; fsdk_poll_match keeps the ticket's cached
+ * fsdk_ticket_wait (read via fsdk_ticket_wait_info) in sync with it on every
+ * poll. An older fid that sends no "wait" object degrades to SEARCHING with a
+ * 2s retry - never a harsher wait than the server actually said. */
+typedef enum fsdk_wait_reason {
+    FSDK_WAIT_SEARCHING = 0,         /* Capacity exists; actively matchmaking.  */
+    FSDK_WAIT_CAPACITY_STARTING = 1, /* A scale-up is in flight for this queue. */
+    FSDK_WAIT_NO_CAPACITY = 2,       /* Fleet at its ceiling; no scale-up left. */
+    FSDK_WAIT_NO_FLEET = 3           /* No fleet hosts this game (placement
+                                      * would be refused outright).            */
+} fsdk_wait_reason;
+
+/* Server-told wait guidance, cached on the ticket and refreshed by every
+ * fsdk_poll_match call (read it with fsdk_ticket_wait_info). Absent/older-fid
+ * default: {FSDK_WAIT_SEARCHING, 0, 2, 0}. */
+typedef struct fsdk_ticket_wait {
+    int       reason;              /* An fsdk_wait_reason value.               */
+    int       estimate_seconds;    /* CAPACITY_STARTING remaining-boot estimate;
+                                    * 0 for every other reason.                 */
+    int       retry_after_seconds; /* How soon the caller should poll again.    */
+    long long expires_at_unix;     /* Ticket TTL from the wire "expiresAt" (Unix
+                                    * seconds, UTC), parsed best-effort; 0 when
+                                    * absent/unparseable (treat as "unknown",
+                                    * never as "already expired").              */
+} fsdk_ticket_wait;
 
 /* Maximum byte length (including NUL) of a serialized match token. The match
  * token is a FID-signed JWT; this bound is generous for a compact JWT. */
@@ -200,6 +232,27 @@ typedef fsdk_result (*fsdk_http_fn)(fsdk_http_method method,
  * call FAILS CLOSED (FSDK_NOT_IMPLEMENTED) rather than guessing - the core never
  * bakes in its own network stack. */
 void fsdk_set_http_transport(fsdk_http_fn transport, void* user_data);
+
+/* Optional, ADDITIVE companion seam: fsdk_http_fn carries no response headers
+ * (by design - a host supplies {body, status} only), so a 429's "Retry-After"
+ * header has nowhere to travel back through the primary callback. A host that
+ * tracks response headers MAY also install this reader; the core queries it
+ * (if installed) immediately after a request completes, so it always refers to
+ * the MOST RECENT response delivered through fsdk_http_fn - drive it from one
+ * thread, like the rest of this SDK's per-client handles. A host that never
+ * installs this is unaffected: the core falls back to its own default retry
+ * cadence (see fsdk_ticket_wait). Never send a bearer token here; it reads a
+ * header name/value the host already has in hand for the SAME response.
+ *
+ * Return 1 and set *out_seconds when the most recent response carried a
+ * Retry-After header in SECONDS form (an HTTP-date form is "unknown" - return
+ * 0). Return 0 when absent/unknown/not tracked. */
+typedef int (*fsdk_http_retry_after_fn)(long* out_seconds, void* user_data);
+
+/* Install a process-wide Retry-After reader (pass NULL to remove). Purely
+ * additive - a host using only fsdk_set_http_transport works exactly as
+ * before; this seam is optional and queried, never required. */
+void fsdk_set_http_retry_after_fn(fsdk_http_retry_after_fn fn, void* user_data);
 
 /* Host-provided RS256 signature verifier for SERVER-side match-token validation.
  * The core does ALL the dependency-free JWT work itself (compact split, base64url
@@ -424,10 +477,22 @@ fsdk_result fsdk_request_match_auto(fsdk_client* client,
                                     fsdk_ticket** out_ticket);
 
 /* Poll the current status of a ticket. Writes the status to *out_status.
- * This is a lightweight call intended to be invoked on a timer / each frame. */
+ * This is a lightweight call intended to be invoked on a timer / each frame.
+ * While QUEUED, this also refreshes the ticket's cached fsdk_ticket_wait (read
+ * it with fsdk_ticket_wait_info) from the server-told "wait" + "expiresAt"
+ * fields - a richer reason than the bare SEARCHING status, and server-driven
+ * retry cadence. A 429 (polled sooner than the server's own retryAfterSeconds)
+ * returns FSDK_ERR_RATE_LIMITED, leaves *out_status unchanged, and updates
+ * ONLY retry_after_seconds (from fsdk_set_http_retry_after_fn when installed) -
+ * callers should treat this as "keep waiting, poll later", never as failure. */
 fsdk_result fsdk_poll_match(fsdk_client* client,
                             fsdk_ticket* ticket,
                             fsdk_match_status* out_status);
+
+/* Read the ticket's cached server-told wait guidance (last refreshed by
+ * fsdk_poll_match). A freshly created ticket (before its first poll) reads the
+ * default {FSDK_WAIT_SEARCHING, 0, 2, 0}. FSDK_ERR_INVALID_ARG on NULL args. */
+fsdk_result fsdk_ticket_wait_info(const fsdk_ticket* ticket, fsdk_ticket_wait* out);
 
 /* Fetch connection details for a ticket once its status is FSDK_MATCH_FOUND.
  * Fills *out (caller-allocated). Returns FSDK_ERR_NO_MATCH if not yet ready. */

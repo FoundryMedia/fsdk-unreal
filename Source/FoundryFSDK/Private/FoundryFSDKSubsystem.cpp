@@ -307,6 +307,32 @@ namespace
 			default:                         return EFoundryFsdkResult::Unknown;
 		}
 	}
+
+	/** Map an fsdk_wait_reason (int, C ABI) to the Blueprint enum (S5). An unrecognized value (a
+	 *  future reason an older binding doesn't know about) degrades to Searching - never a harsher
+	 *  wait than the server actually said. */
+	EFoundryWaitReason ToBlueprintWaitReason(int32 Reason)
+	{
+		switch (Reason)
+		{
+			case FSDK_WAIT_SEARCHING:         return EFoundryWaitReason::Searching;
+			case FSDK_WAIT_CAPACITY_STARTING: return EFoundryWaitReason::CapacityStarting;
+			case FSDK_WAIT_NO_CAPACITY:       return EFoundryWaitReason::NoCapacity;
+			case FSDK_WAIT_NO_FLEET:          return EFoundryWaitReason::NoFleet;
+			default:                          return EFoundryWaitReason::Searching;
+		}
+	}
+
+	/** Map an fsdk_ticket_wait (C ABI) to the Blueprint struct (S5). */
+	FFoundryTicketWait ToBlueprintWait(const fsdk_ticket_wait& Wait)
+	{
+		FFoundryTicketWait Out;
+		Out.Reason = ToBlueprintWaitReason(Wait.reason);
+		Out.EstimateSeconds = Wait.estimate_seconds;
+		Out.RetryAfterSeconds = Wait.retry_after_seconds;
+		Out.ExpiresAtUnix = Wait.expires_at_unix;
+		return Out;
+	}
 }
 
 void UFoundryFSDKSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -463,7 +489,7 @@ void UFoundryFSDKSubsystem::PollMatch()
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
 	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
-		OnPollMatchComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, EFoundryMatchStatus::Unknown);
+		OnPollMatchComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, EFoundryMatchStatus::Unknown, FFoundryTicketWait());
 		return;
 	}
 
@@ -472,6 +498,8 @@ void UFoundryFSDKSubsystem::PollMatch()
 	{
 		fsdk_result R;
 		fsdk_match_status S = FSDK_MATCH_PENDING;
+		fsdk_ticket_wait W;
+		FMemory::Memzero(&W, sizeof(W));
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			if (CoreRef->ActiveTicket == nullptr)
@@ -481,16 +509,22 @@ void UFoundryFSDKSubsystem::PollMatch()
 			else
 			{
 				R = fsdk_poll_match(CoreRef->Client, CoreRef->ActiveTicket, &S);
+				// Read the ticket's cached wait regardless of R: a RateLimited (429) poll leaves the
+				// status untouched but still refreshes retry_after_seconds (S5) - the one field the
+				// caller needs from that response. No I/O here (a local struct copy), so it is safe
+				// to read inside the same lock hold as the poll above.
+				fsdk_ticket_wait_info(CoreRef->ActiveTicket, &W);
 			}
 		}
 		const EFoundryFsdkResult Result = ToBlueprintResult(R);
 		const EFoundryMatchStatus Status =
 			(R == FSDK_OK) ? ToBlueprintStatus(S) : EFoundryMatchStatus::Unknown;
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Status]()
+		const FFoundryTicketWait Wait = ToBlueprintWait(W);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Status, Wait]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
-				Self->OnPollMatchComplete.Broadcast(Result, Status);
+				Self->OnPollMatchComplete.Broadcast(Result, Status, Wait);
 			}
 		});
 	});

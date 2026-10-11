@@ -41,6 +41,16 @@ const char* fsdk_result_str(fsdk_result result) {
     }
 }
 
+const char* fsdk_wait_reason_str(int reason) {
+    switch (reason) {
+        case FSDK_WAIT_SEARCHING:         return "FSDK_WAIT_SEARCHING";
+        case FSDK_WAIT_CAPACITY_STARTING: return "FSDK_WAIT_CAPACITY_STARTING";
+        case FSDK_WAIT_NO_CAPACITY:       return "FSDK_WAIT_NO_CAPACITY";
+        case FSDK_WAIT_NO_FLEET:          return "FSDK_WAIT_NO_FLEET";
+        default:                          return "FSDK_WAIT_UNKNOWN";
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Logging                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -84,6 +94,34 @@ fsdk_result fsdk_dispatch_http(fsdk_http_method method,
     }
     return g_http_transport(method, url, bearer_token, body_json,
                             out_body, out_status, g_http_user_data);
+}
+
+/* Optional additive companion seam: a host that tracks response headers MAY
+ * also report the last response's Retry-After (seconds). See fsdk.h. */
+static fsdk_http_retry_after_fn g_http_retry_after_fn = NULL;
+static void*                    g_http_retry_after_user_data = NULL;
+
+void fsdk_set_http_retry_after_fn(fsdk_http_retry_after_fn fn, void* user_data) {
+    g_http_retry_after_fn = fn;
+    g_http_retry_after_user_data = user_data;
+}
+
+int fsdk_dispatch_http_retry_after(long* out_seconds) {
+    if (out_seconds != NULL) {
+        *out_seconds = -1;
+    }
+    if (g_http_retry_after_fn == NULL) {
+        return 0;
+    }
+    long seconds = -1;
+    int reported = g_http_retry_after_fn(&seconds, g_http_retry_after_user_data);
+    if (reported && seconds >= 0) {
+        if (out_seconds != NULL) {
+            *out_seconds = seconds;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */

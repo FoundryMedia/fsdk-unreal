@@ -92,9 +92,58 @@ struct FFoundrySessionSeat
 	FString QueueKey;
 };
 
+/**
+ * Server-told reason a ticket is still QUEUED (S5 "matchmaking wait"), mirrors fsdk_wait_reason.
+ * Present only while the ticket is QUEUED - read it off FFoundryTicketWait on every
+ * OnPollMatchComplete. An older fid that sends no "wait" object degrades to Searching with a 2s
+ * retry - never a harsher wait than the server actually said.
+ */
+UENUM(BlueprintType)
+enum class EFoundryWaitReason : uint8
+{
+	/** Capacity exists; actively matchmaking. */
+	Searching        UMETA(DisplayName = "Searching"),
+	/** A scale-up is in flight for this queue's fleet. */
+	CapacityStarting UMETA(DisplayName = "Capacity Starting"),
+	/** Fleet at its ceiling; no scale-up left. */
+	NoCapacity       UMETA(DisplayName = "No Capacity"),
+	/** No fleet hosts this game (placement would be refused outright). */
+	NoFleet          UMETA(DisplayName = "No Fleet")
+};
+
+/**
+ * Server-told wait guidance, mirrors fsdk_ticket_wait. Refreshed on every successful PollMatch
+ * (and, for RetryAfterSeconds only, on a RateLimited 429 poll - see OnPollMatchComplete). A freshly
+ * requested ticket (before its first poll) reads the default {Searching, 0, 2, 0}.
+ */
+USTRUCT(BlueprintType)
+struct FFoundryTicketWait
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	EFoundryWaitReason Reason = EFoundryWaitReason::Searching;
+
+	/** CapacityStarting's remaining-boot estimate, in seconds; 0 for every other reason. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	int32 EstimateSeconds = 0;
+
+	/** How soon the caller should poll again. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	int32 RetryAfterSeconds = 2;
+
+	/** Ticket TTL from the wire "expiresAt" (Unix seconds, UTC), parsed best-effort; 0 when
+	 *  absent/unparseable (treat as "unknown", never as "already expired"). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	int64 ExpiresAtUnix = 0;
+};
+
 // Completion delegates - broadcast on the GAME THREAD when an async op finishes.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryFsdkResultEvent, EFoundryFsdkResult, Result);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkStatusEvent, EFoundryFsdkResult, Result, EFoundryMatchStatus, Status);
+// Wait is the ticket's server-told wait guidance as of THIS poll (S5) - meaningful while Status is
+// Searching/Pending (and, on a RateLimited Result, its RetryAfterSeconds alone is refreshed); the
+// default {Searching, 0, 2, 0} otherwise. See FFoundryTicketWait.
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryFsdkStatusEvent, EFoundryFsdkResult, Result, EFoundryMatchStatus, Status, FFoundryTicketWait, Wait);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFoundryFsdkResult, Result, FFoundryConnection, Connection);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkSessionSeatEvent, EFoundryFsdkResult, Result, FFoundrySessionSeat, Seat);
 
@@ -468,7 +517,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void RequestMatch(const FString& Queue, const FString& AttributesJson, bool bAutoRegion = true);
 
-	/** Poll the active ticket's status. Async: broadcasts OnPollMatchComplete. */
+	/**
+	 * Poll the active ticket's status. Async: broadcasts OnPollMatchComplete with the server-told
+	 * FFoundryTicketWait alongside the result/status (S5 "matchmaking wait") - while QUEUED this is
+	 * a richer reason than the bare Searching status, plus server-driven retry cadence. A poll that
+	 * arrives sooner than the server's own RetryAfterSeconds answers RateLimited (not a failure):
+	 * Wait.RetryAfterSeconds alone is refreshed from the response's Retry-After header (when the
+	 * host transport tracks it), and the caller should keep waiting, poll later.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void PollMatch();
 
