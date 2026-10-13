@@ -175,6 +175,15 @@ extern "C"
 			Request->SetContentAsString(UTF8_TO_TCHAR(BodyJson));
 		}
 		Request->SetTimeout(20.0f);
+		// Complete on the HTTP thread, never the game thread. A WORKER waiting below cannot tick the
+		// HTTP manager, so with the default (game-thread) policy its request only completes when the
+		// game thread ticks - and the game thread may be BLOCKED on the core mutex this worker holds
+		// (the lobby's SetActiveChatChannel behind a my-session poll during LoadMap, 2026-10-13):
+		// a deadlock the 20 s timeout breaks, twice per map load = a 50 s "freeze" on LEAVE MATCH.
+		// The engine's own ProcessRequestUntilComplete forces this policy for the same reason. The
+		// completion lambda only writes State (bDone last) and the Retry-After globals under their
+		// own lock, so it is safe on any thread.
+		Request->SetDelegateThreadPolicy(EHttpRequestDelegateThreadPolicy::CompleteOnHttpThread);
 
 		TSharedRef<FFsdkHttpResult, ESPMode::ThreadSafe> State =
 			MakeShared<FFsdkHttpResult, ESPMode::ThreadSafe>();
@@ -190,8 +199,8 @@ extern "C"
 					// S5: capture the Retry-After header (if any) for the optional seam below - this
 					// IS the "most recent response delivered through fsdk_http_fn" (a transport
 					// failure, the !bOk branch, never reaches here, so it never clobbers this with
-					// "unknown"). Runs on whichever thread completed the request - the game thread,
-					// per the THREADING note above - matching FoundryFSDKHttpRetryAfter's own lock.
+					// "unknown"). Runs on the HTTP thread (CompleteOnHttpThread above) - hence
+					// FoundryFSDKHttpRetryAfter's own lock.
 					long RetrySeconds = 0;
 					const bool bHasRetry = ParseRetryAfterSeconds(Response->GetHeader(TEXT("Retry-After")), RetrySeconds);
 					FScopeLock RetryLock(&GFsdkRetryAfterLock);
@@ -206,10 +215,9 @@ extern "C"
 			return FSDK_ERR_NETWORK;
 		}
 
-		// Synchronous bridge: block until completion. Only the GAME THREAD may tick
-		// the HTTP manager, so pump it here when we're on it (the sync/proof path);
-		// on a worker thread (the async subsystem path) the game thread ticks for
-		// us and we just poll. Either way no game-thread hitch in the async path.
+		// Synchronous bridge: block until completion. The request completes on the HTTP
+		// thread (policy above), so a worker just polls; on the game thread (the
+		// sync/proof path) we also pump the manager so engine-side bookkeeping advances.
 		const bool bGameThread = IsInGameThread();
 		FHttpManager& Manager = FHttpModule::Get().GetHttpManager();
 		const double Deadline = FPlatformTime::Seconds() + 25.0;

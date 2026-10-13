@@ -1234,17 +1234,24 @@ void UFoundryFSDKSubsystem::RunSocialAction(const FString& Action, bool bRefresh
 		Call = MoveTemp(Call)]()
 	{
 		fsdk_result Result;
+		FString ServerMessage;
 		{
 			FScopeLock Lock(&CoreRef->CS);
 			Result = static_cast<fsdk_result>(Call(*CoreRef));
+			if (Result != FSDK_OK)
+			{
+				// The core keeps fid's sentence for the failed call; read it under the same lock.
+				ServerMessage = UTF8_TO_TCHAR(fsdk_last_error_message(CoreRef->Client));
+			}
 		}
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Action, bRefreshPartyOnOk]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Action, bRefreshPartyOnOk, ServerMessage]()
 		{
 			UFoundryFSDKSubsystem* Self = WeakThis.Get();
 			if (Self == nullptr)
 			{
 				return;
 			}
+			Self->CachedLastSocialActionError = ServerMessage;
 			Self->OnSocialActionComplete.Broadcast(ToBlueprintResult(Result), Action);
 			if (bRefreshPartyOnOk && Result == FSDK_OK)
 			{

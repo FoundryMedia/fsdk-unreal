@@ -192,6 +192,10 @@ int fsdk_secret_delete(const char* key) {
     return g_secret_delete(key, g_secret_user_data);
 }
 
+int fsdk_secret_store_installed(void) {
+    return g_secret_save != NULL;
+}
+
 /* -------------------------------------------------------------------------- */
 /* WebSocket transport (host-provided, required for chat)                     */
 /* -------------------------------------------------------------------------- */

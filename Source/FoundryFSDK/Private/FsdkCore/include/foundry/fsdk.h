@@ -696,6 +696,13 @@ fsdk_result fsdk_social_blocked(fsdk_client* client,
 /* Friend-graph mutations - server-authorized as the player themselves. A
  * non-friend/unknown target is a uniform FSDK_ERR_NO_MATCH. */
 fsdk_result fsdk_social_friend_request(fsdk_client* client, const char* username);
+
+/* The server's human-readable message for the LAST failed social call on this
+ * client ("" when that call succeeded, failed before any I/O, or carried no
+ * message). Written for a player ("No player found. Ask your friend for their
+ * exact @username..."), so a UI may show it verbatim - never a wire code.
+ * Valid until the next social call; NULL client reads "". */
+const char* fsdk_last_error_message(const fsdk_client* client);
 fsdk_result fsdk_social_friend_accept(fsdk_client* client, const char* requester_foundry_id);
 fsdk_result fsdk_social_friend_remove(fsdk_client* client, const char* friend_foundry_id);
 fsdk_result fsdk_social_friend_block(fsdk_client* client, const char* foundry_id);

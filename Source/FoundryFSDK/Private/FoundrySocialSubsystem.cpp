@@ -260,8 +260,25 @@ void UFoundrySocialSubsystem::SendFriendRequest(const FString& InUsername)
 		OnActionFailed.Broadcast(TEXT("friend.request"), TEXT("Dev fixture active - actions are disabled."));
 		return;
 	}
+	// fid answers a repeat request with the same 200 as a fresh one (idempotent by design), so the
+	// "already" cases are known only here: the friends list and what this session already sent.
+	const FString Key = Username.ToLower();
+	for (const FFoundryFriend& F : Friends())
+	{
+		if (F.Username.Equals(Username, ESearchCase::IgnoreCase))
+		{
+			OnActionFailed.Broadcast(TEXT("friend.request"), FString::Printf(TEXT("You're already friends with %s."), *F.DisplayName));
+			return;
+		}
+	}
+	if (SentFriendRequests.Contains(Key))
+	{
+		OnActionFailed.Broadcast(TEXT("friend.request"), TEXT("You already sent them a request - it's waiting on them."));
+		return;
+	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		InFlightFriendRequestUsername = Key;
 		Sdk->SendFriendRequest(Username);
 	}
 }
@@ -528,17 +545,56 @@ void UFoundrySocialSubsystem::HandleBlocked(EFoundryFsdkResult Result, const TAr
 	NotePollAnswered();
 }
 
+namespace
+{
+	// Player-facing copy for a result the platform gave no sentence for (offline, a transport
+	// failure, a refused token). Same tone as the matchmaking copy table.
+	FString FallbackActionMessage(EFoundryFsdkResult Result)
+	{
+		switch (Result)
+		{
+		case EFoundryFsdkResult::NotAuthenticated:
+		case EFoundryFsdkResult::Unauthorized: return TEXT("Sign in through the Foundry launcher first.");
+		case EFoundryFsdkResult::Network:
+		case EFoundryFsdkResult::Timeout: return TEXT("Can't reach Foundry right now. Check your connection and try again.");
+		case EFoundryFsdkResult::RateLimited: return TEXT("Slow down - try that again in a moment.");
+		case EFoundryFsdkResult::NoMatch: return TEXT("No one found by that name.");
+		case EFoundryFsdkResult::Unavailable: return TEXT("Foundry is busy right now. Try again in a moment.");
+		case EFoundryFsdkResult::InvalidArg: return TEXT("That doesn't look right - check what you typed.");
+		default: return TEXT("Something went wrong. Try again.");
+		}
+	}
+}
+
 void UFoundrySocialSubsystem::HandleSocialAction(EFoundryFsdkResult Result, const FString& Action)
 {
 	if (Result != EFoundryFsdkResult::Ok)
 	{
-		OnActionFailed.Broadcast(Action, UEnum::GetDisplayValueAsText(Result).ToString());
+		// The platform's own sentence when it gave one ("No player found. Ask your friend for their
+		// exact @username..."), else a player-facing fallback for the transport-level results. Never
+		// the enum's display name (Justin, 2026-10-13: add-friend showed "No Match / Not Ready").
+		const UFoundryFSDKSubsystem* Sdk = Fsdk();
+		FString Message = Sdk ? Sdk->LastSocialActionError() : FString();
+		if (Message.IsEmpty())
+		{
+			Message = FallbackActionMessage(Result);
+		}
+		if (Action == TEXT("friend.request"))
+		{
+			InFlightFriendRequestUsername.Reset();
+		}
+		OnActionFailed.Broadcast(Action, Message);
 		if (Action == TEXT("party.create"))
 		{
 			PendingInviteUsername.Reset();
 			bCreatePartyPending = false;
 		}
 		return;
+	}
+	if (Action == TEXT("friend.request") && !InFlightFriendRequestUsername.IsEmpty())
+	{
+		SentFriendRequests.Add(InFlightFriendRequestUsername);
+		InFlightFriendRequestUsername.Reset();
 	}
 	// The platform follows every party mutation with its own RefreshParty; freshen everything else
 	// (invites, blocked, pending) on the very next tick too.

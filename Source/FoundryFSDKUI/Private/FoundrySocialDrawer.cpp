@@ -1,4 +1,5 @@
 #include "FoundrySocialDrawer.h"
+#include "SFoundryPopupHost.h"
 
 #include "Animation/WidgetAnimation.h"
 #include "Components/Button.h"
@@ -826,7 +827,13 @@ void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2
 	PendingActionFoundryId = Row->Friend.FoundryId;
 	PendingActionUsername = Row->Friend.Username.IsEmpty() ? Row->Friend.DisplayName : Row->Friend.Username;
 
-	TSharedRef<SWidget> MenuContent = ActiveMenu->TakeWidget();
+	// SFoundryPopupHost: kit tooltips drawn in the game window (never an OS tooltip window) and the
+	// project's hardware cursor re-applied over the menu - see the class comment.
+	TSharedRef<SWidget> MenuContent = SNew(SFoundryPopupHost)
+		.ViewportClient(GetWorld() ? GetWorld()->GetGameViewport() : nullptr)
+		[
+			ActiveMenu->TakeWidget()
+		];
 	FWidgetPath OwnerPath;
 	const bool bPath = FSlateApplication::Get().GeneratePathToWidgetUnchecked(TakeWidget(), OwnerPath);
 	// An empty OwnerPath is acceptable - PushMenu falls back to resolving the parent window from

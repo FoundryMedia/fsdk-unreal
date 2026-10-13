@@ -332,21 +332,38 @@ void UFoundryUIWidgetBase::SetKitToolTip(UWidget* Target, const FText& Text)
 
 	if (UFoundryTooltip* Existing = Cast<UFoundryTooltip>(Target->GetToolTip()))
 	{
+		// Relabel IN PLACE. Calling SetToolTip(Existing) again would SNew a fresh SToolTip around a
+		// re-taken widget - the pill is destructed and constructed on every refresh (seen as
+		// DESTRUCT/CONSTRUCT pairs on the app bar's social badge each poll, 2026-10-13).
 		Existing->SetLabel(Text);
-		Target->SetToolTip(Existing);
 		return;
 	}
 
-	const TSubclassOf<UFoundryTooltip> TooltipClass = UFoundryUISettings::LoadWidgetClass(UFoundryUISettings::Get()->DefaultTooltip, TEXT("DefaultTooltip")).Get();
+	const TSubclassOf<UUserWidget> Loaded = UFoundryUISettings::LoadWidgetClass(UFoundryUISettings::Get()->DefaultTooltip, TEXT("DefaultTooltip"));
+	const TSubclassOf<UFoundryTooltip> TooltipClass = Loaded.Get();
 	if (!TooltipClass)
 	{
+		// A TSubclassOf<UFoundryTooltip> assignment silently nulls a class that is not a UFoundryTooltip -
+		// say which case this is, once per class, instead of quietly showing the engine's own tooltip.
+		static TSet<FName> Warned;
+		const FName Key = Loaded ? Loaded->GetFName() : NAME_None;
+		if (!Warned.Contains(Key))
+		{
+			Warned.Add(Key);
+			UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[Tooltip] DefaultTooltip %s - falling back to the engine text tooltip for '%s'."),
+				Loaded ? *FString::Printf(TEXT("'%s' is not a UFoundryTooltip"), *Loaded->GetName()) : TEXT("is unset or failed to load"),
+				*Text.ToString());
+		}
 		return; // falls back to the plain SetToolTipText above - the text is never silently lost
 	}
 	UFoundryTooltip* Tooltip = CreateWidget<UFoundryTooltip>(Target->GetOwningPlayer(), TooltipClass);
 	if (Tooltip == nullptr)
 	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[Tooltip] CreateWidget(%s) returned null for '%s' (owning player %s) - engine text tooltip shown."),
+			*TooltipClass->GetName(), *Text.ToString(), Target->GetOwningPlayer() ? TEXT("set") : TEXT("NULL"));
 		return;
 	}
+	UE_LOG(LogFoundryFSDKUI, Verbose, TEXT("[Tooltip] kit pill '%s' (%s) on %s"), *Text.ToString(), *Tooltip->GetName(), *Target->GetName());
 	Tooltip->SetLabel(Text);
 	Target->SetToolTip(Tooltip);
 }

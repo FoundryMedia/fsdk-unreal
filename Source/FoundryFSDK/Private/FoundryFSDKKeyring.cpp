@@ -21,6 +21,8 @@
 #include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
+DEFINE_LOG_CATEGORY_STATIC(LogFoundryFSDKKeyring, Log, All);
+
 // The core's seam typedefs have C language linkage; define the callbacks with
 // matching linkage so the function-pointer types agree across compilers.
 extern "C"
@@ -45,7 +47,15 @@ extern "C"
 		Cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
 		Cred.UserName = const_cast<LPWSTR>(UserName);
 
-		return CredWriteW(&Cred, 0) ? 0 : 1;
+		if (!CredWriteW(&Cred, 0))
+		{
+			// The core deletes the stale stored token on a failed save (a stale copy trips
+			// auth's reuse-detection and revokes every session) - so say why it failed.
+			UE_LOG(LogFoundryFSDKKeyring, Warning, TEXT("[Keyring] CredWriteW('%s') failed: Win32 error %u - the refresh token was not persisted"),
+				*TargetName, static_cast<uint32>(::GetLastError()));
+			return 1;
+		}
+		return 0;
 	}
 
 	/** fsdk_secret_load_fn: read the value back as a malloc()'d UTF-8 NUL-terminated string. */

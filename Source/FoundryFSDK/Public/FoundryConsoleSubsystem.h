@@ -152,6 +152,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Console")
 	void UnregisterConsoleCommand(const FString& Name);
 
+	/** The words a registered command takes as its FIRST argument (`goo debug`, `goo reset` ...), for the
+	 *  dropdown and Tab. Registering a command already derives them from its help text - `name a | name b`
+	 *  or `[a|b|c]` - so this is only for a command whose help does not spell them out. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Console")
+	void SetCommandArguments(const FString& Name, const TArray<FString>& Arguments);
+
 	// ── Console-widget seam (not for game code) ─────────────────────────────────
 
 	/** Echo (credential-masked) + dispatch one input line. The widget calls this. */
@@ -168,6 +174,18 @@ public:
 	 *  names when the completion is ambiguous. Access-filtered like `help`. */
 	FString CompleteLine(const FString& Current, TArray<FString>& OutCandidates) const;
 
+	/** One row of the console's completion dropdown: the line it inserts and a one-line description. */
+	struct FSuggestion
+	{
+		FString Line;
+		FString Help;
+	};
+
+	/** Live completions for what is typed so far, best first: the registered commands (bare and `foundry <sub>`,
+	 *  access-filtered like `help`) and - in non-Shipping builds only - the engine's console variables and
+	 *  commands with their current value. Empty while a password is being typed. */
+	void GetSuggestions(const FString& Current, TArray<FSuggestion>& Out, int32 MaxCount = 40) const;
+
 	/** True while `foundry login <email>` is awaiting the masked password line. */
 	bool IsAwaitingPassword() const { return !PendingLoginEmail.IsEmpty(); }
 
@@ -180,6 +198,7 @@ private:
 		FString Help;
 		EFoundryConsoleAccess Access = EFoundryConsoleAccess::Any;
 		FFoundryConsoleHandler Handler;
+		TArray<FSuggestion> Arguments;   // first-argument completions: derived from Help at registration, or set explicitly
 	};
 
 	void RegisterBuiltins();

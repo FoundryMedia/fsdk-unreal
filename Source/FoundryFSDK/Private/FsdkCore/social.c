@@ -47,6 +47,10 @@ static fsdk_result social_status_to_result(long status) {
     return status == 404 ? FSDK_ERR_NO_MATCH : FSDK_ERR_PROTOCOL;
 }
 
+const char* fsdk_last_error_message(const fsdk_client* client) {
+    return client == NULL ? "" : client->last_error;
+}
+
 static fsdk_result social_get(fsdk_client* client, const char* path, char** out_body) {
     long status = 0;
     fsdk_result rc;
@@ -56,6 +60,7 @@ static fsdk_result social_get(fsdk_client* client, const char* path, char** out_
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_GET, path,
                            client->player_token, NULL, out_body, &status);
     if (rc != FSDK_OK) {
@@ -63,6 +68,7 @@ static fsdk_result social_get(fsdk_client* client, const char* path, char** out_
     }
     rc = social_status_to_result(status);
     if (rc != FSDK_OK) {
+        fsdk_client_note_error(client, status, *out_body);
         fsdk_string_free(*out_body);
         *out_body = NULL;
     }
@@ -266,6 +272,7 @@ fsdk_result fsdk_dm_send(fsdk_client* client, const char* friend_foundry_id, con
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     if (!fsdk_json_escape(body, body_escaped, sizeof(body_escaped))) {
         return FSDK_ERR_INVALID_ARG;
     }
@@ -281,6 +288,7 @@ fsdk_result fsdk_dm_send(fsdk_client* client, const char* friend_foundry_id, con
     if (rc != FSDK_OK) {
         return rc;
     }
+    fsdk_client_note_error(client, status, resp);
     fsdk_string_free(resp);
     return social_status_to_result(status);
 }
@@ -297,12 +305,14 @@ fsdk_result fsdk_dm_mark_read(fsdk_client* client, const char* friend_foundry_id
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     (void)snprintf(path, sizeof(path), "%s/%s/read", SOCIAL_DM_PATH, friend_foundry_id);
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_POST, path,
                            client->player_token, "{}", &resp, &status);
     if (rc != FSDK_OK) {
         return rc;
     }
+    fsdk_client_note_error(client, status, resp);
     fsdk_string_free(resp);
     return social_status_to_result(status);
 }
@@ -320,11 +330,13 @@ static fsdk_result social_post(fsdk_client* client, const char* path, const char
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_POST, path,
                            client->player_token, body_json, &resp, &status);
     if (rc != FSDK_OK) {
         return rc;
     }
+    fsdk_client_note_error(client, status, resp);
     fsdk_string_free(resp);
     return social_status_to_result(status);
 }
@@ -339,11 +351,13 @@ static fsdk_result social_delete(fsdk_client* client, const char* path) {
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_DELETE, path,
                            client->player_token, NULL, &resp, &status);
     if (rc != FSDK_OK) {
         return rc;
     }
+    fsdk_client_note_error(client, status, resp);
     fsdk_string_free(resp);
     return social_status_to_result(status);
 }
@@ -359,11 +373,13 @@ static fsdk_result social_put(fsdk_client* client, const char* path, const char*
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_PUT, path,
                            client->player_token, body_json, &resp, &status);
     if (rc != FSDK_OK) {
         return rc;
     }
+    fsdk_client_note_error(client, status, resp);
     fsdk_string_free(resp);
     return social_status_to_result(status);
 }
@@ -671,6 +687,7 @@ fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, si
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
+    client->last_error[0] = '\0';
     rc = fsdk_http_request(client->base_url, FSDK_HTTP_POST, SOCIAL_PARTIES_PATH,
                            client->player_token, "{}", &resp, &status);
     if (rc != FSDK_OK) {

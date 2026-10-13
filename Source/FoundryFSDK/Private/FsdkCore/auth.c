@@ -189,8 +189,18 @@ static fsdk_result apply_session(fsdk_client* client, const char* resp) {
     json_extract_string(data, "displayName", client->display_name, sizeof(client->display_name));
     json_extract_string(data, "username", client->username, sizeof(client->username));
 
-    /* Persist the rotated refresh token (best-effort; no store -> session only). */
-    fsdk_secret_save(FSDK_SECRET_KEY_REFRESH, client->refresh_token);
+    /* Persist the rotated refresh token (no store -> session only). A persisted copy
+     * that is STALE - the server rotated, the store kept the old one - is worse than
+     * none: the next resume presents a rotated token, auth reads that as reuse and
+     * revokes EVERY session of the identity, the launcher's included (2026-10-13).
+     * So a failed save deletes the stale copy and says so: the next run is "not
+     * signed in", never a revoke-all. */
+    if (fsdk_secret_store_installed()
+        && fsdk_secret_save(FSDK_SECRET_KEY_REFRESH, client->refresh_token) != 0) {
+        fsdk_log(FSDK_LOG_WARN, "fsdk refresh: could not persist the rotated refresh token - "
+                                "clearing the stale stored copy (this session only; sign in again next run)");
+        fsdk_secret_delete(FSDK_SECRET_KEY_REFRESH);
+    }
     return FSDK_OK;
 }
 

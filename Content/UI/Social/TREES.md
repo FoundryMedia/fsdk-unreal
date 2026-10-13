@@ -62,13 +62,13 @@ WBP_FoundryFriendMenu
           - TextBlock **ConfirmButtonText**  (FontSize=14.0, Bold=1, Color=Surface, SlotPad=14,6,14,6)
 
 WBP_FoundryPartyNameplate
-- VerticalBox  (HAlign=Center)
-  - Border  (Fill=SurfaceHighest, HalfHeight=1, HAlign=Center)
-    - HorizontalBox  (ChildVAlign=Center, SlotPad=10,4,12,4)
+- Overlay  (HAlign=Center)
+  - Border  (Fill=SurfaceHighest, FillAlpha=0.9, HalfHeight=1, HAlign=Center, VAlign=Top, SlotPad=0,0,0,15)
+    - HorizontalBox  (ChildVAlign=Center, SlotPad=10,4,12,6)
       - Image **CrownIcon**  (Icon=icon_crown, IconW=14.0, IconH=14.0, Tint=Idle)
       - TextBlock **NameText**  (FontSize=14.0, Bold=1, Color=Text, SlotPad=6,0,0,0)
       - Image **ReadyIcon**  (Icon=icon_check, IconW=14.0, IconH=14.0, Tint=Online, SlotPad=6,0,0,0)
-  - Border **HostBadge**  (Fill=Tertiary, HalfHeight=1, HAlign=Center, SlotPad=0,2,0,0)
+  - Border **HostBadge**  (Fill=Tertiary, HalfHeight=1, HAlign=Center, VAlign=Bottom)
     - TextBlock  (Text=HOST, FontSize=11.0, Bold=1, Color=HostText, SlotPad=8,1,8,1)
 
 WBP_FoundrySocialDrawer

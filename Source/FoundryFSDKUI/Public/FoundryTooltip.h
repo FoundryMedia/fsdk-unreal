@@ -25,5 +25,8 @@ public:
 	void SetLabel(const FText& Label);
 
 protected:
+	// Lifecycle logs at Verbose (the 2026-10-13 tooltip-window investigation).
+	virtual void NativeConstruct() override;
+	virtual void NativeDestruct() override;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> LabelText;
 };

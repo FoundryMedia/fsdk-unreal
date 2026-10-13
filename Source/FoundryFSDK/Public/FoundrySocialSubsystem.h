@@ -190,6 +190,8 @@ private:
 	TArray<FFoundryFriend> CachedBlocked;
 	TArray<FFoundryParty> CachedInvites;
 	int32 CachedPendingRequests = 0;
+	TSet<FString> SentFriendRequests;      // usernames (lowercase) this session already asked - a repeat says so
+	FString InFlightFriendRequestUsername; // the one SendFriendRequest just fired; joins the set on Ok
 	FString PendingInviteUsername; // queued behind a CreateParty, sent once the new party arrives
 	bool bCreatePartyPending = false; // a CreateParty this subsystem fired is in flight - a second
 	                                   // InviteByUsername queues its name instead of firing another

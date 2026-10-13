@@ -239,6 +239,9 @@ static inline const char* fsdk_json_next_object(const char* cursor,
 /* Opaque handle definitions                                                  */
 /* -------------------------------------------------------------------------- */
 
+/* Bound on the server message fsdk_last_error_message() keeps. */
+#define FSDK_LAST_ERROR_MAX 200
+
 struct fsdk_client {
     char* base_url;       /* api base (FMMS), copied at create.                 */
     char* auth_base_url;  /* auth host override for FID login (NULL -> default).*/
@@ -248,6 +251,7 @@ struct fsdk_client {
     char  foundry_id[64]; /* Logged-in player's FID (set by login/refresh).     */
     char  display_name[128]; /* Display name (may be empty).                    */
     char  username[64]; /* Account handle (set by the /v1/me/user probe).       */
+    char  last_error[FSDK_LAST_ERROR_MAX]; /* Server's human message from the last failed social call ("" = none). */
 
     /* Measured-region cache for fsdk_request_match_auto: repeated FindMatch
      * clicks must not re-ping every region. Refreshed when older than
@@ -256,6 +260,20 @@ struct fsdk_client {
     size_t           regions_cache_count;
     long long        regions_cache_at_ms; /* mono stamp; 0 = never filled.     */
 };
+
+/* Remember the server's human-readable message for a failed call: fid's error
+ * envelope is {"errors":[{"timestamp","status","code","message"}]} and the
+ * first "message" is the sentence written for a player ("No player found...").
+ * A 2xx (or no body) clears it. */
+static inline void fsdk_client_note_error(fsdk_client* client, long status, const char* body) {
+    if (client == NULL) {
+        return;
+    }
+    client->last_error[0] = '\0';
+    if (status >= 400 && body != NULL) {
+        (void)json_extract_string(body, "message", client->last_error, sizeof(client->last_error));
+    }
+}
 
 /* Region measurement tuning (client.c). Internal-only: tests shrink/pin these. */
 #define FSDK_REGION_CACHE_TTL_MS (5 * 60 * 1000)
@@ -382,6 +400,8 @@ int fsdk_secret_save(const char* key, const char* value);
 /* On success sets *out_value to a malloc()'d copy the caller frees with free(). */
 int fsdk_secret_load(const char* key, char** out_value);
 int fsdk_secret_delete(const char* key);
+/* 1 when the host installed a secret store (fsdk_set_secret_store), else 0. */
+int fsdk_secret_store_installed(void);
 
 /* -------------------------------------------------------------------------- */
 /* Internal WS dispatch (routes through fsdk_set_ws_transport).                */

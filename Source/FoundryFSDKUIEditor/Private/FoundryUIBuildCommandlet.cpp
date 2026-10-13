@@ -1272,13 +1272,19 @@ namespace
 	// alongside the drawer/rows, not the menus) - see S4 spec section 3.
 	FFoundryWidgetSpec PartyNameplateSpec()
 	{
-		FFoundryWidgetSpec Root{ TEXT("VerticalBox") };
+		// An Overlay so the HOST badge OVERLAPS the pill's bottom edge (Justin, 2026-10-12: "the host
+		// badge should be overlapping") instead of stacking under it; the pill keeps 15 px of bottom
+		// padding so the badge's centre line sits ~6 px under its rim (2026-10-13: "move it down a
+		// bit"). Fill at 90 % so the stage reads through the plate.
+		FFoundryWidgetSpec Root{ TEXT("Overlay") };
 		Root.P(TEXT("HAlign"), TEXT("Center"));
 
 		Root.C(FFoundryWidgetSpec{ TEXT("Border") }
-			.P(TEXT("Fill"), TEXT("SurfaceHighest")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center"))
+			.P(TEXT("Fill"), TEXT("SurfaceHighest")).P(TEXT("FillAlpha"), 0.9f).P(TEXT("HalfHeight"), TEXT("1"))
+			.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Top")).P(TEXT("SlotPad"), TEXT("0,0,0,15"))
+			// The badge's top overlaps the pill's bottom ~4 px, which is this padding, never text.
 			.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
-				.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("10,4,12,4"))
+				.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("10,4,12,6"))
 				.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("CrownIcon"), true }
 					.P(TEXT("Icon"), TEXT("icon_crown")).P(TEXT("IconW"), 14.0f).P(TEXT("IconH"), 14.0f).P(TEXT("Tint"), TEXT("Idle")))
 				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("NameText"), true }
@@ -1288,7 +1294,7 @@ namespace
 					.P(TEXT("SlotPad"), TEXT("6,0,0,0")))));
 
 		Root.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("HostBadge"), true }
-			.P(TEXT("Fill"), TEXT("Tertiary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,2,0,0"))
+			.P(TEXT("Fill"), TEXT("Tertiary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Bottom"))
 			.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
 				.P(TEXT("Text"), TEXT("HOST")).P(TEXT("FontSize"), 11.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("HostText"))
 				.P(TEXT("SlotPad"), TEXT("8,1,8,1"))));

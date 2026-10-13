@@ -1087,6 +1087,12 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry|Auth")
 	FString GetUsername() const { return CachedUsername; }
 
+	/** The platform's own sentence for the LAST failed social action ("No player found..."), set
+	 *  right before OnSocialActionComplete fires with a non-Ok result; empty when the platform
+	 *  gave none (offline, a transport failure). Never a wire code - safe to show a player. */
+	UFUNCTION(BlueprintPure, Category = "Foundry|Social")
+	FString LastSocialActionError() const { return CachedLastSocialActionError; }
+
 	/** Login established/refreshed (DisplayName empty for BYO). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Auth")
 	FFoundryLoginEvent OnLoginComplete;
@@ -1197,6 +1203,7 @@ private:
 	FString CachedDisplayName;
 	FString CachedFoundryId;
 	FString CachedUsername;
+	FString CachedLastSocialActionError;
 
 	// ── Chat state ──
 	// The fsdk_chat handle lives inside FFsdkCoreState (same lock as the client -
