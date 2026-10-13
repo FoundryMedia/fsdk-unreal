@@ -18,6 +18,10 @@ DEFINE_LOG_CATEGORY_STATIC(LogFMMS, Log, All);
 void UFMMSSubsystem::Deinitialize()
 {
 	StopPolling();
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		GI->GetTimerManager().ClearTimer(MessageTtlTimer);
+	}
 	Super::Deinitialize();
 }
 
@@ -464,6 +468,284 @@ void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message)
 	// UE_LOG capture). Do NOT also Print() here - that double-writes every phase line
 	// (the duplicate-console-lines bug, caught live 2026-08-02).
 	OnFMMSStatus.Broadcast(NewPhase, Message);
+	// The lobby-facing state follows the phase AFTER the status event, so a listener that reads
+	// GetMatchmakingState() from OnFMMSStatus sees the previous state, and one bound to
+	// OnMatchmakingStateChanged sees the new one. A dev fixture freezes it (checked inside).
+	ApplyMatchmakingPhase(NewPhase, Message);
+}
+
+// -- lobby-facing matchmaking state ---------------------------------------------------------------
+// A port of Goo Crew's UGooLobbyModel match half (ApplyPhase / RequestFindMatch / RequestCancel /
+// SetState), moved into core so every game's lobby UI reads ONE state machine. It hangs off SetPhase
+// only; nothing in the FMMS flow above reads it. No locks: this is game-thread state, and the FMMS
+// calls it makes (FindMatchAuthenticated / Cancel / Reconnect) are the existing async ones.
+
+namespace
+{
+	double MatchmakingClockNow()
+	{
+		return FPlatformTime::Seconds();
+	}
+}
+
+bool UFMMSSubsystem::CanCancel() const
+{
+	return MatchmakingState == EFoundryMatchmakingState::Pending
+		|| MatchmakingState == EFoundryMatchmakingState::Searching
+		|| MatchmakingState == EFoundryMatchmakingState::WaitingForCapacity
+		|| MatchmakingState == EFoundryMatchmakingState::Found;
+}
+
+bool UFMMSSubsystem::CanRequest() const
+{
+	if (bMatchmakingFixture)
+	{
+		return false;
+	}
+	if (MatchmakingState != EFoundryMatchmakingState::Idle && MatchmakingState != EFoundryMatchmakingState::Failed)
+	{
+		return false;
+	}
+	const UFoundryFSDKSubsystem* Sdk = Fsdk();
+	return Sdk != nullptr && Sdk->IsLoggedIn();
+}
+
+float UFMMSSubsystem::GetElapsedSearchSeconds() const
+{
+	if (!bSearchClockRunning)
+	{
+		return -1.0f;
+	}
+	switch (MatchmakingState)
+	{
+	case EFoundryMatchmakingState::Pending:
+	case EFoundryMatchmakingState::Searching:
+	case EFoundryMatchmakingState::WaitingForCapacity:
+	case EFoundryMatchmakingState::Found:
+	case EFoundryMatchmakingState::CancelPending:
+		return static_cast<float>(FMath::Max(0.0, MatchmakingClockNow() - SearchClockStartedAt));
+	default:
+		return -1.0f;
+	}
+}
+
+void UFMMSSubsystem::SetMatchmakingState(EFoundryMatchmakingState NewState, const FString& Message,
+                                         double MessageTtlSeconds, bool bForceBroadcast)
+{
+	const bool bChanged = bForceBroadcast || NewState != MatchmakingState || Message != MatchmakingMessage;
+	MatchmakingState = NewState;
+	MatchmakingMessage = Message;
+	// Every call re-decides the TTL: a new state/message must never inherit the previous one's expiry.
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		FTimerManager& Timers = GI->GetTimerManager();
+		Timers.ClearTimer(MessageTtlTimer);
+		if (MessageTtlSeconds > 0.0 && !Message.IsEmpty())
+		{
+			Timers.SetTimer(MessageTtlTimer, this, &UFMMSSubsystem::OnMatchmakingMessageExpired,
+			                static_cast<float>(MessageTtlSeconds), false);
+		}
+	}
+	if (bChanged)
+	{
+		OnMatchmakingStateChanged.Broadcast(MatchmakingState, MatchmakingMessage);
+	}
+}
+
+void UFMMSSubsystem::OnMatchmakingMessageExpired()
+{
+	// A transient message ran out: blank it, and let a Failed state fall back to Idle (the failure text was
+	// the only thing keeping the UI on Failed - both Idle and Failed accept a new request).
+	if (MatchmakingState == EFoundryMatchmakingState::Failed)
+	{
+		MatchmakingState = EFoundryMatchmakingState::Idle;
+	}
+	MatchmakingMessage.Reset();
+	OnMatchmakingStateChanged.Broadcast(MatchmakingState, MatchmakingMessage);
+}
+
+bool UFMMSSubsystem::RequestFindMatch(const FString& Queue, const FString& AttributesJson)
+{
+	if (!CanRequest() || Queue.IsEmpty())
+	{
+		return false; // a second click while a request is live is a no-op, never a second ticket
+	}
+	const EFoundryMatchmakingState Before = MatchmakingState;
+	SearchClockStartedAt = MatchmakingClockNow();
+	bSearchClockRunning = true;
+	bCancelPending = false;
+	SetMatchmakingState(EFoundryMatchmakingState::Pending, TEXT("Requesting a match..."), 0.0);
+	FindMatchAuthenticated(Queue, AttributesJson);
+	// FMMS sets its phase synchronously when it takes the request. A request it refused (its 2 s
+	// anti-spam window, a flow already live) leaves the phase where it was - and would leave us stuck
+	// on Pending with nothing ever answering (Goo Crew, 2026-10-08: the second click after a failure).
+	if (Phase == EFMMSPhase::Idle || Phase == EFMMSPhase::Failed || Phase == EFMMSPhase::Reconnectable)
+	{
+		bSearchClockRunning = false;
+		SetMatchmakingState(Before, TEXT("Give it a second, then try again."), 3.0);
+		return false;
+	}
+	return true;
+}
+
+void UFMMSSubsystem::RequestCancel()
+{
+	if (bMatchmakingFixture || !CanCancel())
+	{
+		return;
+	}
+	bCancelPending = true;
+	SetMatchmakingState(EFoundryMatchmakingState::CancelPending, TEXT("Cancelling..."), 0.0);
+	// Cancel() flips the phase to Idle synchronously and drops any late connection through its phase
+	// guard; ApplyMatchmakingPhase resolves CancelPending on that Idle ("Search cancelled.").
+	Cancel();
+}
+
+void UFMMSSubsystem::RequestReconnect()
+{
+	if (bMatchmakingFixture || MatchmakingState != EFoundryMatchmakingState::Reconnectable)
+	{
+		return;
+	}
+	Reconnect();
+}
+
+void UFMMSSubsystem::DeclineReconnectSeat()
+{
+	if (bMatchmakingFixture || MatchmakingState != EFoundryMatchmakingState::Reconnectable)
+	{
+		return;
+	}
+	Cancel(); // from Reconnectable this abandons the seat's ticket server-side and resets the phase to Idle
+}
+
+void UFMMSSubsystem::ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message)
+{
+	if (bMatchmakingFixture)
+	{
+		return; // a dev fixture owns the displayed state; real phase changes are ignored
+	}
+	switch (InPhase)
+	{
+	case EFMMSPhase::Idle:
+		if (bCancelPending)
+		{
+			bCancelPending = false;
+			bSearchClockRunning = false;
+			SetMatchmakingState(EFoundryMatchmakingState::Idle, TEXT("Search cancelled."), 4.0);
+		}
+		else
+		{
+			bSearchClockRunning = false;
+			SetMatchmakingState(EFoundryMatchmakingState::Idle, Message);
+		}
+		break;
+	case EFMMSPhase::Authenticating:
+	case EFMMSPhase::Requesting:
+		if (!bSearchClockRunning)
+		{
+			SearchClockStartedAt = MatchmakingClockNow();
+			bSearchClockRunning = true;
+		}
+		if (!bCancelPending)
+		{
+			SetMatchmakingState(EFoundryMatchmakingState::Pending, Message);
+		}
+		break;
+	case EFMMSPhase::Searching:
+		if (!bSearchClockRunning)
+		{
+			SearchClockStartedAt = MatchmakingClockNow();
+			bSearchClockRunning = true;
+		}
+		if (!bCancelPending)
+		{
+			SetMatchmakingState(EFoundryMatchmakingState::Searching, Message);
+		}
+		break;
+	case EFMMSPhase::WaitingForCapacity:
+		// Still a live search (the search clock keeps running) - Message is the server-composed
+		// sentence (incl. any "~N min left"), rendered verbatim by the status line.
+		if (!bSearchClockRunning)
+		{
+			SearchClockStartedAt = MatchmakingClockNow();
+			bSearchClockRunning = true;
+		}
+		if (!bCancelPending)
+		{
+			SetMatchmakingState(EFoundryMatchmakingState::WaitingForCapacity, Message);
+		}
+		break;
+	case EFMMSPhase::Connecting:
+		// A match arrived. If a cancel is pending, FMMS itself decides: its Cancel() during
+		// Connecting cancels the ticket and flips to Idle, and a late connection callback is
+		// dropped by its phase guard. We keep showing "Cancelling" until that Idle lands.
+		if (!bCancelPending)
+		{
+			SetMatchmakingState(EFoundryMatchmakingState::Found, TEXT("Match found - connecting"));
+		}
+		break;
+	case EFMMSPhase::Traveling:
+		// Past the point of no return: the client is travelling. Cancel is off.
+		bCancelPending = false;
+		SetMatchmakingState(EFoundryMatchmakingState::Traveling, TEXT("Joining the server..."));
+		break;
+	case EFMMSPhase::Failed:
+		bCancelPending = false;
+		bSearchClockRunning = false;
+		SetMatchmakingState(EFoundryMatchmakingState::Failed, Message.IsEmpty() ? TEXT("try again.") : Message, 6.0);
+		break;
+	case EFMMSPhase::Reconnectable:
+		bCancelPending = false;
+		bSearchClockRunning = false;
+		SetMatchmakingState(EFoundryMatchmakingState::Reconnectable,
+		                    Message.IsEmpty() ? TEXT("You are seated in a live match.") : Message);
+		break;
+	default:
+		break;
+	}
+}
+
+bool UFMMSSubsystem::SetMatchmakingFixture(EFoundryMatchmakingState State, const FString& Message, float ElapsedSeconds)
+{
+#if !UE_BUILD_SHIPPING
+	bMatchmakingFixture = true;
+	bCancelPending = false;
+	if (ElapsedSeconds >= 0.0f)
+	{
+		SearchClockStartedAt = MatchmakingClockNow() - static_cast<double>(ElapsedSeconds);
+		bSearchClockRunning = true;
+	}
+	else
+	{
+		bSearchClockRunning = false;
+	}
+	// Forced: the fixture flag itself changed what the UI shows ("Dev fixture - Find Match disabled."),
+	// even when the state and message happen to equal the current ones.
+	SetMatchmakingState(State, Message, 0.0, true);
+	return true;
+#else
+	(void)State;
+	(void)Message;
+	(void)ElapsedSeconds;
+	return false;
+#endif
+}
+
+void UFMMSSubsystem::ClearMatchmakingFixture()
+{
+#if !UE_BUILD_SHIPPING
+	if (!bMatchmakingFixture)
+	{
+		return;
+	}
+	bMatchmakingFixture = false;
+	bCancelPending = false;
+	bSearchClockRunning = false;
+	// Re-derive from the real phase (its message is gone, so the defaults in the table apply).
+	ApplyMatchmakingPhase(Phase, FString());
+	OnMatchmakingStateChanged.Broadcast(MatchmakingState, MatchmakingMessage);
+#endif
 }
 
 void UFMMSSubsystem::Fail(const FString& Message)

@@ -53,6 +53,11 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultSettingsMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundrySettingsMenu.WBP_FoundrySettingsMenu_C")));
 	DefaultKeybindRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryKeybindRow.WBP_FoundryKeybindRow_C")));
 	DefaultTooltip = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryTooltip.WBP_FoundryTooltip_C")));
+
+	// The lobby app bar + match cluster family, generated into /FoundryFSDK/UI/Match.
+	DefaultAppBar = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryAppBar.WBP_FoundryAppBar_C")));
+	DefaultMatchCluster = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryMatchCluster.WBP_FoundryMatchCluster_C")));
+	DefaultModeRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryModeRow.WBP_FoundryModeRow_C")));
 }
 
 void UFoundryUISettings::ApplyMatchmakingCopyOverrides()

@@ -1,0 +1,48 @@
+WBP_FoundryAppBar
+- SizeBox  (H=76.0)
+  - Border  (Fill=SurfaceLow, Radius=0.0)
+    - HorizontalBox  (ChildVAlign=Center)
+      - TextBlock **TitleText**  (FontRole=Heading, FontSize=20.0, Bold=1, Color=Text, SlotPad=24,0,0,0)
+      - Spacer  (Size=Fill)
+      - HorizontalBox  (ChildVAlign=Center, SlotPad=0,0,16,0)
+        - Image **PlayerAvatar**  (Icon=icon_person, IconW=28.0, IconH=28.0)
+        - TextBlock **PlayerNameText**  (FontSize=14.0, Bold=1, Color=Text, SlotPad=10,0,0,0)
+      - SizeBox  (W=48.0, H=48.0, SlotPad=0,0,12,0)
+        - Button **SocialButton**  (Normal=SurfaceHigh, Hovered=SurfaceHighest, Pressed=SurfaceHighest, HalfHeight=1)
+          - Overlay
+            - Image  (Icon=icon_users, IconW=22.0, IconH=22.0, Tint=Text, HAlign=Center, VAlign=Center)
+            - Border **SocialBadge**  (Fill=Error, HalfHeight=1, HAlign=Right, VAlign=Top, Collapsed=1)
+              - TextBlock **SocialBadgeText**  (FontSize=11.0, Bold=1, Color=Text, SlotPad=6,1,6,1)
+      - SizeBox  (W=48.0, H=48.0, SlotPad=0,0,24,0)
+        - Button **SettingsButton**  (Normal=SurfaceHigh, Hovered=SurfaceHighest, Pressed=SurfaceHighest, HalfHeight=1)
+          - Image  (Icon=icon_gear, IconW=22.0, IconH=22.0, Tint=Text, HAlign=Center, VAlign=Center)
+
+WBP_FoundryMatchCluster
+- VerticalBox  (ChildHAlign=Center)
+  - Border **ModeMenu**  (Fill=SurfaceHighest, Radius=24.0, RadiusRole=Panel, Collapsed=1, HAlign=Center, SlotPad=0,0,0,8)
+    - VerticalBox **ModeList**  (SlotPad=8.0)
+  - Button **ModeButton**  (Normal=SurfaceHigh, Hovered=SurfaceHighest, Pressed=SurfaceHighest, HalfHeight=1, HAlign=Center, SlotPad=0,0,0,12)
+    - HorizontalBox  (ChildVAlign=Center, SlotPad=16,8,12,8)
+      - TextBlock **ModeText**  (FontSize=14.0, Bold=1, Color=Text)
+      - Image **ModeChevron**  (Icon=icon_chevron_down, IconW=16.0, IconH=16.0, Tint=TextSecondary, Pivot=0.5,0.5, SlotPad=8,0,0,0)
+  - SizeBox  (W=360.0, H=72.0, HAlign=Center)
+    - Overlay
+      - Button **FindMatchButton**  (Normal=Primary, Hovered=PrimaryContainer, Pressed=PrimaryContainer, Disabled=SurfaceHigh, HalfHeight=1)
+        - TextBlock **FindMatchText**  (Text=FIND MATCH, FontRole=Heading, FontSize=22.0, Bold=1, Color=Surface, HAlign=Center, VAlign=Center)
+      - Button **CancelButton**  (Normal=Error, Hovered=Error, Pressed=Error, HalfHeight=1, Collapsed=1)
+        - TextBlock **CancelText**  (Text=CANCEL SEARCH, FontRole=Heading, FontSize=22.0, Bold=1, Color=Surface, HAlign=Center, VAlign=Center)
+  - HorizontalBox **StatusRow**  (ChildVAlign=Center, HAlign=Center, SlotPad=0,10,0,0)
+    - Image **Spinner**  (Icon=icon_spinner, IconW=20.0, IconH=20.0, Tint=Primary, Pivot=0.5,0.5)
+    - TextBlock **StatusText**  (FontSize=14.0, Color=TextSecondary, SlotPad=8,0,8,0)
+    - Button **LeaveMatchButton**  (Normal=Transparent, Hovered=SurfaceHigh, Pressed=SurfaceHigh, HalfHeight=1)
+      - TextBlock  (Text=Leave match, FontSize=14.0, Bold=1, Color=Secondary, SlotPad=10,4,10,4)
+  - TextBlock **PartyText**  (FontSize=12.0, Color=TextSecondary, HAlign=Center, SlotPad=0,6,0,0)
+
+WBP_FoundryModeRow
+- Button **SelectButton**  (Normal=Transparent, Hovered=SurfaceHigh, Pressed=SurfaceHigh)
+  - HorizontalBox  (ChildVAlign=Center, SlotPad=12,8,12,8)
+    - VerticalBox  (Size=Fill)
+      - TextBlock **LabelText**  (FontSize=14.0, Bold=1, Color=Text)
+      - TextBlock **DetailText**  (FontSize=12.0, Color=TextSecondary)
+    - Image **CheckIcon**  (Icon=icon_check, IconW=16.0, IconH=16.0, Tint=Online, Collapsed=1, SlotPad=12,0,0,0)
+

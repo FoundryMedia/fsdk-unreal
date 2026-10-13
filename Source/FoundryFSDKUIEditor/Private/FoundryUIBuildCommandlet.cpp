@@ -89,11 +89,14 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Texture2D.h"
 #include "Factories/TextureFactory.h"
+#include "FoundryAppBar.h"
 #include "FoundryConfirmDialog.h"
 #include "FoundryFriendMenu.h"
 #include "FoundryFriendRow.h"
 #include "FoundryInviteRow.h"
 #include "FoundryKeybindRow.h"
+#include "FoundryMatchCluster.h"
+#include "FoundryModeRow.h"
 #include "FoundryPartyNameplate.h"
 #include "FoundryPauseMenu.h"
 #include "FoundrySettingsMenu.h"
@@ -320,10 +323,23 @@ namespace
 		 *  Empty means UFoundrySettingsMenu / UFoundryKeybindRow themselves. */
 		FString SettingsParent;
 		FString KeybindRowParent;
+		/** Resolved exactly like DrawerParent, for the generated app bar / match cluster / mode row
+		 *  WBPs. Empty means UFoundryAppBar / UFoundryMatchCluster / UFoundryModeRow themselves. */
+		FString AppBarParent;
+		FString MatchClusterParent;
+		FString ModeRowParent;
 		/** The menus WBPs' own destination/prefix ("menus": {out, prefix}); either left empty means
 		 *  "use Out/Prefix above" (the social values) for THAT field. */
 		FString MenusOut;
 		FString MenusPrefix;
+		/** The Match family (app bar / match cluster / mode row) is OPT-IN with a profile: it is
+		 *  built ONLY when the profile carries a "match": {out, prefix} object (bHasMatch). Either
+		 *  field left empty means "use Out/Prefix above" for THAT field. A profile without the
+		 *  object (e.g. Goo Crew's, which hand-builds its own bar/cluster/rows) builds none of it
+		 *  and prints no ini lines for it. */
+		bool bHasMatch = false;
+		FString MatchOut;
+		FString MatchPrefix;
 		FFoundryUIPalette Palette;
 		FFoundryUIFonts Fonts;
 		FFoundryUIRadii Radii;
@@ -359,12 +375,23 @@ namespace
 		Root->TryGetStringField(TEXT("confirmParent"), OutProfile.ConfirmParent);
 		Root->TryGetStringField(TEXT("settingsParent"), OutProfile.SettingsParent);
 		Root->TryGetStringField(TEXT("keybindRowParent"), OutProfile.KeybindRowParent);
+		Root->TryGetStringField(TEXT("appBarParent"), OutProfile.AppBarParent);
+		Root->TryGetStringField(TEXT("matchClusterParent"), OutProfile.MatchClusterParent);
+		Root->TryGetStringField(TEXT("modeRowParent"), OutProfile.ModeRowParent);
 
 		const TSharedPtr<FJsonObject>* MenusObj = nullptr;
 		if (Root->TryGetObjectField(TEXT("menus"), MenusObj) && MenusObj && MenusObj->IsValid())
 		{
 			(*MenusObj)->TryGetStringField(TEXT("out"), OutProfile.MenusOut);
 			(*MenusObj)->TryGetStringField(TEXT("prefix"), OutProfile.MenusPrefix);
+		}
+
+		const TSharedPtr<FJsonObject>* MatchObj = nullptr;
+		if (Root->TryGetObjectField(TEXT("match"), MatchObj) && MatchObj && MatchObj->IsValid())
+		{
+			OutProfile.bHasMatch = true;
+			(*MatchObj)->TryGetStringField(TEXT("out"), OutProfile.MatchOut);
+			(*MatchObj)->TryGetStringField(TEXT("prefix"), OutProfile.MatchPrefix);
 		}
 
 		const TSharedPtr<FJsonObject>* PaletteObj = nullptr;
@@ -442,7 +469,8 @@ namespace
 	/** The [/Script/FoundryFSDKUI.FoundryUISettings] ini block a project pastes into its own
 	 *  DefaultGame.ini to point UFoundryUISettings at the just-built skinned copies and palette -
 	 *  printed so a profile run never has to be hand-derived into ini form again. */
-	FString BuildIniBlock(const FString& SocialPath, const FString& Prefix, const FString& MenusPath, const FString& MenusPrefix, const FFoundryUIPalette& Palette)
+	FString BuildIniBlock(const FString& SocialPath, const FString& Prefix, const FString& MenusPath, const FString& MenusPrefix,
+		bool bMatch, const FString& MatchPath, const FString& MatchPrefix, const FFoundryUIPalette& Palette)
 	{
 		FString S;
 		S += TEXT("[/Script/FoundryFSDKUI.FoundryUISettings]") LINE_TERMINATOR;
@@ -456,6 +484,12 @@ namespace
 		S += FString::Printf(TEXT("DefaultSettingsMenu=%s/%sSettingsMenu.%sSettingsMenu_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultKeybindRow=%s/%sKeybindRow.%sKeybindRow_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultTooltip=%s/%sTooltip.%sTooltip_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
+		if (bMatch)
+		{
+			S += FString::Printf(TEXT("DefaultAppBar=%s/%sAppBar.%sAppBar_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
+			S += FString::Printf(TEXT("DefaultMatchCluster=%s/%sMatchCluster.%sMatchCluster_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
+			S += FString::Printf(TEXT("DefaultModeRow=%s/%sModeRow.%sModeRow_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
+		}
 		S += TEXT("Palette=(");
 		S += FString::Printf(TEXT("Surface=%s,"), *FormatLinearColor(Palette.Surface));
 		S += FString::Printf(TEXT("SurfaceLow=%s,"), *FormatLinearColor(Palette.SurfaceLow));
@@ -1789,6 +1823,154 @@ namespace
 			.P(TEXT("FontSize"), 13.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("12,6,12,6")));
 		return Root;
 	}
+
+	// -- the Match family (ST-139): the lobby app bar, the find-match cluster and its mode row. Bound
+	// names == the parents' (UFoundryAppBar / UFoundryMatchCluster / UFoundryModeRow)
+	// BindWidgetOptional members verbatim. ------------------------------------------------------
+
+	/** One 48x48 round icon button of the app bar (Social, Settings) - same style, different icon. */
+	FFoundryWidgetSpec AppBarIconButton(const TCHAR* ButtonName, const TCHAR* SlotPad)
+	{
+		FFoundryWidgetSpec Box{ TEXT("SizeBox") };
+		Box.P(TEXT("W"), 48.0f).P(TEXT("H"), 48.0f).P(TEXT("SlotPad"), SlotPad);
+		Box.C(FFoundryWidgetSpec{ TEXT("Button"), ButtonName, true }
+			.P(TEXT("Normal"), TEXT("SurfaceHigh")).P(TEXT("Hovered"), TEXT("SurfaceHighest")).P(TEXT("Pressed"), TEXT("SurfaceHighest"))
+			.P(TEXT("HalfHeight"), TEXT("1")));
+		return Box;
+	}
+
+	FFoundryWidgetSpec AppBarSpec()
+	{
+		FFoundryWidgetSpec Root{ TEXT("SizeBox") };
+		Root.P(TEXT("H"), 76.0f);
+
+		FFoundryWidgetSpec Row{ TEXT("HorizontalBox") };
+		Row.P(TEXT("ChildVAlign"), TEXT("Center"));
+
+		Row.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("TitleText"), true }
+			.P(TEXT("FontRole"), TEXT("Heading")).P(TEXT("FontSize"), 20.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text"))
+			.P(TEXT("SlotPad"), TEXT("24,0,0,0")));
+		Row.C(FFoundryWidgetSpec{ TEXT("Spacer") }.P(TEXT("Size"), TEXT("Fill")));
+
+		// The signed-in player: avatar (tinted at runtime - no Tint here) + display name.
+		Row.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
+			.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,0,16,0"))
+			.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("PlayerAvatar"), true }
+				.P(TEXT("Icon"), TEXT("icon_person")).P(TEXT("IconW"), 28.0f).P(TEXT("IconH"), 28.0f))
+			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("PlayerNameText"), true }
+				.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("10,0,0,0"))));
+
+		// Social: a people icon with a corner badge (Collapsed until the runtime has a count).
+		FFoundryWidgetSpec SocialBox = AppBarIconButton(TEXT("SocialButton"), TEXT("0,0,12,0"));
+		SocialBox.Children[0].C(FFoundryWidgetSpec{ TEXT("Overlay") }
+			.C(FFoundryWidgetSpec{ TEXT("Image") }
+				.P(TEXT("Icon"), TEXT("icon_users")).P(TEXT("IconW"), 22.0f).P(TEXT("IconH"), 22.0f).P(TEXT("Tint"), TEXT("Text"))
+				.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center")))
+			.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("SocialBadge"), true }
+				.P(TEXT("Fill"), TEXT("Error")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Right")).P(TEXT("VAlign"), TEXT("Top"))
+				.P(TEXT("Collapsed"), TEXT("1"))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("SocialBadgeText"), true }
+					.P(TEXT("FontSize"), 11.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("6,1,6,1")))));
+		Row.C(MoveTemp(SocialBox));
+
+		// Settings: the gear. Centered explicitly - a Fill-aligned Image would stretch the 22 px
+		// brush to the whole 48 px button (the same trap the add-friend button's icon documents).
+		FFoundryWidgetSpec SettingsBox = AppBarIconButton(TEXT("SettingsButton"), TEXT("0,0,24,0"));
+		SettingsBox.Children[0].C(FFoundryWidgetSpec{ TEXT("Image") }
+			.P(TEXT("Icon"), TEXT("icon_gear")).P(TEXT("IconW"), 22.0f).P(TEXT("IconH"), 22.0f).P(TEXT("Tint"), TEXT("Text"))
+			.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center")));
+		Row.C(MoveTemp(SettingsBox));
+
+		FFoundryWidgetSpec Bar{ TEXT("Border") };
+		Bar.P(TEXT("Fill"), TEXT("SurfaceLow"));
+		Bar.P(TEXT("Radius"), 0.0f); // a full-width top bar is square - the Panel radius default would round its corners
+		Bar.C(MoveTemp(Row));
+		Root.C(MoveTemp(Bar));
+		return Root;
+	}
+
+	FFoundryWidgetSpec MatchClusterSpec(const FFoundryUIRadii& Radii)
+	{
+		FFoundryWidgetSpec Root{ TEXT("VerticalBox") };
+		Root.P(TEXT("ChildHAlign"), TEXT("Center"));
+
+		// The mode list popup: Collapsed until the ModeButton opens it; rows are runtime-built
+		// (UFoundryModeRow) into ModeList.
+		Root.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("ModeMenu"), true }
+			.P(TEXT("Fill"), TEXT("SurfaceHighest")).P(TEXT("Radius"), Radii.Panel).P(TEXT("RadiusRole"), TEXT("Panel"))
+			.P(TEXT("Collapsed"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,0,0,8"))
+			.C(FFoundryWidgetSpec{ TEXT("VerticalBox"), TEXT("ModeList"), true }
+				.P(TEXT("SlotPad"), 8.0f)));
+
+		Root.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("ModeButton"), true }
+			.P(TEXT("Normal"), TEXT("SurfaceHigh")).P(TEXT("Hovered"), TEXT("SurfaceHighest")).P(TEXT("Pressed"), TEXT("SurfaceHighest"))
+			.P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,0,0,12"))
+			.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
+				.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("16,8,12,8"))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("ModeText"), true }
+					.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")))
+				// Pivot centre: the runtime tweens this 0 <-> 180 as the menu opens/closes.
+				.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("ModeChevron"), true }
+					.P(TEXT("Icon"), TEXT("icon_chevron_down")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("TextSecondary"))
+					.P(TEXT("Pivot"), TEXT("0.5,0.5")).P(TEXT("SlotPad"), TEXT("8,0,0,0")))));
+
+		// FIND MATCH and CANCEL SEARCH stack in one Overlay; the runtime shows exactly one (a WBP
+		// with no CancelButton falls back to relabeling FindMatchButton).
+		Root.C(FFoundryWidgetSpec{ TEXT("SizeBox") }
+			.P(TEXT("W"), 360.0f).P(TEXT("H"), 72.0f).P(TEXT("HAlign"), TEXT("Center"))
+			.C(FFoundryWidgetSpec{ TEXT("Overlay") }
+				.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("FindMatchButton"), true }
+					.P(TEXT("Normal"), TEXT("Primary")).P(TEXT("Hovered"), TEXT("PrimaryContainer")).P(TEXT("Pressed"), TEXT("PrimaryContainer"))
+					.P(TEXT("Disabled"), TEXT("SurfaceHigh")).P(TEXT("HalfHeight"), TEXT("1"))
+					.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("FindMatchText"), true }
+						.P(TEXT("Text"), TEXT("FIND MATCH")).P(TEXT("FontRole"), TEXT("Heading")).P(TEXT("FontSize"), 22.0f).P(TEXT("Bold"), TEXT("1"))
+						.P(TEXT("Color"), TEXT("Surface")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center"))))
+				.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("CancelButton"), true }
+					.P(TEXT("Normal"), TEXT("Error")).P(TEXT("Hovered"), TEXT("Error")).P(TEXT("Pressed"), TEXT("Error"))
+					.P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("Collapsed"), TEXT("1"))
+					.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("CancelText"), true }
+						.P(TEXT("Text"), TEXT("CANCEL SEARCH")).P(TEXT("FontRole"), TEXT("Heading")).P(TEXT("FontSize"), 22.0f).P(TEXT("Bold"), TEXT("1"))
+						.P(TEXT("Color"), TEXT("Surface")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center"))))));
+
+		// Status: spinner (rotated at runtime) + the status sentence + Leave match (Reconnectable only).
+		Root.C(FFoundryWidgetSpec{ TEXT("HorizontalBox"), TEXT("StatusRow"), true }
+			.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,10,0,0"))
+			.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("Spinner"), true }
+				.P(TEXT("Icon"), TEXT("icon_spinner")).P(TEXT("IconW"), 20.0f).P(TEXT("IconH"), 20.0f).P(TEXT("Tint"), TEXT("Primary"))
+				.P(TEXT("Pivot"), TEXT("0.5,0.5")))
+			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("StatusText"), true }
+				.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("SlotPad"), TEXT("8,0,8,0")))
+			.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("LeaveMatchButton"), true }
+				.P(TEXT("Normal"), TEXT("Transparent")).P(TEXT("Hovered"), TEXT("SurfaceHigh")).P(TEXT("Pressed"), TEXT("SurfaceHigh"))
+				.P(TEXT("HalfHeight"), TEXT("1"))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
+					.P(TEXT("Text"), TEXT("Leave match")).P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Secondary"))
+					.P(TEXT("SlotPad"), TEXT("10,4,10,4")))));
+
+		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("PartyText"), true }
+			.P(TEXT("FontSize"), 12.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,6,0,0")));
+		return Root;
+	}
+
+	FFoundryWidgetSpec ModeRowSpec()
+	{
+		// The Button is the WBP root (bound SelectButton); a mode the player cannot queue (empty
+		// QueueName) is shown disabled by the runtime, so Disabled stays the default (= Normal).
+		FFoundryWidgetSpec Root{ TEXT("Button"), TEXT("SelectButton"), true };
+		Root.P(TEXT("Normal"), TEXT("Transparent")).P(TEXT("Hovered"), TEXT("SurfaceHigh")).P(TEXT("Pressed"), TEXT("SurfaceHigh"));
+		Root.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
+			.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("12,8,12,8"))
+			.C(FFoundryWidgetSpec{ TEXT("VerticalBox") }
+				.P(TEXT("Size"), TEXT("Fill"))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("LabelText"), true }
+					.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("DetailText"), true }
+					.P(TEXT("FontSize"), 12.0f).P(TEXT("Color"), TEXT("TextSecondary"))))
+			.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("CheckIcon"), true }
+				.P(TEXT("Icon"), TEXT("icon_check")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("Online"))
+				.P(TEXT("Collapsed"), TEXT("1")).P(TEXT("SlotPad"), TEXT("12,0,0,0"))));
+		return Root;
+	}
 }
 
 UFoundryUIBuildCommandlet::UFoundryUIBuildCommandlet()
@@ -1959,12 +2141,65 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		}
 	}
 
+	// Match family (ST-139): the app bar, the find-match cluster and its mode row. Without a profile
+	// it is ALWAYS built, under OutRoot/Match with the plugin's WBP_Foundry* names. WITH a profile it
+	// is OPT-IN: built only when the profile carries a "match" object (a profile without one - Goo
+	// Crew's - builds exactly what it always did and prints no ini lines for this family). Its
+	// out/prefix fall back to the social values when the object leaves them empty.
+	const bool bBuildMatch = !bHasProfile || Profile.bHasMatch;
+	const FString MatchPath = bHasProfile ? (!Profile.MatchOut.IsEmpty() ? Profile.MatchOut : SocialPath) : (OutRoot / TEXT("Match"));
+	const FString MatchPrefix = bHasProfile ? (!Profile.MatchPrefix.IsEmpty() ? Profile.MatchPrefix : Prefix) : TEXT("WBP_Foundry");
+	const FString AppBarAssetName = bHasProfile ? (MatchPrefix + TEXT("AppBar")) : TEXT("WBP_FoundryAppBar");
+	const FString MatchClusterAssetName = bHasProfile ? (MatchPrefix + TEXT("MatchCluster")) : TEXT("WBP_FoundryMatchCluster");
+	const FString ModeRowAssetName = bHasProfile ? (MatchPrefix + TEXT("ModeRow")) : TEXT("WBP_FoundryModeRow");
+
+	UClass* AppBarParentClass = UFoundryAppBar::StaticClass();
+	if (bBuildMatch && bHasProfile && !Profile.AppBarParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryAppBar::StaticClass(), nullptr, *Profile.AppBarParent);
+		if (Loaded != nullptr)
+		{
+			AppBarParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile appBarParent '%s' failed to resolve - using UFoundryAppBar"), *Profile.AppBarParent);
+		}
+	}
+	UClass* MatchClusterParentClass = UFoundryMatchCluster::StaticClass();
+	if (bBuildMatch && bHasProfile && !Profile.MatchClusterParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryMatchCluster::StaticClass(), nullptr, *Profile.MatchClusterParent);
+		if (Loaded != nullptr)
+		{
+			MatchClusterParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile matchClusterParent '%s' failed to resolve - using UFoundryMatchCluster"), *Profile.MatchClusterParent);
+		}
+	}
+	UClass* ModeRowParentClass = UFoundryModeRow::StaticClass();
+	if (bBuildMatch && bHasProfile && !Profile.ModeRowParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryModeRow::StaticClass(), nullptr, *Profile.ModeRowParent);
+		if (Loaded != nullptr)
+		{
+			ModeRowParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile modeRowParent '%s' failed to resolve - using UFoundryModeRow"), *Profile.ModeRowParent);
+		}
+	}
+
 	// Two separate buffers - so a -dump that lands the menus WBPs in their own folder gets a
 	// TREES.md listing ONLY the menus widgets there, and the social folder's TREES.md lists ONLY
 	// the social ones. When the two paths are the SAME folder, both buffers are written into one
 	// file (below), so that case still reads as a single complete dump.
 	FString SocialDump;
 	FString MenusDump;
+	FString MatchDump; // stays empty when the Match family is not built (opt-in with a profile)
 
 	bAnySaveFailed |= !BuildWBP(SocialPath, *FriendRowAssetName, UFoundryFriendRow::StaticClass(), FriendRowSpec(), Palette, Radii, Fonts, Icons, SocialDump);
 	bAnySaveFailed |= !BuildWBP(SocialPath, *InviteRowAssetName, UFoundryInviteRow::StaticClass(), InviteRowSpec(), Palette, Radii, Fonts, Icons, SocialDump);
@@ -1976,18 +2211,24 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	bAnySaveFailed |= !BuildWBP(MenusPath, *KeybindRowAssetName, KeybindRowParentClass, KeybindRowSpec(), Palette, Radii, Fonts, Icons, MenusDump);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *SettingsMenuAssetName, SettingsParentClass, SettingsMenuSpec(Radii), Palette, Radii, Fonts, Icons, MenusDump);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *TooltipAssetName, UFoundryTooltip::StaticClass(), TooltipSpec(), Palette, Radii, Fonts, Icons, MenusDump);
+	if (bBuildMatch)
+	{
+		bAnySaveFailed |= !BuildWBP(MatchPath, *AppBarAssetName, AppBarParentClass, AppBarSpec(), Palette, Radii, Fonts, Icons, MatchDump);
+		bAnySaveFailed |= !BuildWBP(MatchPath, *MatchClusterAssetName, MatchClusterParentClass, MatchClusterSpec(Radii), Palette, Radii, Fonts, Icons, MatchDump);
+		bAnySaveFailed |= !BuildWBP(MatchPath, *ModeRowAssetName, ModeRowParentClass, ModeRowSpec(), Palette, Radii, Fonts, Icons, MatchDump);
+	}
 
 	if (bHasProfile)
 	{
 		// Printed unconditionally (not gated on -dump) - this is the thing a profile run exists to
 		// save someone from hand-deriving: paste it into the project's DefaultGame.ini.
-		const FString Ini = BuildIniBlock(SocialPath, Prefix, MenusPath, MenusPrefix, Palette);
+		const FString Ini = BuildIniBlock(SocialPath, Prefix, MenusPath, MenusPrefix, bBuildMatch, MatchPath, MatchPrefix, Palette);
 		UE_LOG(LogFoundryUIBuild, Log, TEXT("-- paste into DefaultGame.ini --\n%s"), *Ini);
 	}
 
 	if (bDump)
 	{
-		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s"), *SocialDump, *MenusDump);
+		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s%s"), *SocialDump, *MenusDump, *MatchDump);
 
 		// A profile's "out" is a project content path (e.g. "/Game/UI/Lobby"), not the plugin's own
 		// Content dir - resolve it to its mounted disk directory; without a profile, TREES.md still
@@ -2022,16 +2263,31 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		const FString TreesDir = ResolveTreesDir(SocialPath, TEXT("UI/Social"));
 		const FString MenusTreesDir = ResolveTreesDir(MenusPath, TEXT("UI/Menus"));
 
-		if (MenusTreesDir == TreesDir)
+		// One TREES.md per distinct folder; families that share a folder (the menus with the social
+		// WBPs, the Match family with either) share ONE file carrying every section, in build order -
+		// still the complete dump for that folder.
+		TArray<TPair<FString, FString>> TreesFiles;
+		auto AddTrees = [&TreesFiles](const FString& Dir, const FString& Content)
 		{
-			// The menus WBPs share the social folder - one file, both sections (still the complete
-			// dump for that folder).
-			bAnySaveFailed |= TreesDir.IsEmpty() || !WriteTreesFile(TreesDir, SocialDump + MenusDump);
+			for (TPair<FString, FString>& Entry : TreesFiles)
+			{
+				if (Entry.Key == Dir)
+				{
+					Entry.Value += Content;
+					return;
+				}
+			}
+			TreesFiles.Emplace(Dir, Content);
+		};
+		AddTrees(TreesDir, SocialDump);
+		AddTrees(MenusTreesDir, MenusDump);
+		if (bBuildMatch)
+		{
+			AddTrees(ResolveTreesDir(MatchPath, TEXT("UI/Match")), MatchDump);
 		}
-		else
+		for (const TPair<FString, FString>& Entry : TreesFiles)
 		{
-			bAnySaveFailed |= TreesDir.IsEmpty() || !WriteTreesFile(TreesDir, SocialDump);
-			bAnySaveFailed |= MenusTreesDir.IsEmpty() || !WriteTreesFile(MenusTreesDir, MenusDump);
+			bAnySaveFailed |= Entry.Key.IsEmpty() || !WriteTreesFile(Entry.Key, Entry.Value);
 		}
 	}
 

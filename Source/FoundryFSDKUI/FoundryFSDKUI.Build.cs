@@ -40,6 +40,7 @@ public class FoundryFSDKUI : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"InputCore",
+			"Json", // UFoundryMatchCluster merges the party id into the mode's ticket-attributes JSON
 			"EnhancedInput",
 			"GameplayTags",
 		});

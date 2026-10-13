@@ -307,6 +307,28 @@ def draw_external(d, s):
     _line(d, s, [(0.4167, 0.5833), (0.875, 0.125)], w)
 
 
+def draw_gear(d, s):
+    """Eight-tooth gear with a round hub hole - the app bar's Settings button. Ported from
+    GooCrew/SourceAssets/icons/make_icons.py's draw_gear (same geometry)."""
+    n = 8
+    ro, ri = 0.44, 0.33
+    pts = []
+    for i in range(n):
+        a = 2 * pi * i / n
+        for rr, off in ((ri, -0.30), (ro, -0.16), (ro, 0.16), (ri, 0.30)):
+            pts.append((0.5 + rr * cos(a + off), 0.5 + rr * sin(a + off)))
+    _poly(d, s, pts, round_w=0.04)
+    _dot(d, s, 0.5, 0.5, 0.14, CLEAR)
+
+
+def draw_spinner(d, s):
+    """Open ring arc (a gap at the upper-left) - the match cluster's busy indicator, rotated at
+    runtime. Ported from GooCrew/SourceAssets/icons/make_icons.py's draw_spinner (same geometry)."""
+    w = s * 0.10
+    m = s * 0.14
+    d.arc([m, m, s - m, s - m], 300, 220, fill=(255, 255, 255, 255), width=int(w))
+
+
 # --------------------------------------------------------------------------------------
 # Contact sheet
 # --------------------------------------------------------------------------------------
@@ -392,6 +414,8 @@ GLYPHS = [
     ("icon_check.png", draw_check),
     ("icon_external.png", draw_external),
     ("icon_crown.png", draw_crown),
+    ("icon_gear.png", draw_gear),
+    ("icon_spinner.png", draw_spinner),
 ]
 
 if __name__ == "__main__":

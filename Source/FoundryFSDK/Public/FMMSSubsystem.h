@@ -31,6 +31,32 @@ enum class EFMMSPhase : uint8
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFMMSStatusEvent, EFMMSPhase, Phase, const FString&, Message);
 
 /**
+ * Lobby-facing matchmaking state: the FMMS phase plus the two local-only states a UI needs (Pending =
+ * the request left but FMMS has not answered; CancelPending = Cancel pressed, waiting for FMMS to
+ * confirm Idle). Ordinals are shared with Goo Crew's EGooLobbyMatchState on purpose (it static_asserts them).
+ */
+UENUM(BlueprintType)
+enum class EFoundryMatchmakingState : uint8
+{
+	Idle,
+	/** Request pressed; on the wire (FMMS Authenticating / Requesting). */
+	Pending,
+	Searching,
+	/** FMMS WaitingForCapacity - still a live search, Cancel still works; Message is the server sentence. */
+	WaitingForCapacity,
+	/** FMMS Connecting: matched, connection being resolved. */
+	Found,
+	Traveling,
+	Failed,
+	/** Cancel pressed while a request was live; waiting for FMMS to confirm Idle. */
+	CancelPending,
+	Reconnectable
+};
+
+/** Native, game thread: the matchmaking state or its message changed (incl. a TTL clearing the message). */
+DECLARE_MULTICAST_DELEGATE_TwoParams(FFMMSMatchmakingStateChanged, EFoundryMatchmakingState, const FString& /*Message*/);
+
+/**
  * FMMS matchmaking orchestrator. Drives the full player loop on top of {@link UFoundryFSDKSubsystem}:
  *   InitializeClient -> Authenticate -> RequestMatch -> (poll) -> GetConnection
  *   -> ClientTravel("<ip>:<port>?token=<matchToken>")
@@ -112,6 +138,74 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|FMMS")
 	FFMMSStatusEvent OnFMMSStatus;
 
+	// -- lobby-facing matchmaking state (the UI kit's match cluster reads this; one state machine) ------------
+
+	/** Native, game thread; fires on every state OR message change (incl. a TTL clearing the message). */
+	FFMMSMatchmakingStateChanged OnMatchmakingStateChanged;
+
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	EFoundryMatchmakingState GetMatchmakingState() const { return MatchmakingState; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	FString GetMatchmakingMessage() const { return MatchmakingMessage; }
+
+	/** Seconds since the request left (LOCAL clock), or -1 while no search clock runs. */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	float GetElapsedSearchSeconds() const;
+
+	/** The queue of the current / last request (PendingQueue). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	FString GetQueue() const { return PendingQueue; }
+
+	/** Pending / Searching / WaitingForCapacity / Found. */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool CanCancel() const;
+
+	/** Idle or Failed, not a fixture, SDK present and signed in. (Mode availability is the UI's.) */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool CanRequest() const;
+
+	/**
+	 * Duplicate-safe UI entry. false (no-op) when !CanRequest() or Queue is empty. Otherwise: remember the
+	 * state, start the clock, SetMatchmakingState(Pending, "Requesting a match...") and call
+	 * FindMatchAuthenticated. FMMS sets its phase synchronously when it takes the request; if the phase is
+	 * still Idle/Failed/Reconnectable afterwards (its anti-spam window, a flow already live) the request was
+	 * refused - the clock stops, the previous state returns with "Give it a second, then try again." (3 s)
+	 * and this returns false. That is what keeps a second click from parking the UI on Pending forever.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	bool RequestFindMatch(const FString& Queue, const FString& AttributesJson);
+
+	/** No-op unless CanCancel(). Shows CancelPending until FMMS confirms Idle, then Cancel(). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void RequestCancel();
+
+	/** No-op unless the state is Reconnectable and no fixture is active. Reconnect(). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void RequestReconnect();
+
+	/** Reconnectable only: decline the live seat = Cancel() (abandons the seat server-side, phase -> Idle). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void DeclineReconnectSeat();
+
+	/** Pure state-machine step (public for automation tests): maps an FMMS phase onto the matchmaking state. */
+	void ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message);
+
+	/**
+	 * Dev fixture: replaces the DISPLAYED state; Request/Decline calls refuse while active; real phase changes are
+	 * ignored. ElapsedSeconds >= 0 starts the clock that far in the past; < 0 = no clock. Returns false in
+	 * Shipping (bodies are gated, declarations are not - UHT rejects a reflected member inside a custom #if).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	bool SetMatchmakingFixture(EFoundryMatchmakingState State, const FString& Message, float ElapsedSeconds);
+
+	/** Drop the fixture; the displayed state re-derives from the real FMMS phase. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void ClearMatchmakingFixture();
+
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool IsMatchmakingFixtureActive() const { return bMatchmakingFixture; }
+
 private:
 	UFUNCTION() void HandleAuth(EFoundryFsdkResult Result);
 	UFUNCTION() void HandleRequest(EFoundryFsdkResult Result);
@@ -127,6 +221,13 @@ private:
 	void StopPolling();
 	void AbandonReconnectSeat();
 	void SetPhase(EFMMSPhase NewPhase, const FString& Message);
+	/** Set the lobby-facing state + message and broadcast OnMatchmakingStateChanged when either changed (or
+	 *  bForceBroadcast). MessageTtlSeconds > 0 arms MessageTtlTimer on the GameInstance timer manager: the
+	 *  message clears (and a Failed state falls back to Idle) when it fires. A null GameInstance = no TTL
+	 *  (unit tests build the subsystem with NewObject and no outer). */
+	void SetMatchmakingState(EFoundryMatchmakingState NewState, const FString& Message, double MessageTtlSeconds = 0.0,
+	                         bool bForceBroadcast = false);
+	void OnMatchmakingMessageExpired();
 	void Fail(const FString& Message);
 	/** Fail() with the player text resolved from FoundryMatchmakingCopy::ForResult(Result) - logs the
 	 *  numeric Result separately (never in the player-facing string). */
@@ -165,6 +266,17 @@ private:
 	/** Last-known ticket TTL (Unix seconds, UTC) from FFoundryTicketWait::ExpiresAtUnix; 0 = unknown
 	 *  (fall back to SearchStartedSeconds + NoExpiryWaitCeilingSeconds). */
 	int64 TicketExpiresAtUnix = 0;
+
+	// -- lobby-facing matchmaking state (see SetMatchmakingState / ApplyMatchmakingPhase) --
+	EFoundryMatchmakingState MatchmakingState = EFoundryMatchmakingState::Idle;
+	FString MatchmakingMessage;
+	/** FPlatformTime::Seconds() when the request left; meaningful only while bSearchClockRunning. */
+	double SearchClockStartedAt = 0.0;
+	bool bSearchClockRunning = false;
+	/** Cancel pressed while a request was live; the next Idle phase reads as "Search cancelled.". */
+	bool bCancelPending = false;
+	bool bMatchmakingFixture = false;
+	FTimerHandle MessageTtlTimer;
 
 	static constexpr float PollIntervalSeconds = 2.0f;
 	/** Minimum seconds between FindMatch attempts; sooner re-clicks are ignored (anti-spam). */

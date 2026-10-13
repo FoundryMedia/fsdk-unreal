@@ -105,6 +105,27 @@ struct FOUNDRYFSDKUI_API FFoundryUIPalette
 	FLinearColor Member5;
 };
 
+/** One selectable matchmaking mode the kit's match cluster offers (Project Settings -> Game -> Foundry UI). */
+USTRUCT(BlueprintType)
+struct FOUNDRYFSDKUI_API FFoundryMatchmakingMode
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FText DisplayName;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FText Detail;
+
+	/** FMMS queue NAME ("<game-slug>/<mode>"). Empty = shown disabled, "(not queueable yet)". */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString QueueName;
+
+	/** Extra ticket attributes as a JSON object; the cluster merges "partyId" into it when the player is in a party. Empty = {}. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString AttributesJson;
+};
+
 /**
  * Project Settings -> Game -> Foundry UI: the account-page URL ManageAccountButton opens, the
  * default widget classes the social drawer resolves its row/menu classes from when a host leaves
@@ -163,6 +184,28 @@ public:
 	 *  wrap plain tooltip text in, in place of the engine's own default tooltip style. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultTooltip;
+
+	/** WBP_FoundryAppBar - the lobby's top bar (title, player chip, social + settings buttons). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultAppBar;
+
+	/** WBP_FoundryMatchCluster - the mode pill, Find Match / Cancel Search, status line and party count. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultMatchCluster;
+
+	/** WBP_FoundryModeRow - one row of the match cluster's mode menu. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultModeRow;
+
+	/** The app bar's title text. Empty -> the project name (FApp::GetProjectName). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Matchmaking")
+	FText AppBarTitle;
+
+	/** The modes the match cluster's mode menu offers, in order. A mode with an empty QueueName is
+	 *  listed disabled ("not queueable yet"). A game overrides UFoundryMatchCluster::GetModes to build
+	 *  the list in code instead. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Matchmaking")
+	TArray<FFoundryMatchmakingMode> MatchmakingModes;
 
 	/** The sound mix UFoundryGameUserSettings::ApplyAudio pushes. Unset = the volumes persist but
 	 *  are never applied - the same silent no-op posture as an unset default widget class. */
