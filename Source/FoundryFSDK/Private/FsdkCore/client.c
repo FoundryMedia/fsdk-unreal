@@ -204,7 +204,7 @@ static long long days_from_civil(long long y, int m, int d) {
 }
 
 /* Read exactly `width` ASCII digits starting at *pp into *out and advance *pp
- * past them. Returns 1 on success; on failure *pp/*out are left untouched (not
+ * past them. Returns 1 on success; on failure *pp and *out are left untouched (not
  * even partial digits are consumed). */
 static int read_fixed_digits(const char** pp, int width, int* out) {
     const char* p = *pp;
