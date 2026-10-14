@@ -1792,8 +1792,12 @@ namespace
 
 	FFoundryWidgetSpec KeybindRowSpec()
 	{
+		// A SizeBox ROOT so the row's own top padding is a real slot: a WBP root has no parent slot, so
+		// a SlotPad on the HorizontalBox-as-root was silently dropped and the KeyButton pills touched
+		// (Justin's settings screenshot, 2026-10-13). The SizeBox draws nothing; the padding is the
+		// HorizontalBox's SlotPad toward it.
+		FFoundryWidgetSpec Shell{ TEXT("SizeBox") };
 		FFoundryWidgetSpec Root{ TEXT("HorizontalBox") };
-		// A bit more air between rows - the KeyButton pills touched each other today.
 		Root.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,8,0,0"));
 		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("ActionText"), true }
 			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("Size"), TEXT("Fill")));
@@ -1809,7 +1813,8 @@ namespace
 				.P(TEXT("Normal"), TEXT("Transparent")).P(TEXT("Radius"), 8.0f)
 				.C(FFoundryWidgetSpec{ TEXT("Image") }
 					.P(TEXT("Icon"), TEXT("icon_close")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("TextSecondary")))));
-		return Root;
+		Shell.C(MoveTemp(Root));
+		return Shell;
 	}
 
 	// -- the kit tooltip pill (S3c) - a small pill UFoundryUIWidgetBase::ApplyKitTooltips/SetKitToolTip

@@ -27,14 +27,15 @@ WBP_FoundryConfirmDialog
             - TextBlock **ConfirmText**  (FontSize=15.0, Bold=1, Color=Surface, SlotPad=16,8,16,8)
 
 WBP_FoundryKeybindRow
-- HorizontalBox  (ChildVAlign=Center, SlotPad=0,8,0,0)
-  - TextBlock **ActionText**  (FontSize=14.0, Color=Text, Size=Fill)
-  - SizeBox  (W=180.0)
-    - Button **KeyButton**  (Normal=SurfaceHigh, HalfHeight=1)
-      - TextBlock **KeyText**  (FontSize=14.0, Bold=1, Color=Text, HAlign=Center, VAlign=Center, SlotPad=16,8,16,8)
-  - SizeBox  (W=32.0, SlotPad=8,0,0,0)
-    - Button **ResetButton**  (Normal=Transparent, Radius=8.0)
-      - Image  (Icon=icon_close, IconW=16.0, IconH=16.0, Tint=TextSecondary)
+- SizeBox
+  - HorizontalBox  (ChildVAlign=Center, SlotPad=0,8,0,0)
+    - TextBlock **ActionText**  (FontSize=14.0, Color=Text, Size=Fill)
+    - SizeBox  (W=180.0)
+      - Button **KeyButton**  (Normal=SurfaceHigh, HalfHeight=1)
+        - TextBlock **KeyText**  (FontSize=14.0, Bold=1, Color=Text, HAlign=Center, VAlign=Center, SlotPad=16,8,16,8)
+    - SizeBox  (W=32.0, SlotPad=8,0,0,0)
+      - Button **ResetButton**  (Normal=Transparent, Radius=8.0)
+        - Image  (Icon=icon_close, IconW=16.0, IconH=16.0, Tint=TextSecondary)
 
 WBP_FoundrySettingsMenu
 - Overlay
