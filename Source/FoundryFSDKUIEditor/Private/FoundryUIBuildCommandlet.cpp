@@ -92,6 +92,8 @@
 #include "FoundryAppBar.h"
 #include "FoundryBootSplash.h"
 #include "FoundryConfirmDialog.h"
+#include "FoundryCreditRow.h"
+#include "FoundryCreditsView.h"
 #include "FoundryFriendMenu.h"
 #include "FoundryFriendRow.h"
 #include "FoundryInviteRow.h"
@@ -325,6 +327,10 @@ namespace
 		 *  Empty means UFoundrySettingsMenu / UFoundryKeybindRow themselves. */
 		FString SettingsParent;
 		FString KeybindRowParent;
+		/** Resolved exactly like DrawerParent, for the generated credits view / credit row WBPs.
+		 *  Empty means UFoundryCreditsView / UFoundryCreditRow themselves. */
+		FString CreditsParent;
+		FString CreditRowParent;
 		/** Resolved exactly like DrawerParent, for the generated app bar / match cluster / mode row
 		 *  WBPs. Empty means UFoundryAppBar / UFoundryMatchCluster / UFoundryModeRow themselves. */
 		FString AppBarParent;
@@ -389,6 +395,8 @@ namespace
 		Root->TryGetStringField(TEXT("confirmParent"), OutProfile.ConfirmParent);
 		Root->TryGetStringField(TEXT("settingsParent"), OutProfile.SettingsParent);
 		Root->TryGetStringField(TEXT("keybindRowParent"), OutProfile.KeybindRowParent);
+		Root->TryGetStringField(TEXT("creditsParent"), OutProfile.CreditsParent);
+		Root->TryGetStringField(TEXT("creditRowParent"), OutProfile.CreditRowParent);
 		Root->TryGetStringField(TEXT("appBarParent"), OutProfile.AppBarParent);
 		Root->TryGetStringField(TEXT("matchClusterParent"), OutProfile.MatchClusterParent);
 		Root->TryGetStringField(TEXT("modeRowParent"), OutProfile.ModeRowParent);
@@ -511,6 +519,8 @@ namespace
 		S += FString::Printf(TEXT("DefaultConfirmDialog=%s/%sConfirmDialog.%sConfirmDialog_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultSettingsMenu=%s/%sSettingsMenu.%sSettingsMenu_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultKeybindRow=%s/%sKeybindRow.%sKeybindRow_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
+		S += FString::Printf(TEXT("DefaultCreditsView=%s/%sCreditsView.%sCreditsView_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
+		S += FString::Printf(TEXT("DefaultCreditRow=%s/%sCreditRow.%sCreditRow_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultTooltip=%s/%sTooltip.%sTooltip_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		if (bMatch)
 		{
@@ -1608,13 +1618,21 @@ namespace
 	// (no wrapping HorizontalBox needed for a single label) and vertical SlotPad giving it a real
 	// clickable height. Hovered is explicit (never left to default-to-Normal) - every pill on this
 	// menu states its own hover colour.
-	FFoundryWidgetSpec PauseMenuButton(const TCHAR* ButtonName, const TCHAR* NormalTok, const TCHAR* HoveredTok, const TCHAR* TextName, const TCHAR* TextTok)
+	// Label: a literal the generator bakes in. Null = the runtime sets the text (SETTINGS / the
+	// primary + resume buttons relabel per pause context); ABOUT and CLOSE are never relabeled.
+	FFoundryWidgetSpec PauseMenuButton(const TCHAR* ButtonName, const TCHAR* NormalTok, const TCHAR* HoveredTok, const TCHAR* TextName, const TCHAR* TextTok,
+		const TCHAR* Label = nullptr)
 	{
+		FFoundryWidgetSpec Text{ TEXT("TextBlock"), TextName, true };
+		Text.P(TEXT("FontSize"), 15.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TextTok)
+			.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,14,0,14"));
+		if (Label != nullptr)
+		{
+			Text.P(TEXT("Text"), Label);
+		}
 		return FFoundryWidgetSpec{ TEXT("Button"), ButtonName, true }
 			.P(TEXT("Normal"), NormalTok).P(TEXT("Hovered"), HoveredTok).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("SlotPad"), TEXT("0,6,0,0"))
-			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TextName, true }
-				.P(TEXT("FontSize"), 15.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TextTok)
-				.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,14,0,14")));
+			.C(MoveTemp(Text));
 	}
 
 	FFoundryWidgetSpec PauseMenuSpec(const FFoundryUIRadii& Radii)
@@ -1633,6 +1651,8 @@ namespace
 			.P(TEXT("FontRole"), TEXT("Heading")).P(TEXT("HAlign"), TEXT("Center")));
 
 		Column.C(PauseMenuButton(TEXT("SettingsButton"), TEXT("SurfaceHigh"), TEXT("SurfaceHigh"), TEXT("SettingsText"), TEXT("Text")));
+		// Opens the credits view in BOTH pause contexts - a fixed label, never relabeled at runtime.
+		Column.C(PauseMenuButton(TEXT("AboutButton"), TEXT("SurfaceHigh"), TEXT("SurfaceHigh"), TEXT("AboutText"), TEXT("Text"), TEXT("ABOUT")));
 		Column.C(PauseMenuButton(TEXT("PrimaryButton"), TEXT("Primary"), TEXT("Primary"), TEXT("PrimaryText"), TEXT("Surface")));
 		// Was Normal=Transparent/text=TextSecondary - invisible against the SurfaceHighest panel
 		// (the same family of bug as the settings-menu combos). A real pill now, like BackButton.
@@ -1890,6 +1910,64 @@ namespace
 				.P(TEXT("Normal"), TEXT("Transparent")).P(TEXT("Radius"), 8.0f)
 				.C(FFoundryWidgetSpec{ TEXT("Image") }
 					.P(TEXT("Icon"), TEXT("icon_close")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("TextSecondary")))));
+		Shell.C(MoveTemp(Root));
+		return Shell;
+	}
+
+	// -- the credits view + its row (Lane C2): the settings menu's SHELL shape (Overlay > Backdrop +
+	// a centered SizeBox > Panel), but a single column - title, a scrolling entries list, a footer
+	// line, a close pill. The entries are runtime-built from CreditRow WBPs into EntriesBox (the
+	// KeybindList pattern), never from this spec. ----------------------------------------------------
+
+	FFoundryWidgetSpec CreditsViewSpec(const FFoundryUIRadii& Radii)
+	{
+		FFoundryWidgetSpec SizeBoxNode;
+		FFoundryWidgetSpec Root = MenuBackdropAndSizeBox(720.0f, SizeBoxNode);
+		// The settings menu's backdrop strength (the shared helper's 0.6 is the dialog dim).
+		Root.Children[0].P(TEXT("FillAlpha"), 0.92f);
+		SizeBoxNode.P(TEXT("MaxH"), 720.0f);
+
+		FFoundryWidgetSpec Panel{ TEXT("Border"), TEXT("Panel"), true };
+		Panel.P(TEXT("Fill"), TEXT("SurfaceHighest")).P(TEXT("Radius"), Radii.Panel);
+
+		FFoundryWidgetSpec Column{ TEXT("VerticalBox") };
+		Column.P(TEXT("SlotPad"), TEXT("28,28,28,28"));
+
+		Column.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("TitleText"), true }
+			.P(TEXT("Text"), TEXT("CREDITS")).P(TEXT("FontSize"), 26.0f).P(TEXT("Bold"), TEXT("1"))
+			.P(TEXT("Color"), TEXT("Text")).P(TEXT("FontRole"), TEXT("Heading")));
+
+		FFoundryWidgetSpec Entries{ TEXT("ScrollBox"), TEXT("EntriesBox"), true };
+		Entries.P(TEXT("BarThickness"), 4.0f).P(TEXT("Size"), TEXT("Fill")).P(TEXT("SlotPad"), TEXT("0,16,0,0"));
+		Column.C(MoveTemp(Entries));
+
+		Column.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("FooterText"), true }
+			.P(TEXT("FontSize"), 13.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("Wrap"), TEXT("1"))
+			.P(TEXT("SlotPad"), TEXT("0,12,0,0")));
+
+		Column.C(PauseMenuButton(TEXT("CloseButton"), TEXT("SurfaceHigh"), TEXT("Primary"), TEXT("CloseText"), TEXT("Text"), TEXT("CLOSE"))
+			.P(TEXT("SlotPad"), TEXT("0,16,0,0")));
+
+		Panel.C(MoveTemp(Column));
+		SizeBoxNode.C(MoveTemp(Panel));
+		Root.C(MoveTemp(SizeBoxNode));
+		return Root;
+	}
+
+	FFoundryWidgetSpec CreditRowSpec()
+	{
+		// A SizeBox ROOT for the same reason as KeybindRowSpec: a WBP root has no parent slot, so the
+		// row's own top padding would be silently dropped. The row doubles as a section header: the
+		// runtime fills SectionText and leaves NameText/RoleText empty (or the reverse).
+		FFoundryWidgetSpec Shell{ TEXT("SizeBox") };
+		FFoundryWidgetSpec Root{ TEXT("HorizontalBox") };
+		Root.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,8,0,0"));
+		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("SectionText"), true }
+			.P(TEXT("FontSize"), 17.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")).P(TEXT("FontRole"), TEXT("Heading")));
+		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("NameText"), true }
+			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("0,0,16,0")));
+		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("RoleText"), true }
+			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("HAlign"), TEXT("Right")).P(TEXT("Size"), TEXT("Fill")));
 		Shell.C(MoveTemp(Root));
 		return Shell;
 	}
@@ -2200,6 +2278,8 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	const FString ConfirmDialogAssetName = bHasProfile ? (MenusPrefix + TEXT("ConfirmDialog")) : TEXT("WBP_FoundryConfirmDialog");
 	const FString SettingsMenuAssetName = bHasProfile ? (MenusPrefix + TEXT("SettingsMenu")) : TEXT("WBP_FoundrySettingsMenu");
 	const FString KeybindRowAssetName = bHasProfile ? (MenusPrefix + TEXT("KeybindRow")) : TEXT("WBP_FoundryKeybindRow");
+	const FString CreditsViewAssetName = bHasProfile ? (MenusPrefix + TEXT("CreditsView")) : TEXT("WBP_FoundryCreditsView");
+	const FString CreditRowAssetName = bHasProfile ? (MenusPrefix + TEXT("CreditRow")) : TEXT("WBP_FoundryCreditRow");
 	// Never reparentable (like FriendRow/InviteRow/FriendMenu) - always UFoundryTooltip itself.
 	const FString TooltipAssetName = bHasProfile ? (MenusPrefix + TEXT("Tooltip")) : TEXT("WBP_FoundryTooltip");
 
@@ -2253,6 +2333,33 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		else
 		{
 			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile keybindRowParent '%s' failed to resolve - using UFoundryKeybindRow"), *Profile.KeybindRowParent);
+		}
+	}
+
+	UClass* CreditsParentClass = UFoundryCreditsView::StaticClass();
+	if (bHasProfile && !Profile.CreditsParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryCreditsView::StaticClass(), nullptr, *Profile.CreditsParent);
+		if (Loaded != nullptr)
+		{
+			CreditsParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile creditsParent '%s' failed to resolve - using UFoundryCreditsView"), *Profile.CreditsParent);
+		}
+	}
+	UClass* CreditRowParentClass = UFoundryCreditRow::StaticClass();
+	if (bHasProfile && !Profile.CreditRowParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryCreditRow::StaticClass(), nullptr, *Profile.CreditRowParent);
+		if (Loaded != nullptr)
+		{
+			CreditRowParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile creditRowParent '%s' failed to resolve - using UFoundryCreditRow"), *Profile.CreditRowParent);
 		}
 	}
 
@@ -2378,6 +2485,9 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	bAnySaveFailed |= !BuildWBP(MenusPath, *ConfirmDialogAssetName, ConfirmParentClass, ConfirmDialogSpec(Radii), Palette, Radii, Fonts, Icons, MenusDump);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *KeybindRowAssetName, KeybindRowParentClass, KeybindRowSpec(), Palette, Radii, Fonts, Icons, MenusDump);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *SettingsMenuAssetName, SettingsParentClass, SettingsMenuSpec(Radii), Palette, Radii, Fonts, Icons, MenusDump);
+	bAnySaveFailed |= !BuildWBP(MenusPath, *CreditRowAssetName, CreditRowParentClass, CreditRowSpec(), Palette, Radii, Fonts, Icons, MenusDump);
+	bAnySaveFailed |= !BuildWBP(MenusPath, *CreditsViewAssetName, CreditsParentClass, CreditsViewSpec(Radii), Palette, Radii, Fonts, Icons, MenusDump);
+	UE_LOG(LogFoundryUIBuild, Log, TEXT("credits -> %s/%s"), *MenusPath, *CreditsViewAssetName);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *TooltipAssetName, UFoundryTooltip::StaticClass(), TooltipSpec(), Palette, Radii, Fonts, Icons, MenusDump);
 	if (bBuildMatch)
 	{

@@ -3,8 +3,10 @@
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
 #include "FoundryConfirmDialog.h"
+#include "FoundryCreditsView.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryMenuHost.h"
+#include "FoundryUISettings.h"
 #include "Kismet/KismetSystemLibrary.h"
 
 UFoundryPauseMenu::UFoundryPauseMenu()
@@ -22,6 +24,7 @@ void UFoundryPauseMenu::SetContext(EFoundryPauseContext InContext)
 void UFoundryPauseMenu::ApplyContextLabels()
 {
 	SetText(SettingsText, TEXT("SETTINGS"));
+	SetText(AboutText, TEXT("ABOUT")); // same in both contexts
 	switch (PauseContext)
 	{
 	case EFoundryPauseContext::Match:
@@ -43,6 +46,7 @@ void UFoundryPauseMenu::NativeOnInitialized()
 {
 	Super::NativeOnInitialized();
 	if (SettingsButton) { SettingsButton->OnClicked.AddDynamic(this, &UFoundryPauseMenu::HandleSettingsClicked); }
+	if (AboutButton) { AboutButton->OnClicked.AddDynamic(this, &UFoundryPauseMenu::HandleAboutClicked); }
 	if (PrimaryButton) { PrimaryButton->OnClicked.AddDynamic(this, &UFoundryPauseMenu::HandlePrimaryClicked); }
 	if (ResumeButton) { ResumeButton->OnClicked.AddDynamic(this, &UFoundryPauseMenu::HandleResumeClicked); }
 	SetIsFocusable(true);
@@ -84,6 +88,36 @@ void UFoundryPauseMenu::HandleSettingsClicked()
 		IFoundryMenuHost::Execute_RequestOpenSettings(Host);
 	}
 	OnSettingsRequested.Broadcast();
+}
+
+void UFoundryPauseMenu::HandleAboutClicked()
+{
+	OnAboutRequested.Broadcast();
+
+	const TSubclassOf<UUserWidget> Loaded = UFoundryUISettings::LoadWidgetClass(UFoundryUISettings::Get()->DefaultCreditsView, TEXT("DefaultCreditsView"));
+	UClass* ViewClass = Loaded.Get();
+	if (ViewClass == nullptr || !ViewClass->IsChildOf(UFoundryCreditsView::StaticClass()))
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[UI] %s: ABOUT has no usable credits view class (DefaultCreditsView) - nothing to show."), *GetClass()->GetName());
+		return;
+	}
+
+	UFoundryCreditsView* View = CreateWidget<UFoundryCreditsView>(GetOwningPlayer(), TSubclassOf<UFoundryCreditsView>(ViewClass));
+	if (View == nullptr)
+	{
+		return;
+	}
+
+	// Its own layer over this menu (like the confirm dialog) - this menu stays underneath.
+	if (UObject* Host = FindMenuHost())
+	{
+		IFoundryMenuHost::Execute_RequestPushMenu(Host, View);
+	}
+	else
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[UI] %s has no menu host - adding the credits view to the viewport directly."), *GetClass()->GetName());
+		View->AddToViewport(30);
+	}
 }
 
 void UFoundryPauseMenu::HandleResumeClicked()

@@ -570,12 +570,20 @@ bool UFMMSSubsystem::RequestFindMatch(const FString& Queue, const FString& Attri
 	{
 		return false; // a second click while a request is live is a no-op, never a second ticket
 	}
+	// COPY the arguments before anything is broadcast: a caller passes references into its own state
+	// (the match cluster hands over Modes[i].QueueName), and the Pending broadcast below re-enters
+	// that caller, whose Refresh() reassigns Modes - the reference then points into freed memory.
+	// Shipping client 0.1.1 crashed on the first Find Match exactly there (EXCEPTION_ACCESS_VIOLATION in
+	// FindMatchAuthenticated's PendingQueue = Queue; 2026-10-15). Never trust a reference parameter across
+	// a delegate this object fires.
+	const FString QueueCopy = Queue;
+	const FString AttributesCopy = AttributesJson;
 	const EFoundryMatchmakingState Before = MatchmakingState;
 	SearchClockStartedAt = MatchmakingClockNow();
 	bSearchClockRunning = true;
 	bCancelPending = false;
 	SetMatchmakingState(EFoundryMatchmakingState::Pending, TEXT("Requesting a match..."), 0.0);
-	FindMatchAuthenticated(Queue, AttributesJson);
+	FindMatchAuthenticated(QueueCopy, AttributesCopy);
 	// FMMS sets its phase synchronously when it takes the request. A request it refused (its 2 s
 	// anti-spam window, a flow already live) leaves the phase where it was - and would leave us stuck
 	// on Pending with nothing ever answering (Goo Crew, 2026-10-08: the second click after a failure).

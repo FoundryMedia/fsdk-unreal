@@ -105,4 +105,51 @@ bool FFMMSMatchmakingStateTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+
+// A listener that, on the Pending broadcast, replaces the array the caller's queue reference points into -
+// the shape of UFoundryMatchCluster::HandleFmmsState -> Refresh() -> Modes = GetModes(). Before the copy-first
+// fix RequestFindMatch then read freed memory (client 0.1.1 crash, 2026-10-15).
+namespace
+{
+	struct FFMMSReallocatingListener
+	{
+		TArray<FString> Holder;
+		void OnState(EFoundryMatchmakingState State, const FString& /*Message*/)
+		{
+			if (State == EFoundryMatchmakingState::Pending)
+			{
+				TArray<FString> Fresh;
+				for (int32 i = 0; i < 64; ++i)
+				{
+					Fresh.Add(FString::Printf(TEXT("filler-%d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), i));
+				}
+				Holder = MoveTemp(Fresh); // the old buffer - and the caller's reference into it - is gone
+			}
+		}
+	};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSFindMatchArgumentsSurviveBroadcastTest, "FoundryFSDK.FMMS.FindMatchArgumentsSurviveBroadcast",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FFMMSFindMatchArgumentsSurviveBroadcastTest::RunTest(const FString& Parameters)
+{
+	UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+	UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+	FFMMSReallocatingListener Listener;
+	Listener.Holder.Add(TEXT("goo-crew/spread"));
+	Listener.Holder.Add(TEXT("{\"partyId\":\"p-1\"}"));
+	Fmms->OnMatchmakingStateChanged.AddRaw(&Listener, &FFMMSReallocatingListener::OnState);
+
+	// With no FSDK subsystem the request fails inside FindMatchAuthenticated - AFTER the Pending broadcast
+	// has run the listener and AFTER both parameters were read. Reaching the assertions is the test; the
+	// subsystem must have consumed COPIES, not the references into Listener.Holder.
+	const bool bAccepted = Fmms->RequestFindMatch(Listener.Holder[0], Listener.Holder[1]);
+	TestFalse(TEXT("no FSDK: the request is refused after the broadcast"), bAccepted);
+	TestTrue(TEXT("state is Failed or Idle, never stuck on Pending"),
+		Fmms->GetMatchmakingState() != EFoundryMatchmakingState::Pending);
+	Fmms->OnMatchmakingStateChanged.RemoveAll(&Listener);
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -41,6 +41,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry UI")
 	FFoundryPauseMenuEvent OnResumeRequested;
 
+	/** ABOUT was clicked - broadcast right before this menu pushes the credits view. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry UI")
+	FFoundryPauseMenuEvent OnAboutRequested;
+
 	/** The destructive action's confirm dialog was confirmed (QUIT TO DESKTOP in Lobby, LEAVE MATCH
 	 *  in Match) - broadcast right before this menu acts on it. */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry UI")
@@ -76,6 +80,8 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> TitleText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> SettingsButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> SettingsText;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> AboutButton;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> AboutText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> PrimaryButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> PrimaryText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ResumeButton;
@@ -88,6 +94,7 @@ protected:
 
 private:
 	UFUNCTION() void HandleSettingsClicked();
+	UFUNCTION() void HandleAboutClicked();
 	UFUNCTION() void HandleResumeClicked();
 	UFUNCTION() void HandlePrimaryClicked();
 	UFUNCTION() void HandleConfirmedPrimary();

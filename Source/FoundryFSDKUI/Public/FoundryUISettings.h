@@ -128,6 +128,23 @@ struct FOUNDRYFSDKUI_API FFoundryMatchmakingMode
 	FString AttributesJson;
 };
 
+/** One line of the credits view: a person (or company) and what they did, grouped under a Section heading. */
+USTRUCT(BlueprintType)
+struct FOUNDRYFSDKUI_API FFoundryCreditEntry
+{
+	GENERATED_BODY()
+
+	/** Section heading the entry sits under (entries with the same Section are grouped in order of first appearance). */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Section;
+
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Name;
+
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Role;
+};
+
 /**
  * Project Settings -> Game -> Foundry UI: the account-page URL ManageAccountButton opens, the
  * default widget classes the social drawer resolves its row/menu classes from when a host leaves
@@ -199,6 +216,14 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultModeRow;
 
+	/** WBP_FoundryCreditsView - the credits view the pause menu's ABOUT button pushes. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultCreditsView;
+
+	/** WBP_FoundryCreditRow - one section header or one name/role line of the credits view. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultCreditRow;
+
 	/** The app bar's title text. Empty -> the project name (FApp::GetProjectName). */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Matchmaking")
 	FText AppBarTitle;
@@ -259,6 +284,18 @@ public:
 	/** Seconds the logos take to fade out. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	float BootSplashFadeOutSeconds = 0.6f;
+
+	/** The credits view's heading. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Credits")
+	FText CreditsTitle;
+
+	/** The credits, in display order; entries sharing a Section are grouped under one header. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Credits")
+	TArray<FFoundryCreditEntry> Credits;
+
+	/** The line(s) under the credits: "Made with Foundry." plus the Unreal Engine attribution Epic's EULA asks shipped products to carry. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Credits")
+	FText CreditsFooter;
 
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI")
 	FFoundryUIPalette Palette;

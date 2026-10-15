@@ -7,6 +7,8 @@ WBP_FoundryPauseMenu
         - TextBlock **TitleText**  (FontSize=22.0, Bold=1, Color=Text, FontRole=Heading, HAlign=Center)
         - Button **SettingsButton**  (Normal=SurfaceHigh, Hovered=SurfaceHigh, HalfHeight=1, SlotPad=0,6,0,0)
           - TextBlock **SettingsText**  (FontSize=15.0, Bold=1, Color=Text, HAlign=Center, VAlign=Center, SlotPad=0,14,0,14)
+        - Button **AboutButton**  (Normal=SurfaceHigh, Hovered=SurfaceHigh, HalfHeight=1, SlotPad=0,6,0,0)
+          - TextBlock **AboutText**  (FontSize=15.0, Bold=1, Color=Text, HAlign=Center, VAlign=Center, SlotPad=0,14,0,14, Text=ABOUT)
         - Button **PrimaryButton**  (Normal=Primary, Hovered=Primary, HalfHeight=1, SlotPad=0,6,0,0)
           - TextBlock **PrimaryText**  (FontSize=15.0, Bold=1, Color=Surface, HAlign=Center, VAlign=Center, SlotPad=0,14,0,14)
         - Button **ResumeButton**  (Normal=SurfaceHigh, Hovered=Primary, HalfHeight=1, SlotPad=0,6,0,0)
@@ -124,6 +126,25 @@ WBP_FoundrySettingsMenu
   - SizeBox  (HAlign=Right, VAlign=Top, SlotPad=0,40,64,0, W=44.0, H=44.0)
     - Button **CloseButton**  (Normal=Transparent, Hovered=Transparent, HalfHeight=1)
       - Image  (Icon=icon_close, IconW=16.0, IconH=16.0, Tint=Text)
+
+WBP_FoundryCreditRow
+- SizeBox
+  - HorizontalBox  (ChildVAlign=Center, SlotPad=0,8,0,0)
+    - TextBlock **SectionText**  (FontSize=17.0, Bold=1, Color=Text, FontRole=Heading)
+    - TextBlock **NameText**  (FontSize=14.0, Color=Text, SlotPad=0,0,16,0)
+    - TextBlock **RoleText**  (FontSize=14.0, Color=TextSecondary, HAlign=Right, Size=Fill)
+
+WBP_FoundryCreditsView
+- Overlay
+  - Border **Backdrop**  (Fill=Surface, FillAlpha=0.92, Radius=0.0)
+  - SizeBox  (W=720.0, HAlign=Center, VAlign=Center, MaxH=720.0)
+    - Border **Panel**  (Fill=SurfaceHighest, Radius=24.0)
+      - VerticalBox  (SlotPad=28,28,28,28)
+        - TextBlock **TitleText**  (Text=CREDITS, FontSize=26.0, Bold=1, Color=Text, FontRole=Heading)
+        - ScrollBox **EntriesBox**  (BarThickness=4.0, Size=Fill, SlotPad=0,16,0,0)
+        - TextBlock **FooterText**  (FontSize=13.0, Color=TextSecondary, Wrap=1, SlotPad=0,12,0,0)
+        - Button **CloseButton**  (Normal=SurfaceHigh, Hovered=Primary, HalfHeight=1, SlotPad=0,16,0,0)
+          - TextBlock **CloseText**  (FontSize=15.0, Bold=1, Color=Text, HAlign=Center, VAlign=Center, SlotPad=0,14,0,14, Text=CLOSE)
 
 WBP_FoundryTooltip
 - Border  (Fill=SurfaceHighest, HalfHeight=1)

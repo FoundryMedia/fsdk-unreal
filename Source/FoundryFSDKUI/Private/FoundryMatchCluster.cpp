@@ -509,8 +509,11 @@ void UFoundryMatchCluster::HandleFindMatch()
 			}
 			const UFoundrySocialSubsystem* S = Social();
 			const FString PartyId = S ? S->Party().PartyId : FString();
-			const FFoundryMatchmakingMode& Mode = Modes[SelectedModeIndex];
-			F->RequestFindMatch(Mode.QueueName, MergePartyId(Mode.AttributesJson, PartyId)); // duplicate-safe: the subsystem refuses a second request
+			// Values, not references: RequestFindMatch broadcasts Pending before it consumes its arguments and
+			// this widget's HandleFmmsState -> Refresh() reassigns Modes on that broadcast (the 0.1.1 crash).
+			const FString QueueName = Modes[SelectedModeIndex].QueueName;
+			const FString Attributes = MergePartyId(Modes[SelectedModeIndex].AttributesJson, PartyId);
+			F->RequestFindMatch(QueueName, Attributes); // duplicate-safe: the subsystem refuses a second request
 		}
 		break;
 	}

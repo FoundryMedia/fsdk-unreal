@@ -60,6 +60,16 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultMatchCluster = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryMatchCluster.WBP_FoundryMatchCluster_C")));
 	DefaultModeRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryModeRow.WBP_FoundryModeRow_C")));
 
+	// The credits view the pause menu's ABOUT button pushes, generated into /FoundryFSDK/UI/Menus.
+	DefaultCreditsView = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryCreditsView.WBP_FoundryCreditsView_C")));
+	DefaultCreditRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryCreditRow.WBP_FoundryCreditRow_C")));
+	CreditsTitle = FText::FromString(TEXT("CREDITS"));
+	// \u00AE = registered mark, \u2013 = en dash (escapes keep the source ASCII).
+	CreditsFooter = FText::FromString(
+		FString(TEXT("Made with Foundry.\n"))
+		+ TEXT("Powered by Unreal Engine. Unreal\u00AE is a trademark or registered trademark of Epic Games, Inc. in the United States of America and elsewhere. ")
+		  TEXT("Unreal\u00AE Engine, Copyright 1998 \u2013 2026, Epic Games, Inc. All rights reserved."));
+
 	// The boot splash, generated into /FoundryFSDK/UI/Splash; the platform logo is the kit's own Foundry mark.
 	DefaultBootSplash = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Splash/WBP_FoundryBootSplash.WBP_FoundryBootSplash_C")));
 	PlatformLogo = TSoftObjectPtr<UTexture2D>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Icons/foundry_logo.foundry_logo")));

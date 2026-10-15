@@ -36,8 +36,10 @@ struct FFoundryWidgetSpec
  * -run=FoundryUIBuild [-dump] [-out=/FoundryFSDK/UI] [-verifyicons] [-profile=<path to a JSON
  * file>] : builds the five default social-drawer Widget Blueprints (WBP_FoundrySocialDrawer /
  * WBP_FoundryFriendRow / WBP_FoundryInviteRow / WBP_FoundryFriendMenu / WBP_FoundryPartyNameplate)
- * under <out>/Social, and the five default menu Widget Blueprints (WBP_FoundryPauseMenu /
- * WBP_FoundryConfirmDialog / WBP_FoundrySettingsMenu / WBP_FoundryKeybindRow / WBP_FoundryTooltip)
+ * under <out>/Social, and the seven default menu Widget Blueprints (WBP_FoundryPauseMenu /
+ * WBP_FoundryConfirmDialog / WBP_FoundrySettingsMenu / WBP_FoundryKeybindRow / WBP_FoundryCreditsView /
+ * WBP_FoundryCreditRow / WBP_FoundryTooltip - the credits view and its row have parents
+ * UFoundryCreditsView / UFoundryCreditRow; the pause menu carries an ABOUT button that opens it)
  * under <out>/Menus, and the three default Match-family Widget Blueprints (WBP_FoundryAppBar /
  * WBP_FoundryMatchCluster / WBP_FoundryModeRow - the lobby app bar, the find-match cluster and its
  * mode row; parents UFoundryAppBar / UFoundryMatchCluster / UFoundryModeRow) under <out>/Match,
@@ -46,21 +48,21 @@ struct FFoundryWidgetSpec
  * Mip Gen SimpleAverage, NeverStream, Trilinear filtering).
  *
  * Re-runnable: CreatePackage replaces an existing package's object of the same name cleanly; all
- * thirteen Blueprints and every icon texture are rebuilt from the spec / source PNGs each run, nothing
+ * fifteen Blueprints and every icon texture are rebuilt from the spec / source PNGs each run, nothing
  * outside <out>/Social, <out>/Menus, <out>/Match and <out>/Icons is touched. No animations are generated (the
  * WBPs' Sequencer tracks are left for the Designer pass); the parent classes' PlayOrTween
  * code-tween fallback covers their absence.
  *
  * -profile points at a JSON file ({out, prefix, drawerParent, nameplateParent, pauseParent,
- * confirmParent, settingsParent, keybindRowParent, appBarParent, matchClusterParent,
+ * confirmParent, settingsParent, keybindRowParent, creditsParent, creditRowParent, appBarParent, matchClusterParent,
  * modeRowParent, menus{out,prefix}, match{out,prefix}, splash{out,prefix,parent,studioLogo,platformLogo}, palette{},
  * fonts{regular,bold,heading}, radii{panel,input,button}}, every field optional) that builds a
  * GAME's own skinned copies instead of the plugin's navy defaults: colours fall back to the plugin
  * palette per-key, fonts fall back to the engine Roboto per-face, radii fall back to 24/16/16 (the
  * navy kit's own values); "menus" (out/prefix for the pause menu, confirm dialog, settings menu,
- * keybind row and tooltip - the tooltip is never reparentable, like the friend row/invite
+ * keybind row, credits view, credit row and tooltip - the tooltip is never reparentable, like the friend row/invite
  * row/friend menu) falls back to the social out/prefix when absent, so a profile with no "menus"
- * object still gets all five built alongside the drawer. The Match family is the exception to
+ * object still gets all seven built alongside the drawer. The Match family is the exception to
  * that fallback pattern: WITH a profile it is OPT-IN - the three Match WBPs are built ONLY when the
  * profile carries a "match" object (its out/prefix fall back to the social values when left empty;
  * the three *Parent keys reparent them like drawerParent does), so a profile without one - e.g. a
@@ -71,6 +73,7 @@ struct FFoundryWidgetSpec
  * studioLogo / platformLogo PNG paths import as <out>/T_StudioLogo / T_PlatformLogo and the WBP
  * hard-references them, so a cook carries them. Prints the
  * [/Script/FoundryFSDKUI.FoundryUISettings] ini block (DefaultSocialDrawer through DefaultTooltip,
+ * incl. DefaultCreditsView / DefaultCreditRow,
  * + DefaultAppBar / DefaultMatchCluster / DefaultModeRow only when the Match family was built, +
  * the resolved Palette) to paste into the project's DefaultGame.ini. With no -profile, output is
  * byte-identical to before -profile existed.
