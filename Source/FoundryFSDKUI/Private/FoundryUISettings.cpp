@@ -1,6 +1,7 @@
 #include "FoundryUISettings.h"
 
 #include "Blueprint/UserWidget.h"
+#include "Engine/Texture2D.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryMatchmakingCopy.h"
 #include "UObject/SoftObjectPath.h"
@@ -58,6 +59,10 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultAppBar = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryAppBar.WBP_FoundryAppBar_C")));
 	DefaultMatchCluster = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryMatchCluster.WBP_FoundryMatchCluster_C")));
 	DefaultModeRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryModeRow.WBP_FoundryModeRow_C")));
+
+	// The boot splash, generated into /FoundryFSDK/UI/Splash; the platform logo is the kit's own Foundry mark.
+	DefaultBootSplash = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Splash/WBP_FoundryBootSplash.WBP_FoundryBootSplash_C")));
+	PlatformLogo = TSoftObjectPtr<UTexture2D>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Icons/foundry_logo.foundry_logo")));
 }
 
 void UFoundryUISettings::ApplyMatchmakingCopyOverrides()

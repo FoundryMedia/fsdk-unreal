@@ -418,6 +418,13 @@ GLYPHS = [
     ("icon_spinner.png", draw_spinner),
 ]
 
+# Brand art that is COPIED, not drawn: committed as-is next to the generated glyphs, never overwritten
+# by this script. foundry_logo.png = foundry-app/app/public/foundry-logo.png (512 x 512 RGBA), the
+# default "made with Foundry" platform logo the boot splash WBP references (Icon=foundry_logo).
+PASSTHROUGH = [
+    "foundry_logo.png",
+]
+
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     for name, fn in GLYPHS:
@@ -426,6 +433,11 @@ if __name__ == "__main__":
     sw2, sh2 = contact_sheet_64(list(WRITTEN), "_contact_sheet_64.png", "same glyphs at 64px")
     for name, w, h in WRITTEN:
         print("UI %s %dx%d" % (name, w, h))
+    for name in PASSTHROUGH:
+        if not os.path.exists(_out(name)):
+            raise SystemExit("missing pass-through art %s - copy it into %s" % (name, OUT_DIR))
+        w, h = Image.open(_out(name)).size
+        print("UI %s %dx%d (pass-through brand art, not generated)" % (name, w, h))
     print("UI _contact_sheet.png %dx%d (review sheet, do not import)" % (sw, sh))
     print("UI _contact_sheet_64.png %dx%d (legibility check at list/button size, do not import)" % (sw2, sh2))
     print("wrote %d PNGs + 2 contact sheets to %s" % (len(WRITTEN), OUT_DIR))

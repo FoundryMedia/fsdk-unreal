@@ -90,6 +90,7 @@
 #include "Engine/Texture2D.h"
 #include "Factories/TextureFactory.h"
 #include "FoundryAppBar.h"
+#include "FoundryBootSplash.h"
 #include "FoundryConfirmDialog.h"
 #include "FoundryFriendMenu.h"
 #include "FoundryFriendRow.h"
@@ -165,6 +166,7 @@ namespace
 	FLinearColor TokenColor(const FFoundryUIPalette& P, const FString& Token)
 	{
 		if (Token == TEXT("White")) { return FLinearColor::White; }
+		if (Token == TEXT("Black")) { return FLinearColor::Black; }
 		if (Token == TEXT("Transparent")) { return FLinearColor(0.0f, 0.0f, 0.0f, 0.0f); }
 		if (Token == TEXT("Surface")) { return P.Surface; }
 		if (Token == TEXT("SurfaceLow")) { return P.SurfaceLow; }
@@ -340,6 +342,18 @@ namespace
 		bool bHasMatch = false;
 		FString MatchOut;
 		FString MatchPrefix;
+		/** The boot splash family is OPT-IN with a profile, exactly like Match: built ONLY when the
+		 *  profile carries a "splash": {out, prefix, parent, studioLogo, platformLogo} object
+		 *  (bHasSplash). out/prefix left empty fall back to the social values. "parent" (or the
+		 *  top-level "splashParent") is a native class path the WBP reparents to; empty means
+		 *  UFoundryBootSplash itself. studioLogo / platformLogo are PNG paths (absolute, or relative
+		 *  to the project dir) imported as <out>/T_StudioLogo and <out>/T_PlatformLogo. */
+		bool bHasSplash = false;
+		FString SplashOut;
+		FString SplashPrefix;
+		FString SplashParent;
+		FString SplashStudioLogo;
+		FString SplashPlatformLogo;
 		FFoundryUIPalette Palette;
 		FFoundryUIFonts Fonts;
 		FFoundryUIRadii Radii;
@@ -392,6 +406,18 @@ namespace
 			OutProfile.bHasMatch = true;
 			(*MatchObj)->TryGetStringField(TEXT("out"), OutProfile.MatchOut);
 			(*MatchObj)->TryGetStringField(TEXT("prefix"), OutProfile.MatchPrefix);
+		}
+
+		Root->TryGetStringField(TEXT("splashParent"), OutProfile.SplashParent);
+		const TSharedPtr<FJsonObject>* SplashObj = nullptr;
+		if (Root->TryGetObjectField(TEXT("splash"), SplashObj) && SplashObj && SplashObj->IsValid())
+		{
+			OutProfile.bHasSplash = true;
+			(*SplashObj)->TryGetStringField(TEXT("out"), OutProfile.SplashOut);
+			(*SplashObj)->TryGetStringField(TEXT("prefix"), OutProfile.SplashPrefix);
+			(*SplashObj)->TryGetStringField(TEXT("parent"), OutProfile.SplashParent);
+			(*SplashObj)->TryGetStringField(TEXT("studioLogo"), OutProfile.SplashStudioLogo);
+			(*SplashObj)->TryGetStringField(TEXT("platformLogo"), OutProfile.SplashPlatformLogo);
 		}
 
 		const TSharedPtr<FJsonObject>* PaletteObj = nullptr;
@@ -470,7 +496,9 @@ namespace
 	 *  DefaultGame.ini to point UFoundryUISettings at the just-built skinned copies and palette -
 	 *  printed so a profile run never has to be hand-derived into ini form again. */
 	FString BuildIniBlock(const FString& SocialPath, const FString& Prefix, const FString& MenusPath, const FString& MenusPrefix,
-		bool bMatch, const FString& MatchPath, const FString& MatchPrefix, const FFoundryUIPalette& Palette)
+		bool bMatch, const FString& MatchPath, const FString& MatchPrefix,
+		bool bSplash, const FString& SplashPath, const FString& SplashPrefix, bool bStudioLogo, bool bPlatformLogo,
+		const FFoundryUIPalette& Palette)
 	{
 		FString S;
 		S += TEXT("[/Script/FoundryFSDKUI.FoundryUISettings]") LINE_TERMINATOR;
@@ -489,6 +517,18 @@ namespace
 			S += FString::Printf(TEXT("DefaultAppBar=%s/%sAppBar.%sAppBar_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
 			S += FString::Printf(TEXT("DefaultMatchCluster=%s/%sMatchCluster.%sMatchCluster_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
 			S += FString::Printf(TEXT("DefaultModeRow=%s/%sModeRow.%sModeRow_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
+		}
+		if (bSplash)
+		{
+			S += FString::Printf(TEXT("DefaultBootSplash=%s/%sBootSplash.%sBootSplash_C") LINE_TERMINATOR, *SplashPath, *SplashPrefix, *SplashPrefix);
+			if (bStudioLogo)
+			{
+				S += FString::Printf(TEXT("StudioLogo=%s/T_StudioLogo.T_StudioLogo") LINE_TERMINATOR, *SplashPath);
+			}
+			if (bPlatformLogo)
+			{
+				S += FString::Printf(TEXT("PlatformLogo=%s/T_PlatformLogo.T_PlatformLogo") LINE_TERMINATOR, *SplashPath);
+			}
 		}
 		S += TEXT("Palette=(");
 		S += FString::Printf(TEXT("Surface=%s,"), *FormatLinearColor(Palette.Surface));
@@ -546,6 +586,74 @@ namespace
 
 	// -- icon import ------------------------------------------------------------------------------
 
+	/** Imports ONE PNG as a UI texture (the settings every icon uses) into DestPath/BaseName and saves it.
+	 *  Returns null (logging why) when the import produced no texture; a failed save only sets
+	 *  bOutAnySaveFailed - the texture is still returned. */
+	UTexture2D* ImportUITexture(IAssetTools& AssetTools, const FString& FullSrc, const FString& DestPath, const FString& BaseName,
+		bool& bOutAnySaveFailed)
+	{
+		// Seed the FACTORY with the settings we want, so the FIRST DDC build (the one the
+		// import itself kicks off) is already right - see .claude/rules/unreal-plugin-
+		// conventions.md "Importing textures and glTF from a commandlet". The PreEditChange/
+		// PostEditChange pass below still runs (idempotent re-runs, and it covers the two
+		// fields the factory has no equivalent for: NeverStream, Filter).
+		UTextureFactory* Factory = NewObject<UTextureFactory>();
+		Factory->CompressionSettings = TC_EditorIcon;
+		Factory->LODGroup = TEXTUREGROUP_UI;
+		Factory->MipGenSettings = TMGS_SimpleAverage;
+
+		UAssetImportTask* Task = NewObject<UAssetImportTask>();
+		Task->Filename = FullSrc;
+		Task->DestinationPath = DestPath;
+		Task->DestinationName = BaseName;
+		Task->bReplaceExisting = true;
+		Task->bReplaceExistingSettings = true;
+		Task->bAutomated = true;
+		Task->bSave = false;
+		Task->bAsync = false;
+		Task->Factory = Factory;
+
+		TArray<UAssetImportTask*> Tasks;
+		Tasks.Add(Task);
+		AssetTools.ImportAssetTasks(Tasks);
+
+		UTexture2D* Tex = nullptr;
+		for (UObject* Obj : Task->GetObjects())
+		{
+			Tex = Cast<UTexture2D>(Obj);
+			if (Tex != nullptr)
+			{
+				break;
+			}
+		}
+		if (Tex == nullptr)
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("failed to import icon '%s' from %s"), *BaseName, *FullSrc);
+			return nullptr;
+		}
+
+		// PreEditChange/PostEditChange around the post-import settings change - see
+		// .claude/rules/unreal-plugin-conventions.md "Importing textures and glTF from a
+		// commandlet": touching CompressionSettings while the DDC build from the import is
+		// still in flight can assert. SimpleAverage (not FromTextureGroup, which on the UI
+		// group resolves to NoMipmaps) gives these small UI glyphs a real mip chain - without
+		// one, every icon was sampled at native res and pixelated when shown smaller/scaled.
+		// NeverStream + Trilinear keep them resident and smoothly filtered regardless.
+		Tex->PreEditChange(nullptr);
+		Tex->CompressionSettings = TC_EditorIcon;
+		Tex->LODGroup = TEXTUREGROUP_UI;
+		Tex->MipGenSettings = TMGS_SimpleAverage;
+		Tex->SRGB = true;
+		Tex->NeverStream = true;
+		Tex->Filter = TF_Trilinear;
+		Tex->PostEditChange();
+		if (!SaveAsset(Tex))
+		{
+			bOutAnySaveFailed = true;
+		}
+		return Tex;
+	}
+
 	TMap<FString, UTexture2D*> ImportIcons(const FString& ContentDir, const FString& OutRoot, bool& bOutAnySaveFailed)
 	{
 		TMap<FString, UTexture2D*> Result;
@@ -568,70 +676,39 @@ namespace
 			const FString BaseName = FPaths::GetBaseFilename(FileName);
 			const FString FullSrc = SrcDir / FileName;
 
-			// Seed the FACTORY with the settings we want, so the FIRST DDC build (the one the
-			// import itself kicks off) is already right - see .claude/rules/unreal-plugin-
-			// conventions.md "Importing textures and glTF from a commandlet". The PreEditChange/
-			// PostEditChange pass below still runs (idempotent re-runs, and it covers the two
-			// fields the factory has no equivalent for: NeverStream, Filter).
-			UTextureFactory* Factory = NewObject<UTextureFactory>();
-			Factory->CompressionSettings = TC_EditorIcon;
-			Factory->LODGroup = TEXTUREGROUP_UI;
-			Factory->MipGenSettings = TMGS_SimpleAverage;
-
-			UAssetImportTask* Task = NewObject<UAssetImportTask>();
-			Task->Filename = FullSrc;
-			Task->DestinationPath = DestPath;
-			Task->DestinationName = BaseName;
-			Task->bReplaceExisting = true;
-			Task->bReplaceExistingSettings = true;
-			Task->bAutomated = true;
-			Task->bSave = false;
-			Task->bAsync = false;
-			Task->Factory = Factory;
-
-			TArray<UAssetImportTask*> Tasks;
-			Tasks.Add(Task);
-			AssetTools.ImportAssetTasks(Tasks);
-
-			UTexture2D* Tex = nullptr;
-			for (UObject* Obj : Task->GetObjects())
-			{
-				Tex = Cast<UTexture2D>(Obj);
-				if (Tex != nullptr)
-				{
-					break;
-				}
-			}
+			UTexture2D* Tex = ImportUITexture(AssetTools, FullSrc, DestPath, BaseName, bOutAnySaveFailed);
 			if (Tex == nullptr)
 			{
-				UE_LOG(LogFoundryUIBuild, Error, TEXT("failed to import icon '%s' from %s"), *BaseName, *FullSrc);
 				continue;
-			}
-
-			// PreEditChange/PostEditChange around the post-import settings change - see
-			// .claude/rules/unreal-plugin-conventions.md "Importing textures and glTF from a
-			// commandlet": touching CompressionSettings while the DDC build from the import is
-			// still in flight can assert. SimpleAverage (not FromTextureGroup, which on the UI
-			// group resolves to NoMipmaps) gives these small UI glyphs a real mip chain - without
-			// one, every icon was sampled at native res and pixelated when shown smaller/scaled.
-			// NeverStream + Trilinear keep them resident and smoothly filtered regardless.
-			Tex->PreEditChange(nullptr);
-			Tex->CompressionSettings = TC_EditorIcon;
-			Tex->LODGroup = TEXTUREGROUP_UI;
-			Tex->MipGenSettings = TMGS_SimpleAverage;
-			Tex->SRGB = true;
-			Tex->NeverStream = true;
-			Tex->Filter = TF_Trilinear;
-			Tex->PostEditChange();
-			if (!SaveAsset(Tex))
-			{
-				bOutAnySaveFailed = true;
 			}
 
 			Result.Add(BaseName, Tex);
 			UE_LOG(LogFoundryUIBuild, Log, TEXT("imported icon %s -> %s/%s"), *FileName, *DestPath, *BaseName);
 		}
 		return Result;
+	}
+
+	/** Imports one of the boot splash's logo PNGs (a profile path: absolute, or relative to the project
+	 *  dir) as <SplashPath>/<AssetName>. Null (logging why) when the file is missing or the import fails,
+	 *  so the splash falls back to its default art instead of the run dying. */
+	UTexture2D* ImportSplashLogo(const FString& ProfilePngPath, const FString& SplashPath, const TCHAR* AssetName, bool& bOutAnySaveFailed)
+	{
+		const FString FullSrc = FPaths::IsRelative(ProfilePngPath)
+			? FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), ProfilePngPath)
+			: ProfilePngPath;
+		if (!FPaths::FileExists(FullSrc))
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("splash logo %s: file not found at %s - using the default art"), AssetName, *FullSrc);
+			return nullptr;
+		}
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+		UTextureFactory::SuppressImportOverwriteDialog(true);
+		UTexture2D* Tex = ImportUITexture(AssetTools, FullSrc, SplashPath, AssetName, bOutAnySaveFailed);
+		if (Tex != nullptr)
+		{
+			UE_LOG(LogFoundryUIBuild, Log, TEXT("imported splash logo %s -> %s/%s"), *FullSrc, *SplashPath, AssetName);
+		}
+		return Tex;
 	}
 
 	// -- icon verification (-verifyicons) - proves the mip/filter settings above actually landed,
@@ -1976,6 +2053,39 @@ namespace
 				.P(TEXT("Collapsed"), TEXT("1")).P(TEXT("SlotPad"), TEXT("12,0,0,0"))));
 		return Root;
 	}
+
+	// -- the boot splash (fifth family): opaque black, two logos side by side. Bound names ==
+	// UFoundryBootSplash's BindWidgetOptional members verbatim. The root Overlay carries NO slot props (a
+	// WBP root has no parent slot); the gap between the logos is the PlatformLogo child's own SlotPad.
+	// StudioIcon names an entry of the Icons map (empty = a plain white shape image the runtime
+	// replaces, 256 x 256); PlatformIcon likewise (default "foundry_logo"). No text, no buttons.
+	FFoundryWidgetSpec BootSplashSpec(const FString& StudioIcon, const FString& PlatformIcon)
+	{
+		FFoundryWidgetSpec Root;
+		Root.Type = TEXT("Overlay");
+		Root.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("Backdrop"), true }
+			.P(TEXT("Fill"), TEXT("Black")).P(TEXT("Radius"), 0.0f).P(TEXT("HAlign"), TEXT("Fill")).P(TEXT("VAlign"), TEXT("Fill")));
+
+		FFoundryWidgetSpec LogoRow{ TEXT("HorizontalBox"), TEXT("LogoRow"), true };
+		LogoRow.P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Center")).P(TEXT("ChildVAlign"), TEXT("Center"));
+
+		FFoundryWidgetSpec Studio{ TEXT("Image"), TEXT("StudioLogo"), true };
+		if (!StudioIcon.IsEmpty())
+		{
+			Studio.P(TEXT("Icon"), StudioIcon).P(TEXT("IconW"), 256.0f).P(TEXT("IconH"), 256.0f);
+		}
+		else
+		{
+			Studio.P(TEXT("Fill"), TEXT("White")).P(TEXT("Radius"), 0.0f).P(TEXT("W"), 256.0f).P(TEXT("H"), 256.0f);
+		}
+		LogoRow.C(MoveTemp(Studio));
+
+		LogoRow.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("PlatformLogo"), true }
+			.P(TEXT("Icon"), PlatformIcon).P(TEXT("IconW"), 256.0f).P(TEXT("IconH"), 256.0f).P(TEXT("SlotPad"), TEXT("80,0,0,0")));
+
+		Root.C(MoveTemp(LogoRow));
+		return Root;
+	}
 }
 
 UFoundryUIBuildCommandlet::UFoundryUIBuildCommandlet()
@@ -2198,6 +2308,58 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		}
 	}
 
+	// Boot splash (fifth family): the black two-logo stinger screen. Without a profile it is ALWAYS
+	// built, under OutRoot/Splash as WBP_FoundryBootSplash with the plugin's default foundry_logo art. WITH a
+	// profile it is OPT-IN: built only when the profile carries a "splash" object (a profile without one
+	// builds none of it and prints no ini lines for it). out/prefix fall back to the social values; the
+	// optional studioLogo / platformLogo PNGs are imported next to the WBP so it hard-references them
+	// (cook-safe) and the ini block names them.
+	const bool bBuildSplash = !bHasProfile || Profile.bHasSplash;
+	const FString SplashPath = bHasProfile ? (!Profile.SplashOut.IsEmpty() ? Profile.SplashOut : SocialPath) : (OutRoot / TEXT("Splash"));
+	const FString SplashPrefix = bHasProfile ? (!Profile.SplashPrefix.IsEmpty() ? Profile.SplashPrefix : Prefix) : TEXT("WBP_Foundry");
+	const FString SplashAssetName = SplashPrefix + TEXT("BootSplash");
+
+	UClass* SplashParentClass = UFoundryBootSplash::StaticClass();
+	if (bBuildSplash && bHasProfile && !Profile.SplashParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryBootSplash::StaticClass(), nullptr, *Profile.SplashParent);
+		if (Loaded != nullptr)
+		{
+			SplashParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile splash parent '%s' failed to resolve - using UFoundryBootSplash"), *Profile.SplashParent);
+		}
+	}
+
+	TMap<FString, UTexture2D*> SplashIcons = Icons;
+	FString SplashStudioIcon;                          // empty = the plain white shape image
+	FString SplashPlatformIcon = TEXT("foundry_logo"); // the plugin default
+	bool bStudioLogoImported = false;
+	bool bPlatformLogoImported = false;
+	if (bBuildSplash && bHasProfile)
+	{
+		if (!Profile.SplashStudioLogo.IsEmpty())
+		{
+			if (UTexture2D* Tex = ImportSplashLogo(Profile.SplashStudioLogo, SplashPath, TEXT("T_StudioLogo"), bAnySaveFailed))
+			{
+				SplashIcons.Add(TEXT("splash_studio_logo"), Tex);
+				SplashStudioIcon = TEXT("splash_studio_logo");
+				bStudioLogoImported = true;
+			}
+		}
+		if (!Profile.SplashPlatformLogo.IsEmpty())
+		{
+			if (UTexture2D* Tex = ImportSplashLogo(Profile.SplashPlatformLogo, SplashPath, TEXT("T_PlatformLogo"), bAnySaveFailed))
+			{
+				SplashIcons.Add(TEXT("splash_platform_logo"), Tex);
+				SplashPlatformIcon = TEXT("splash_platform_logo");
+				bPlatformLogoImported = true;
+			}
+		}
+	}
+
 	// Two separate buffers - so a -dump that lands the menus WBPs in their own folder gets a
 	// TREES.md listing ONLY the menus widgets there, and the social folder's TREES.md lists ONLY
 	// the social ones. When the two paths are the SAME folder, both buffers are written into one
@@ -2205,6 +2367,7 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	FString SocialDump;
 	FString MenusDump;
 	FString MatchDump; // stays empty when the Match family is not built (opt-in with a profile)
+	FString SplashDump; // stays empty when the boot splash is not built (opt-in with a profile)
 
 	bAnySaveFailed |= !BuildWBP(SocialPath, *FriendRowAssetName, UFoundryFriendRow::StaticClass(), FriendRowSpec(), Palette, Radii, Fonts, Icons, SocialDump);
 	bAnySaveFailed |= !BuildWBP(SocialPath, *InviteRowAssetName, UFoundryInviteRow::StaticClass(), InviteRowSpec(), Palette, Radii, Fonts, Icons, SocialDump);
@@ -2222,18 +2385,25 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		bAnySaveFailed |= !BuildWBP(MatchPath, *MatchClusterAssetName, MatchClusterParentClass, MatchClusterSpec(Radii), Palette, Radii, Fonts, Icons, MatchDump);
 		bAnySaveFailed |= !BuildWBP(MatchPath, *ModeRowAssetName, ModeRowParentClass, ModeRowSpec(), Palette, Radii, Fonts, Icons, MatchDump);
 	}
+	if (bBuildSplash)
+	{
+		bAnySaveFailed |= !BuildWBP(SplashPath, *SplashAssetName, SplashParentClass, BootSplashSpec(SplashStudioIcon, SplashPlatformIcon),
+			Palette, Radii, Fonts, SplashIcons, SplashDump);
+		UE_LOG(LogFoundryUIBuild, Log, TEXT("boot splash -> %s/%s"), *SplashPath, *SplashAssetName);
+	}
 
 	if (bHasProfile)
 	{
 		// Printed unconditionally (not gated on -dump) - this is the thing a profile run exists to
 		// save someone from hand-deriving: paste it into the project's DefaultGame.ini.
-		const FString Ini = BuildIniBlock(SocialPath, Prefix, MenusPath, MenusPrefix, bBuildMatch, MatchPath, MatchPrefix, Palette);
+		const FString Ini = BuildIniBlock(SocialPath, Prefix, MenusPath, MenusPrefix, bBuildMatch, MatchPath, MatchPrefix,
+			bBuildSplash, SplashPath, SplashPrefix, bStudioLogoImported, bPlatformLogoImported, Palette);
 		UE_LOG(LogFoundryUIBuild, Log, TEXT("-- paste into DefaultGame.ini --\n%s"), *Ini);
 	}
 
 	if (bDump)
 	{
-		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s%s"), *SocialDump, *MenusDump, *MatchDump);
+		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s%s%s"), *SocialDump, *MenusDump, *MatchDump, *SplashDump);
 
 		// A profile's "out" is a project content path (e.g. "/Game/UI/Lobby"), not the plugin's own
 		// Content dir - resolve it to its mounted disk directory; without a profile, TREES.md still
@@ -2289,6 +2459,10 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		if (bBuildMatch)
 		{
 			AddTrees(ResolveTreesDir(MatchPath, TEXT("UI/Match")), MatchDump);
+		}
+		if (bBuildSplash)
+		{
+			AddTrees(ResolveTreesDir(SplashPath, TEXT("UI/Splash")), SplashDump);
 		}
 		for (const TPair<FString, FString>& Entry : TreesFiles)
 		{

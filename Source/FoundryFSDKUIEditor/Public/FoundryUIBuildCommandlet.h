@@ -1,5 +1,5 @@
 // Copyright Foundry Media. FoundryUIBuild commandlet: generates the default UI kit's Widget
-// Blueprints under /FoundryFSDK/UI/{Social,Menus,Match} and imports its icon set.
+// Blueprints under /FoundryFSDK/UI/{Social,Menus,Match,Splash} and imports its icon set.
 
 #pragma once
 
@@ -53,7 +53,7 @@ struct FFoundryWidgetSpec
  *
  * -profile points at a JSON file ({out, prefix, drawerParent, nameplateParent, pauseParent,
  * confirmParent, settingsParent, keybindRowParent, appBarParent, matchClusterParent,
- * modeRowParent, menus{out,prefix}, match{out,prefix}, palette{},
+ * modeRowParent, menus{out,prefix}, match{out,prefix}, splash{out,prefix,parent,studioLogo,platformLogo}, palette{},
  * fonts{regular,bold,heading}, radii{panel,input,button}}, every field optional) that builds a
  * GAME's own skinned copies instead of the plugin's navy defaults: colours fall back to the plugin
  * palette per-key, fonts fall back to the engine Roboto per-face, radii fall back to 24/16/16 (the
@@ -65,7 +65,11 @@ struct FFoundryWidgetSpec
  * profile carries a "match" object (its out/prefix fall back to the social values when left empty;
  * the three *Parent keys reparent them like drawerParent does), so a profile without one - e.g. a
  * game that hand-builds its own app bar / cluster / mode rows - builds and prints exactly what it
- * did before the family existed. WITHOUT a profile the family is always built. Prints the
+ * did before the family existed. WITHOUT a profile the family is always built. The Splash family
+ * (WBP_FoundryBootSplash, parent UFoundryBootSplash - the non-skippable boot stinger: black backdrop,
+ * studio + platform logos side by side) follows the same opt-in rule under a "splash" object; its
+ * studioLogo / platformLogo PNG paths import as <out>/T_StudioLogo / T_PlatformLogo and the WBP
+ * hard-references them, so a cook carries them. Prints the
  * [/Script/FoundryFSDKUI.FoundryUISettings] ini block (DefaultSocialDrawer through DefaultTooltip,
  * + DefaultAppBar / DefaultMatchCluster / DefaultModeRow only when the Match family was built, +
  * the resolved Palette) to paste into the project's DefaultGame.ini. With no -profile, output is
