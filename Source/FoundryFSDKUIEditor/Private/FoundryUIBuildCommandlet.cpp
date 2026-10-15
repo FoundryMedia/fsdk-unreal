@@ -926,6 +926,17 @@ namespace
 			{
 				Txt->SetAutoWrapText(true);
 			}
+			{
+				const FString Justify = GetProp(TEXT("Justify"));
+				if (Justify == TEXT("Center"))
+				{
+					Txt->SetJustification(ETextJustify::Center);
+				}
+				else if (Justify == TEXT("Right"))
+				{
+					Txt->SetJustification(ETextJustify::Right);
+				}
+			}
 			NewWidget = Txt;
 		}
 		else if (TypeStr == TEXT("EditableTextBox"))
@@ -2099,7 +2110,10 @@ namespace
 				.P(TEXT("Icon"), TEXT("icon_spinner")).P(TEXT("IconW"), 20.0f).P(TEXT("IconH"), 20.0f).P(TEXT("Tint"), TEXT("Primary"))
 				.P(TEXT("Pivot"), TEXT("0.5,0.5")))
 			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("StatusText"), true }
-				.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("SlotPad"), TEXT("8,0,8,0")))
+				// Wrap + Fill + centred: the server-told wait sentence is a full line ("we're starting a server for
+				// you... (~9 min left)") and overflowed Goo's hand-built cluster (Justin, 2026-10-15).
+				.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("Wrap"), TEXT("1"))
+				.P(TEXT("Justify"), TEXT("Center")).P(TEXT("HAlign"), TEXT("Fill")).P(TEXT("SlotPad"), TEXT("8,0,8,0")))
 			.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("LeaveMatchButton"), true }
 				.P(TEXT("Normal"), TEXT("Transparent")).P(TEXT("Hovered"), TEXT("SurfaceHigh")).P(TEXT("Pressed"), TEXT("SurfaceHigh"))
 				.P(TEXT("HalfHeight"), TEXT("1"))
