@@ -273,13 +273,10 @@ void UFMMSSubsystem::NotifyMatchEnded()
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
 		// Tell matchmaking the match is over BEFORE the ticket is cancelled: fid then stops backfilling into
-		// the dead match and my-session stops offering the seat. Copy the id first - nothing below may
-		// invalidate it - and call this before CancelMatch (which waits for the report to finish).
-		const FString EndedMatchId = CurrentMatchId;
-		if (!EndedMatchId.IsEmpty())
-		{
-			Sdk->ReportMatchEnded(EndedMatchId);
-		}
+		// the dead match and my-session stops offering the seat. Keyed on the SDK's active TICKET, which every
+		// search holds - CurrentMatchId is empty on a fresh search (only my-session sets it), so it cannot gate
+		// this. CancelMatch waits for the report to finish.
+		Sdk->ReportMatchEnded();
 		Sdk->CancelMatch(); // worker thread, fire-and-forget; a failure is WARN-logged there and changes nothing here
 	}
 	else

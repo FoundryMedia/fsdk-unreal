@@ -45,7 +45,6 @@
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
 #define FSDK_PATH_REGIONS       "/v1/fmms/regions"
 #define FSDK_PATH_MY_SESSION    "/v1/fmms/my-session"
-#define FSDK_PATH_MATCHES       "/v1/fmms/matches"
 
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
@@ -973,33 +972,20 @@ fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out) {
     return FSDK_OK;
 }
 
-fsdk_result fsdk_report_match_ended(fsdk_client* client, const char* match_id) {
-    if (client == NULL || match_id == NULL) {
+fsdk_result fsdk_report_match_ended(fsdk_client* client, fsdk_ticket* ticket) {
+    if (client == NULL || ticket == NULL || ticket->ticket_id == NULL) {
         return FSDK_ERR_INVALID_ARG;
-    }
-    /* The id goes into a URL path: UUID-shaped ids only (letters, digits, '-',
-     * '_'), bounded to fsdk_session_seat.match_id - never trust it in raw. */
-    const size_t len = strlen(match_id);
-    if (len == 0 || len >= sizeof(((fsdk_session_seat*)0)->match_id)) {
-        return FSDK_ERR_INVALID_ARG;
-    }
-    for (size_t i = 0; i < len; i++) {
-        const char c = match_id[i];
-        const int ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
-                       || (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
-        if (!ok) {
-            return FSDK_ERR_INVALID_ARG;
-        }
     }
     if (!client->authenticated || client->player_token == NULL) {
         return FSDK_ERR_NOT_AUTHENTICATED;
     }
 
-    /* POST {base_url}/v1/fmms/matches/{id}/ended, empty body, player bearer.
-     * 200 {matchId,status}; 404 = no seat in that match (or an older fid
-     * without the route); idempotent server-side. */
-    char path[160];
-    snprintf(path, sizeof(path), "%s/%s/ended", FSDK_PATH_MATCHES, match_id);
+    /* POST {base_url}/v1/fmms/tickets/{id}/match-ended, empty body, player
+     * bearer. The ticket id came from the server (submit / my-session), the
+     * same trust level as cancel and connection. 200 {ticketId,matchId,status};
+     * 404 = no such seat (or an older fid without the route); idempotent. */
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s/match-ended", FSDK_PATH_TICKETS, ticket->ticket_id);
 
     client->last_error[0] = '\0';
     char* resp = NULL;

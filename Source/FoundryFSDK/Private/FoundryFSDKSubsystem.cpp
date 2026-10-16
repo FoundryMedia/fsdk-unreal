@@ -729,35 +729,41 @@ void UFoundryFSDKSubsystem::AbandonMatch(const FString& TicketId)
 	});
 }
 
-void UFoundryFSDKSubsystem::ReportMatchEnded(const FString& MatchId)
+void UFoundryFSDKSubsystem::ReportMatchEnded()
 {
 	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
-	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || MatchId.IsEmpty())
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
 	{
 		return;
 	}
 
-	// Fire-and-forget: the platform closes the match to new seats. Raised here, on the caller's thread, so
-	// a CancelMatch() issued right after this call is guaranteed to see it and wait its turn.
+	// Fire-and-forget, exactly like CancelMatch(): the ACTIVE ticket is read under the serialization lock on
+	// the worker. The counter is raised here, on the caller's thread, so a CancelMatch() issued right after
+	// this call is guaranteed to see it and wait its turn.
 	CoreRef->PendingEndedReports.Increment();
-	const FString MatchCopy = MatchId;
-	Async(EAsyncExecution::Thread, [CoreRef, MatchCopy]()
+	Async(EAsyncExecution::Thread, [CoreRef]()
 	{
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			const FTCHARToUTF8 MatchUtf8(*MatchCopy);
-			const fsdk_result R = fsdk_report_match_ended(CoreRef->Client, MatchUtf8.Get());
-			if (R == FSDK_OK)
+			if (CoreRef->ActiveTicket == nullptr)
 			{
-				UE_LOG(LogFoundryFSDK, Log, TEXT("ReportMatchEnded: matchmaking closed match %s to new seats."), *MatchCopy);
+				UE_LOG(LogFoundryFSDK, Log, TEXT("ReportMatchEnded: no active ticket - nothing to report"));
 			}
 			else
 			{
-				// Fail-soft: the seat's ticket is cancelled right after and the match ends via the
-				// allocation reaper regardless - this only costs the early close.
-				const FString ServerMessage = UTF8_TO_TCHAR(fsdk_last_error_message(CoreRef->Client));
-				UE_LOG(LogFoundryFSDK, Warning, TEXT("ReportMatchEnded: report for match %s failed (result %d): %s"),
-					*MatchCopy, static_cast<int32>(R), *ServerMessage);
+				const fsdk_result R = fsdk_report_match_ended(CoreRef->Client, CoreRef->ActiveTicket);
+				if (R == FSDK_OK)
+				{
+					UE_LOG(LogFoundryFSDK, Log, TEXT("ReportMatchEnded: matchmaking closed the match to new seats."));
+				}
+				else
+				{
+					// Fail-soft: the ticket is cancelled right after and the match ends via the allocation
+					// reaper regardless - this only costs the early close.
+					const FString ServerMessage = UTF8_TO_TCHAR(fsdk_last_error_message(CoreRef->Client));
+					UE_LOG(LogFoundryFSDK, Warning, TEXT("ReportMatchEnded: report failed (result %d): %s"),
+						static_cast<int32>(R), *ServerMessage);
+				}
 			}
 		}
 		CoreRef->PendingEndedReports.Decrement(); // after the lock: CancelMatch waits on this, then takes it

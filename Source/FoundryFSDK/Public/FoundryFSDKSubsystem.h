@@ -566,13 +566,15 @@ public:
 	void AbandonMatch(const FString& TicketId);
 
 	/**
-	 * Tell matchmaking the game OBSERVED the match end (POST /v1/fmms/matches/{id}/ended): fid closes the
+	 * Tell matchmaking the game OBSERVED the match end (POST /v1/fmms/tickets/{ticketId}/match-ended, keyed on
+	 * the ACTIVE ticket - the one thing every search and reconnect holds, unlike a match id): fid closes that
 	 * match to new seats, so nobody is backfilled into a dead match and my-session stops offering the seat.
-	 * Fire-and-forget on a worker thread (never blocks the game thread); the outcome is logged. Idempotent
-	 * server-side. A later CancelMatch() waits for an in-flight report, so call this FIRST.
+	 * Fire-and-forget on a worker thread (never blocks the game thread); the outcome is logged, and no active
+	 * ticket is a logged no-op. Idempotent server-side. A later CancelMatch() waits for an in-flight report
+	 * (a cancelled ticket no longer holds the seat), so call this FIRST.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
-	void ReportMatchEnded(const FString& MatchId);
+	void ReportMatchEnded();
 
 	// ── FRC chat (the game's GLOBAL room over the platform realtime socket) ─────
 	// Server-authoritative end to end: the player token only ever grants ROOM
