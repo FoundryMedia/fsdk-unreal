@@ -406,8 +406,10 @@ bool FFMMSCancelKeepsMatchOverMessageTest::RunTest(const FString& Parameters)
 
 // -- lobby notices are transient: "Match over" and a refused-join sentence must not sit under Find Match ----------
 // (Justin, 2026-10-16: "there is text under the find match button saying 'The match is over' that shouldnt be
-// there".) The bare GameInstance never ticks its timer manager by itself, so the test advances it ONCE by hand:
-// FTimerManager::Tick returns early on a second call in the same frame, hence one tick per GameInstance.
+// there".) The bare GameInstance never ticks its timer manager by itself, so the test drives it by hand - TWICE:
+// a timer set outside a tick is PENDING and only activated at the end of the next Tick (TimerManager.cpp,
+// InternalSetTimer: !HasBeenTickedThisFrame() -> PendingTimerSet), and Tick refuses a second call in the same
+// frame, so the test ticks once, bumps GFrameCounter, and ticks again to fire it (first run: 1 tick, 0 fires).
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSLobbyNoticesExpireTest, "FoundryFSDK.FMMS.LobbyNoticesExpire",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
 bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
@@ -423,7 +425,9 @@ bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
 		TArray<FString> Messages;
 		const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
 			[&Messages](EFoundryMatchmakingState, const FString& Message) { Messages.Add(Message); });
-		GI->GetTimerManager().Tick(60.0f);
+		GI->GetTimerManager().Tick(0.0f);  // activates the PENDING timer (set outside a tick)
+		++GFrameCounter;                    // Tick() refuses a second call in the same frame
+		GI->GetTimerManager().Tick(60.0f); // fires it
 		Fmms->OnMatchmakingStateChanged.Remove(Handle);
 		TestTrue(TEXT("match over: the message expired"), Fmms->GetMatchmakingMessage().IsEmpty());
 		TestEqual(TEXT("match over: expiry stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
@@ -436,7 +440,9 @@ bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
 		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("Joining"));
 		Fmms->HandleNetworkFailure(nullptr, nullptr, ENetworkFailure::PendingConnectionFailure, TEXT("The match is over."));
 		TestEqual(TEXT("refused join: shown first"), Fmms->GetMatchmakingMessage(), FString(TEXT("The match is over.")));
-		GI->GetTimerManager().Tick(60.0f);
+		GI->GetTimerManager().Tick(0.0f);  // activates the PENDING timer (set outside a tick)
+		++GFrameCounter;                    // Tick() refuses a second call in the same frame
+		GI->GetTimerManager().Tick(60.0f); // fires it
 		TestTrue(TEXT("refused join: the sentence expired"), Fmms->GetMatchmakingMessage().IsEmpty());
 		TestEqual(TEXT("refused join: expiry stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
 	}
@@ -445,7 +451,9 @@ bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
 		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
 		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
 		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Idle, TEXT("Ready."));
-		GI->GetTimerManager().Tick(60.0f);
+		GI->GetTimerManager().Tick(0.0f);  // activates the PENDING timer (set outside a tick)
+		++GFrameCounter;                    // Tick() refuses a second call in the same frame
+		GI->GetTimerManager().Tick(60.0f); // fires it
 		TestEqual(TEXT("plain Idle message has no TTL"), Fmms->GetMatchmakingMessage(), FString(TEXT("Ready.")));
 	}
 	return true;
