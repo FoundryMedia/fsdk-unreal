@@ -99,6 +99,7 @@
 #include "FoundryInviteRow.h"
 #include "FoundryKeybindRow.h"
 #include "FoundryMatchCluster.h"
+#include "FoundryMatchResults.h"
 #include "FoundryModeRow.h"
 #include "FoundryPartyNameplate.h"
 #include "FoundryPauseMenu.h"
@@ -348,6 +349,15 @@ namespace
 		bool bHasMatch = false;
 		FString MatchOut;
 		FString MatchPrefix;
+		/** The match results screen (seventh family) is OPT-IN with a profile, exactly like Match:
+		 *  built ONLY when the profile carries a "results": {out, prefix, parent} object
+		 *  (bHasResults). out/prefix left empty fall back to the social values. "parent" (or the
+		 *  top-level "resultsParent") is a native class path the WBP reparents to; empty means
+		 *  UFoundryMatchResults itself. */
+		bool bHasResults = false;
+		FString ResultsOut;
+		FString ResultsPrefix;
+		FString ResultsParent;
 		/** The boot splash family is OPT-IN with a profile, exactly like Match: built ONLY when the
 		 *  profile carries a "splash": {out, prefix, parent, studioLogo, platformLogo} object
 		 *  (bHasSplash). out/prefix left empty fall back to the social values. "parent" (or the
@@ -414,6 +424,16 @@ namespace
 			OutProfile.bHasMatch = true;
 			(*MatchObj)->TryGetStringField(TEXT("out"), OutProfile.MatchOut);
 			(*MatchObj)->TryGetStringField(TEXT("prefix"), OutProfile.MatchPrefix);
+		}
+
+		Root->TryGetStringField(TEXT("resultsParent"), OutProfile.ResultsParent);
+		const TSharedPtr<FJsonObject>* ResultsObj = nullptr;
+		if (Root->TryGetObjectField(TEXT("results"), ResultsObj) && ResultsObj && ResultsObj->IsValid())
+		{
+			OutProfile.bHasResults = true;
+			(*ResultsObj)->TryGetStringField(TEXT("out"), OutProfile.ResultsOut);
+			(*ResultsObj)->TryGetStringField(TEXT("prefix"), OutProfile.ResultsPrefix);
+			(*ResultsObj)->TryGetStringField(TEXT("parent"), OutProfile.ResultsParent);
 		}
 
 		Root->TryGetStringField(TEXT("splashParent"), OutProfile.SplashParent);
@@ -505,6 +525,7 @@ namespace
 	 *  printed so a profile run never has to be hand-derived into ini form again. */
 	FString BuildIniBlock(const FString& SocialPath, const FString& Prefix, const FString& MenusPath, const FString& MenusPrefix,
 		bool bMatch, const FString& MatchPath, const FString& MatchPrefix,
+		bool bResults, const FString& ResultsPath, const FString& ResultsPrefix,
 		bool bSplash, const FString& SplashPath, const FString& SplashPrefix, bool bStudioLogo, bool bPlatformLogo,
 		const FFoundryUIPalette& Palette)
 	{
@@ -527,6 +548,10 @@ namespace
 			S += FString::Printf(TEXT("DefaultAppBar=%s/%sAppBar.%sAppBar_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
 			S += FString::Printf(TEXT("DefaultMatchCluster=%s/%sMatchCluster.%sMatchCluster_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
 			S += FString::Printf(TEXT("DefaultModeRow=%s/%sModeRow.%sModeRow_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
+		}
+		if (bResults)
+		{
+			S += FString::Printf(TEXT("DefaultMatchResults=%s/%sMatchResults.%sMatchResults_C") LINE_TERMINATOR, *ResultsPath, *ResultsPrefix, *ResultsPrefix);
 		}
 		if (bSplash)
 		{
@@ -2146,6 +2171,47 @@ namespace
 		return Root;
 	}
 
+	// -- the match results screen (seventh family): a full-screen stack layer (dimmed Backdrop + a
+	// centered Panel), the shared menu shell. Bound names == UFoundryMatchResults's BindWidgetOptional
+	// members verbatim. The root Overlay carries NO slot props (a WBP root has no parent slot). The
+	// countdown line is hidden by the runtime until the game sets a deadline; the button label is
+	// baked (the runtime never relabels it). -------------------------------------------------------
+	FFoundryWidgetSpec MatchResultsSpec(const FFoundryUIRadii& Radii)
+	{
+		FFoundryWidgetSpec SizeBoxNode;
+		FFoundryWidgetSpec Root = MenuBackdropAndSizeBox(640.0f, SizeBoxNode);
+		// A results screen takes over the view: heavier dim than the confirm dialog's 0.6.
+		Root.Children[0].P(TEXT("FillAlpha"), 0.85f);
+
+		FFoundryWidgetSpec Panel{ TEXT("Border"), TEXT("Panel"), true };
+		Panel.P(TEXT("Fill"), TEXT("SurfaceHighest")).P(TEXT("Radius"), Radii.Panel);
+
+		FFoundryWidgetSpec Column{ TEXT("VerticalBox") };
+		Column.P(TEXT("SlotPad"), TEXT("32,32,32,32"));
+
+		// HAlign Fill + Justify Center: a wrapped line needs the full row width to wrap against, and
+		// Justify centers the wrapped lines themselves (a slot HAlign Center would size to content).
+		Column.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("TitleText"), true }
+			.P(TEXT("FontSize"), 40.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text"))
+			.P(TEXT("FontRole"), TEXT("Heading")).P(TEXT("Wrap"), TEXT("1")).P(TEXT("Justify"), TEXT("Center")).P(TEXT("HAlign"), TEXT("Fill")));
+
+		Column.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("DetailText"), true }
+			.P(TEXT("FontSize"), 18.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("Wrap"), TEXT("1"))
+			.P(TEXT("Justify"), TEXT("Center")).P(TEXT("HAlign"), TEXT("Fill")).P(TEXT("SlotPad"), TEXT("0,12,0,0")));
+
+		Column.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("CountdownText"), true }
+			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary"))
+			.P(TEXT("Justify"), TEXT("Center")).P(TEXT("HAlign"), TEXT("Fill")).P(TEXT("SlotPad"), TEXT("0,20,0,0")));
+
+		Column.C(PauseMenuButton(TEXT("ReturnButton"), TEXT("Primary"), TEXT("PrimaryContainer"), TEXT("ReturnText"), TEXT("Surface"), TEXT("RETURN TO LOBBY"))
+			.P(TEXT("SlotPad"), TEXT("0,28,0,0")));
+
+		Panel.C(MoveTemp(Column));
+		SizeBoxNode.C(MoveTemp(Panel));
+		Root.C(MoveTemp(SizeBoxNode));
+		return Root;
+	}
+
 	// -- the boot splash (fifth family): opaque black, two logos side by side. Bound names ==
 	// UFoundryBootSplash's BindWidgetOptional members verbatim. The root Overlay carries NO slot props (a
 	// WBP root has no parent slot); the gap between the logos is the PlatformLogo child's own SlotPad.
@@ -2429,6 +2495,29 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		}
 	}
 
+	// Match results (seventh family): the match-end results screen. Without a profile it is ALWAYS built,
+	// under OutRoot/Match as WBP_FoundryMatchResults. WITH a profile it is OPT-IN: built only when the
+	// profile carries a "results" object (a profile without one builds none of it and prints no ini
+	// line for it). out/prefix fall back to the social values, like the Match family.
+	const bool bBuildResults = !bHasProfile || Profile.bHasResults;
+	const FString ResultsPath = bHasProfile ? (!Profile.ResultsOut.IsEmpty() ? Profile.ResultsOut : SocialPath) : (OutRoot / TEXT("Match"));
+	const FString ResultsPrefix = bHasProfile ? (!Profile.ResultsPrefix.IsEmpty() ? Profile.ResultsPrefix : Prefix) : TEXT("WBP_Foundry");
+	const FString ResultsAssetName = ResultsPrefix + TEXT("MatchResults");
+
+	UClass* ResultsParentClass = UFoundryMatchResults::StaticClass();
+	if (bBuildResults && bHasProfile && !Profile.ResultsParent.IsEmpty())
+	{
+		UClass* Loaded = StaticLoadClass(UFoundryMatchResults::StaticClass(), nullptr, *Profile.ResultsParent);
+		if (Loaded != nullptr)
+		{
+			ResultsParentClass = Loaded;
+		}
+		else
+		{
+			UE_LOG(LogFoundryUIBuild, Error, TEXT("profile results parent '%s' failed to resolve - using UFoundryMatchResults"), *Profile.ResultsParent);
+		}
+	}
+
 	// Boot splash (fifth family): the black two-logo stinger screen. Without a profile it is ALWAYS
 	// built, under OutRoot/Splash as WBP_FoundryBootSplash with the plugin's default foundry_logo art. WITH a
 	// profile it is OPT-IN: built only when the profile carries a "splash" object (a profile without one
@@ -2488,6 +2577,7 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	FString SocialDump;
 	FString MenusDump;
 	FString MatchDump; // stays empty when the Match family is not built (opt-in with a profile)
+	FString ResultsDump; // stays empty when the match results screen is not built (opt-in with a profile)
 	FString SplashDump; // stays empty when the boot splash is not built (opt-in with a profile)
 
 	bAnySaveFailed |= !BuildWBP(SocialPath, *FriendRowAssetName, UFoundryFriendRow::StaticClass(), FriendRowSpec(), Palette, Radii, Fonts, Icons, SocialDump);
@@ -2509,6 +2599,11 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		bAnySaveFailed |= !BuildWBP(MatchPath, *MatchClusterAssetName, MatchClusterParentClass, MatchClusterSpec(Radii), Palette, Radii, Fonts, Icons, MatchDump);
 		bAnySaveFailed |= !BuildWBP(MatchPath, *ModeRowAssetName, ModeRowParentClass, ModeRowSpec(), Palette, Radii, Fonts, Icons, MatchDump);
 	}
+	if (bBuildResults)
+	{
+		bAnySaveFailed |= !BuildWBP(ResultsPath, *ResultsAssetName, ResultsParentClass, MatchResultsSpec(Radii), Palette, Radii, Fonts, Icons, ResultsDump);
+		UE_LOG(LogFoundryUIBuild, Log, TEXT("match results -> %s/%s"), *ResultsPath, *ResultsAssetName);
+	}
 	if (bBuildSplash)
 	{
 		bAnySaveFailed |= !BuildWBP(SplashPath, *SplashAssetName, SplashParentClass, BootSplashSpec(SplashStudioIcon, SplashPlatformIcon),
@@ -2521,13 +2616,13 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		// Printed unconditionally (not gated on -dump) - this is the thing a profile run exists to
 		// save someone from hand-deriving: paste it into the project's DefaultGame.ini.
 		const FString Ini = BuildIniBlock(SocialPath, Prefix, MenusPath, MenusPrefix, bBuildMatch, MatchPath, MatchPrefix,
-			bBuildSplash, SplashPath, SplashPrefix, bStudioLogoImported, bPlatformLogoImported, Palette);
+			bBuildResults, ResultsPath, ResultsPrefix, bBuildSplash, SplashPath, SplashPrefix, bStudioLogoImported, bPlatformLogoImported, Palette);
 		UE_LOG(LogFoundryUIBuild, Log, TEXT("-- paste into DefaultGame.ini --\n%s"), *Ini);
 	}
 
 	if (bDump)
 	{
-		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s%s%s"), *SocialDump, *MenusDump, *MatchDump, *SplashDump);
+		UE_LOG(LogFoundryUIBuild, Log, TEXT("%s%s%s%s%s"), *SocialDump, *MenusDump, *MatchDump, *ResultsDump, *SplashDump);
 
 		// A profile's "out" is a project content path (e.g. "/Game/UI/Lobby"), not the plugin's own
 		// Content dir - resolve it to its mounted disk directory; without a profile, TREES.md still
@@ -2583,6 +2678,10 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 		if (bBuildMatch)
 		{
 			AddTrees(ResolveTreesDir(MatchPath, TEXT("UI/Match")), MatchDump);
+		}
+		if (bBuildResults)
+		{
+			AddTrees(ResolveTreesDir(ResultsPath, TEXT("UI/Match")), ResultsDump);
 		}
 		if (bBuildSplash)
 		{

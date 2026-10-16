@@ -216,6 +216,11 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultModeRow;
 
+	/** WBP_FoundryMatchResults - the match-end results screen (title, detail, return countdown,
+	 *  RETURN TO LOBBY), pushed through IFoundryMenuHost::RequestPushMenu. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Match")
+	TSoftClassPtr<UUserWidget> DefaultMatchResults;
+
 	/** WBP_FoundryCreditsView - the credits view the pause menu's ABOUT button pushes. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultCreditsView;

@@ -5,6 +5,7 @@
 #include "FoundryMatchmakingCopy.h"
 #include "foundry/fsdk.h" // fsdk_wait_reason_str (diagnostics only - never player-facing text)
 
+#include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -15,8 +16,25 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogFMMS, Log, All);
 
+void UFMMSSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+	if (GEngine != nullptr)
+	{
+		NetworkFailureHandle = GEngine->OnNetworkFailure().AddUObject(this, &UFMMSSubsystem::HandleNetworkFailure);
+		TravelFailureHandle = GEngine->OnTravelFailure().AddUObject(this, &UFMMSSubsystem::HandleTravelFailure);
+	}
+}
+
 void UFMMSSubsystem::Deinitialize()
 {
+	if (GEngine != nullptr)
+	{
+		GEngine->OnNetworkFailure().Remove(NetworkFailureHandle);
+		GEngine->OnTravelFailure().Remove(TravelFailureHandle);
+	}
+	NetworkFailureHandle.Reset();
+	TravelFailureHandle.Reset();
 	StopPolling();
 	if (UGameInstance* GI = GetGameInstance())
 	{
@@ -94,6 +112,10 @@ void UFMMSSubsystem::FindMatch(const FString& Queue, const FString& AttributesJs
 		return;
 	}
 	BindOnce(Sdk);
+	bMatchEndedNotified = false; // a new search is accepted: the previous match's end no longer applies
+	bSeatReleased = false;
+	EndedTicketId.Reset();
+	KnownTicketId.Reset();
 	PendingQueue = Queue;
 	PendingAttributes = AttributesJson.IsEmpty() ? TEXT("{}") : AttributesJson;
 	SetPhase(EFMMSPhase::Authenticating, TEXT("Authenticating..."));
@@ -132,6 +154,10 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 	// The client already exists + is authenticated from login, so skip
 	// InitializeClient + Authenticate and go straight to the match request.
 	BindOnce(Sdk);
+	bMatchEndedNotified = false; // a new search is accepted: the previous match's end no longer applies
+	bSeatReleased = false;
+	EndedTicketId.Reset();
+	KnownTicketId.Reset();
 	PendingQueue = Queue;
 	PendingAttributes = AttributesJson.IsEmpty() ? TEXT("{}") : AttributesJson;
 	SetPhase(EFMMSPhase::Requesting, TEXT("Checking regions and requesting match..."));
@@ -141,17 +167,116 @@ void UFMMSSubsystem::FindMatchAuthenticated(const FString& Queue, const FString&
 void UFMMSSubsystem::Cancel()
 {
 	StopPolling();
-	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching
-		|| Phase == EFMMSPhase::WaitingForCapacity || Phase == EFMMSPhase::Connecting)
+	// Release the ticket in EVERY phase. The phase stays Traveling for the whole match, so the old
+	// "only while a search is live" scope never DELETEd the ticket of a player who left a match, and the
+	// lobby then offered Reconnect to the dead seat (Justin, 2026-10-16). CancelMatch runs on a worker
+	// thread and is a no-op when the SDK holds no ticket handle.
+	// A SEAT exists in Found / Connecting / Traveling (and a pending Reconnect seat): remember it and arm the
+	// ended-seat belt BEFORE the async cancel, so a my-session read that races the DELETE (the lobby's
+	// CheckActiveSession at BeginPlay) declines the seat instead of offering Reconnect. A Searching ticket is
+	// QUEUED, not seated - nothing to race. Deliberate leave RELEASES the seat (Justin, 2026-10-16).
+	if (IsSeatHeld())
 	{
-		if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+		const FString Released = !ReconnectTicketId.IsEmpty() ? ReconnectTicketId : KnownTicketId; // copy before the resets below
+		if (!Released.IsEmpty())
 		{
-			Sdk->CancelMatch();
+			EndedTicketId = Released;
 		}
+		bSeatReleased = true;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->CancelMatch();
 	}
 	AbandonReconnectSeat(); // Cancel from Reconnectable = decline the live seat
 	CurrentMatchId.Reset();
-	SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."));
+	KnownTicketId.Reset();
+	// RETURN TO LOBBY after NotifyMatchEnded lands here with the phase already Idle: keep the lobby's
+	// "Match over" message instead of overwriting it with "Cancelled.".
+	if (!(bMatchEndedNotified && Phase == EFMMSPhase::Idle))
+	{
+		SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."));
+	}
+}
+
+bool UFMMSSubsystem::IsSeatHeld() const
+{
+	return Phase == EFMMSPhase::Connecting || Phase == EFMMSPhase::Traveling
+		|| MatchmakingState == EFoundryMatchmakingState::Found || MatchmakingState == EFoundryMatchmakingState::Traveling
+		|| !ReconnectTicketId.IsEmpty();
+}
+
+void UFMMSSubsystem::HandleMatchJoinFailure(const FString& Reason)
+{
+	if (!IsSeatHeld())
+	{
+		return; // not our join (or already released): nothing to do
+	}
+	const FString Message = Reason.IsEmpty() ? FString(TEXT("Could not join the match.")) : Reason; // copy before any broadcast
+	UE_LOG(LogFMMS, Log, TEXT("[FMMS] join failed or refused - releasing the seat."));
+	StopPolling();
+	const FString Released = !ReconnectTicketId.IsEmpty() ? ReconnectTicketId : KnownTicketId;
+	if (!Released.IsEmpty())
+	{
+		EndedTicketId = Released;
+	}
+	bSeatReleased = true; // arms the ended-seat belt: a later my-session read of this seat is declined
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->CancelMatch(); // worker thread, no-op without a ticket handle
+	}
+	AbandonReconnectSeat();
+	CurrentMatchId.Reset();
+	KnownTicketId.Reset();
+	bCancelPending = false;
+	SetPhase(EFMMSPhase::Idle, Message);
+}
+
+void UFMMSSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*NetDriver*/,
+                                          ENetworkFailure::Type FailureType, const FString& ErrorString)
+{
+	// Only a refused / failed JOIN releases the seat. ConnectionLost / ConnectionTimeout / etc. are unplanned
+	// disconnects from a live match - exactly what Reconnect is for - so they are left alone.
+	if (FailureType == ENetworkFailure::PendingConnectionFailure || FailureType == ENetworkFailure::FailureReceived)
+	{
+		HandleMatchJoinFailure(ErrorString);
+	}
+}
+
+void UFMMSSubsystem::HandleTravelFailure(UWorld* /*World*/, ETravelFailure::Type /*FailureType*/, const FString& ErrorString)
+{
+	HandleMatchJoinFailure(ErrorString);
+}
+
+void UFMMSSubsystem::NotifyMatchEnded()
+{
+	if (bMatchEndedNotified)
+	{
+		return; // idempotent: the game may call this from a replication callback AND the results screen
+	}
+	bMatchEndedNotified = true;
+	StopPolling();
+	// Remember WHICH seat ended (the pending reconnect seat wins, else the one my-session last reported).
+	// Copy before AbandonReconnectSeat() clears ReconnectTicketId.
+	// (A plain Cancel() may already have recorded it: never overwrite a known id with an empty one.)
+	const FString Ended = !ReconnectTicketId.IsEmpty() ? ReconnectTicketId : KnownTicketId;
+	if (!Ended.IsEmpty())
+	{
+		EndedTicketId = Ended;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->CancelMatch(); // worker thread, fire-and-forget; a failure is WARN-logged there and changes nothing here
+	}
+	else
+	{
+		UE_LOG(LogFMMS, Log, TEXT("[FMMS] NotifyMatchEnded without an SDK - local state cleared only."));
+	}
+	AbandonReconnectSeat();
+	CurrentMatchId.Reset();
+	KnownTicketId.Reset();
+	bCancelPending = false; // the Idle below must read "Match over", not "Search cancelled."
+	SetPhase(EFMMSPhase::Idle, TEXT("Match over"));
 }
 
 /** Decline any pending reconnect seat: cancel its ticket server-side + forget it. */
@@ -209,6 +334,33 @@ void UFMMSSubsystem::Reconnect()
 
 void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat)
 {
+	ApplyMySession(Result, Seat);
+}
+
+void UFMMSSubsystem::ApplyMySession(EFoundryFsdkResult Result, const FFoundrySessionSeat& Seat)
+{
+	const FString SeatTicketId = Seat.TicketId; // copy first: Abandon/SetPhase below re-enter other listeners
+	// Belt for NotifyMatchEnded / a seat-releasing Cancel: the match is over (or left), so a live seat that is (or may be) ours is the dead
+	// match's - the reaper lags up to ~2 min after the server exits and the cancel may have failed. Decline
+	// it (idempotent server-side) and stay Idle; never offer Reconnect to a finished match.
+	if ((bMatchEndedNotified || bSeatReleased) && Result == EFoundryFsdkResult::Ok && Seat.bActive && !SeatTicketId.IsEmpty()
+		&& (EndedTicketId.IsEmpty() || SeatTicketId == EndedTicketId))
+	{
+		UE_LOG(LogFMMS, Log, TEXT("[FMMS] my-session still reports the seat of a match that already ended - declining it."));
+		EndedTicketId = SeatTicketId;
+		if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+		{
+			Sdk->AbandonMatch(SeatTicketId);
+		}
+		ReconnectTicketId.Reset();
+		CurrentMatchId.Reset();
+		KnownTicketId.Reset();
+		if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
+		{
+			SetPhase(EFMMSPhase::Idle, TEXT("Ready."));
+		}
+		return;
+	}
 	// Record the live match id REGARDLESS of the phase machine below - it is
 	// informational (feeds GetCurrentMatchId for in-match match/team chat) and
 	// my-session is the only client-side source of it (the connection payload
@@ -216,15 +368,19 @@ void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionS
 	if (Result == EFoundryFsdkResult::Ok && Seat.bActive)
 	{
 		CurrentMatchId = Seat.MatchId;
+		if (!SeatTicketId.IsEmpty())
+		{
+			KnownTicketId = SeatTicketId;
+		}
 	}
 	if (Phase == EFMMSPhase::Requesting || Phase == EFMMSPhase::Searching
 		|| Phase == EFMMSPhase::WaitingForCapacity || Phase == EFMMSPhase::Connecting)
 	{
 		return; // a live flow started meanwhile - its handlers own the phase
 	}
-	if (Result == EFoundryFsdkResult::Ok && Seat.bActive && !Seat.TicketId.IsEmpty())
+	if (Result == EFoundryFsdkResult::Ok && Seat.bActive && !SeatTicketId.IsEmpty())
 	{
-		ReconnectTicketId = Seat.TicketId;
+		ReconnectTicketId = SeatTicketId;
 		SetPhase(EFMMSPhase::Reconnectable, TEXT("You have a match in progress."));
 		return;
 	}
@@ -234,6 +390,7 @@ void UFMMSSubsystem::HandleMySession(EFoundryFsdkResult Result, FFoundrySessionS
 	if (Result == EFoundryFsdkResult::Ok && !Seat.bActive)
 	{
 		CurrentMatchId.Reset(); // definitive platform answer: no live seat
+		KnownTicketId.Reset();
 	}
 	if (Phase != EFMMSPhase::Idle && Phase != EFMMSPhase::Failed)
 	{

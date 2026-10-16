@@ -43,19 +43,20 @@ struct FFoundryWidgetSpec
  * under <out>/Menus, and the three default Match-family Widget Blueprints (WBP_FoundryAppBar /
  * WBP_FoundryMatchCluster / WBP_FoundryModeRow - the lobby app bar, the find-match cluster and its
  * mode row; parents UFoundryAppBar / UFoundryMatchCluster / UFoundryModeRow) under <out>/Match,
- * from the C++ spec trees in this module's .cpp, and imports the plugin's icon
+ * plus the match-end results screen (WBP_FoundryMatchResults, parent UFoundryMatchResults) under
+ * <out>/Match as well, from the C++ spec trees in this module's .cpp, and imports the plugin's icon
  * set (Content/UI/Icons/src/*.png) into <out>/Icons (Texture Group UI, uncompressed TC_EditorIcon,
  * Mip Gen SimpleAverage, NeverStream, Trilinear filtering).
  *
  * Re-runnable: CreatePackage replaces an existing package's object of the same name cleanly; all
- * fifteen Blueprints and every icon texture are rebuilt from the spec / source PNGs each run, nothing
+ * sixteen Blueprints and every icon texture are rebuilt from the spec / source PNGs each run, nothing
  * outside <out>/Social, <out>/Menus, <out>/Match and <out>/Icons is touched. No animations are generated (the
  * WBPs' Sequencer tracks are left for the Designer pass); the parent classes' PlayOrTween
  * code-tween fallback covers their absence.
  *
  * -profile points at a JSON file ({out, prefix, drawerParent, nameplateParent, pauseParent,
  * confirmParent, settingsParent, keybindRowParent, creditsParent, creditRowParent, appBarParent, matchClusterParent,
- * modeRowParent, menus{out,prefix}, match{out,prefix}, splash{out,prefix,parent,studioLogo,platformLogo}, palette{},
+ * modeRowParent, resultsParent, menus{out,prefix}, match{out,prefix}, results{out,prefix,parent}, splash{out,prefix,parent,studioLogo,platformLogo}, palette{},
  * fonts{regular,bold,heading}, radii{panel,input,button}}, every field optional) that builds a
  * GAME's own skinned copies instead of the plugin's navy defaults: colours fall back to the plugin
  * palette per-key, fonts fall back to the engine Roboto per-face, radii fall back to 24/16/16 (the
@@ -67,7 +68,10 @@ struct FFoundryWidgetSpec
  * profile carries a "match" object (its out/prefix fall back to the social values when left empty;
  * the three *Parent keys reparent them like drawerParent does), so a profile without one - e.g. a
  * game that hand-builds its own app bar / cluster / mode rows - builds and prints exactly what it
- * did before the family existed. WITHOUT a profile the family is always built. The Splash family
+ * did before the family existed. WITHOUT a profile the family is always built. The match results
+ * screen (seventh family, WBP_FoundryMatchResults) follows the same opt-in rule under a "results"
+ * object (out/prefix fall back to the social values; "parent" or the top-level "resultsParent"
+ * reparents it). The Splash family
  * (WBP_FoundryBootSplash, parent UFoundryBootSplash - the non-skippable boot stinger: black backdrop,
  * studio + platform logos side by side) follows the same opt-in rule under a "splash" object; its
  * studioLogo / platformLogo PNG paths import as <out>/T_StudioLogo / T_PlatformLogo and the WBP
@@ -75,6 +79,7 @@ struct FFoundryWidgetSpec
  * [/Script/FoundryFSDKUI.FoundryUISettings] ini block (DefaultSocialDrawer through DefaultTooltip,
  * incl. DefaultCreditsView / DefaultCreditRow,
  * + DefaultAppBar / DefaultMatchCluster / DefaultModeRow only when the Match family was built, +
+ * DefaultMatchResults only when the results screen was built, +
  * the resolved Palette) to paste into the project's DefaultGame.ini. With no -profile, output is
  * byte-identical to before -profile existed.
  *

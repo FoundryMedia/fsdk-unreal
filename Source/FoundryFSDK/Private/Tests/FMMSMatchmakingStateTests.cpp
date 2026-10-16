@@ -152,4 +152,255 @@ bool FFMMSFindMatchArgumentsSurviveBroadcastTest::RunTest(const FString& Paramet
 	return true;
 }
 
+
+// -- match end: Cancel from Traveling, NotifyMatchEnded, and the dead-seat belt (goo-match-end-loop) ---------------
+// Fsdk() is null on a bare transient GameInstance, so the server-side CancelMatch / AbandonMatch calls are NOT
+// observable here; these tests pin the state transitions and the local handle bookkeeping (EndedTicketId, the
+// seat memory) around them. The live proof is the lobby after a real match: no Reconnect offered.
+namespace
+{
+	FFoundrySessionSeat MakeLiveSeat(const TCHAR* Ticket, const TCHAR* Match)
+	{
+		FFoundrySessionSeat Seat;
+		Seat.bActive = true;
+		Seat.TicketId = Ticket;
+		Seat.MatchId = Match;
+		return Seat;
+	}
+
+	int32 StateOf(const UFMMSSubsystem* Fmms)
+	{
+		return static_cast<int32>(Fmms->GetMatchmakingState());
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSCancelFromTravelingTest, "FoundryFSDK.FMMS.CancelFromTravelingResetsToIdle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSCancelFromTravelingTest::RunTest(const FString& Parameters)
+{
+	UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+	UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+
+	Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("Joining"));
+	TestEqual(TEXT("precondition: Traveling"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Traveling));
+	Fmms->Cancel();
+	TestEqual(TEXT("Cancel from Traveling resets to Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	TestEqual(TEXT("cancel message"), Fmms->GetMatchmakingMessage(), FString(TEXT("Cancelled.")));
+	TestEqual(TEXT("FMMS phase Idle"), static_cast<int32>(Fmms->GetPhase()), static_cast<int32>(EFMMSPhase::Idle));
+	TestTrue(TEXT("no clock after cancel"), Fmms->GetElapsedSearchSeconds() < 0.0f);
+	TestTrue(TEXT("no ticket id was ever learned, so none is remembered"), Fmms->GetEndedTicketId().IsEmpty());
+
+	// Cancel from Reconnectable declines the live seat and remembers it as released.
+	UFMMSSubsystem* Fmms2 = NewObject<UFMMSSubsystem>(GI);
+	Fmms2->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+	TestEqual(TEXT("live seat offered"), StateOf(Fmms2), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+	Fmms2->Cancel();
+	TestEqual(TEXT("decline resets to Idle"), StateOf(Fmms2), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	TestFalse(TEXT("no active match after decline"), Fmms2->HasActiveMatch());
+	TestEqual(TEXT("the declined ticket is remembered"), Fmms2->GetEndedTicketId(), FString(TEXT("t-1")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSNotifyMatchEndedTest, "FoundryFSDK.FMMS.NotifyMatchEnded",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSNotifyMatchEndedTest::RunTest(const FString& Parameters)
+{
+	// From Found (Connecting) and from Traveling: Idle + "Match over", exactly ONE state broadcast.
+	const EFMMSPhase StartPhases[] = { EFMMSPhase::Connecting, EFMMSPhase::Traveling };
+	for (const EFMMSPhase Start : StartPhases)
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(Start, TEXT("in match"));
+		TestTrue(TEXT("precondition: not Idle"), Fmms->GetMatchmakingState() != EFoundryMatchmakingState::Idle);
+
+		TArray<EFoundryMatchmakingState> Seen;
+		const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
+			[&Seen](EFoundryMatchmakingState State, const FString&) { Seen.Add(State); });
+		Fmms->NotifyMatchEnded();
+		TestEqual(TEXT("exactly one state broadcast"), Seen.Num(), 1);
+		if (Seen.Num() == 1)
+		{
+			TestEqual(TEXT("the broadcast is Idle"), static_cast<int32>(Seen[0]), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		}
+		TestEqual(TEXT("Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestEqual(TEXT("message"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
+		TestTrue(TEXT("Find Match is not blocked"), Fmms->GetMatchmakingState() == EFoundryMatchmakingState::Idle);
+		TestEqual(TEXT("FMMS phase Idle"), static_cast<int32>(Fmms->GetPhase()), static_cast<int32>(EFMMSPhase::Idle));
+
+		// Idempotent: the second call changes nothing and broadcasts nothing.
+		Seen.Reset();
+		Fmms->NotifyMatchEnded();
+		TestEqual(TEXT("second call broadcasts nothing"), Seen.Num(), 0);
+		TestEqual(TEXT("second call keeps Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestEqual(TEXT("second call keeps the message"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
+		Fmms->OnMatchmakingStateChanged.Remove(Handle);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSEndedSeatNeverReconnectableTest, "FoundryFSDK.FMMS.EndedSeatNeverReconnectable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSEndedSeatNeverReconnectableTest::RunTest(const FString& Parameters)
+{
+	// 1. Ticket id never learned: the match ended, my-session (reaper lag / failed cancel) still reports a seat.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->NotifyMatchEnded();
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestTrue(TEXT("unknown-id belt: not Reconnectable"), Fmms->GetMatchmakingState() != EFoundryMatchmakingState::Reconnectable);
+		TestEqual(TEXT("unknown-id belt: stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("unknown-id belt: no active match"), Fmms->HasActiveMatch());
+		TestEqual(TEXT("the declined ticket is now remembered as ended"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+		TestTrue(TEXT("the ended match id is not exposed"), Fmms->GetCurrentMatchId().IsEmpty());
+	}
+
+	// 2. Ticket id known (my-session answered during the match): only THAT seat is declined.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestEqual(TEXT("precondition: a live seat is offered before the match ends"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+		Fmms->NotifyMatchEnded();
+		TestEqual(TEXT("ended ticket remembered"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+		TestEqual(TEXT("Idle after the match end"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestEqual(TEXT("the ended seat is declined, state stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("the ended seat is never an active match"), Fmms->HasActiveMatch());
+
+		// A DIFFERENT live ticket is a genuinely new seat (a crash mid-way through a later match): still offered.
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-2"), TEXT("m-2")));
+		TestEqual(TEXT("a different ticket is a real seat"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSCancelThenRacingSeatTest, "FoundryFSDK.FMMS.CancelFromTravelingThenSeatDeclined",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSCancelThenRacingSeatTest::RunTest(const FString& Parameters)
+{
+	// A deliberate LEAVE (Cancel from Traveling) releases the seat; a my-session read that races the async cancel
+	// (the lobby's CheckActiveSession at BeginPlay) must be declined, never offered as Reconnect.
+	// 1. Ticket id never learned.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->Cancel();
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestEqual(TEXT("unknown id: seat declined, stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("unknown id: no active match"), Fmms->HasActiveMatch());
+		TestEqual(TEXT("the declined ticket is remembered"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+	}
+	// 2. Ticket id known: only that seat is declined; a different ticket is a real new seat.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1"))); // learned during the match
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->Cancel();
+		TestEqual(TEXT("released ticket remembered"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestEqual(TEXT("racing report for that ticket: declined, stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("racing report: no active match"), Fmms->HasActiveMatch());
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-2"), TEXT("m-2")));
+		TestEqual(TEXT("a different ticket is a real seat"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+	}
+	// 3. A search-time cancel (no seat) arms nothing: a live seat is offered as before.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Searching, TEXT("Searching"));
+		Fmms->Cancel();
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-9"), TEXT("m-9")));
+		TestEqual(TEXT("cancel while searching releases no seat"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+	}
+	// 4. NotifyMatchEnded after a seat-releasing Cancel still runs (only a repeat NotifyMatchEnded is a no-op).
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->Cancel();
+		Fmms->NotifyMatchEnded();
+		TestEqual(TEXT("Match over message"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
+		TestEqual(TEXT("the known ended ticket survives"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSRefusedJoinReleasesSeatTest, "FoundryFSDK.FMMS.RefusedJoinReleasesSeat",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSRefusedJoinReleasesSeatTest::RunTest(const FString& Parameters)
+{
+	// 1. A refused join (PreLogin "The match is over.") while Traveling: Idle with the server's sentence, seat
+	//    released, and the lobby's CheckActiveSession read of that seat is declined, never Reconnectable.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1"))); // id learned
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("Joining"));
+		Fmms->HandleNetworkFailure(nullptr, nullptr, ENetworkFailure::PendingConnectionFailure, TEXT("The match is over."));
+		TestEqual(TEXT("refused join: Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestEqual(TEXT("refused join: the server's sentence"), Fmms->GetMatchmakingMessage(), FString(TEXT("The match is over.")));
+		TestEqual(TEXT("refused join: ticket remembered"), Fmms->GetEndedTicketId(), FString(TEXT("t-1")));
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-1"), TEXT("m-1")));
+		TestEqual(TEXT("the refused seat is declined, not offered"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("no Reconnect to a refusing seat"), Fmms->HasActiveMatch());
+	}
+	// 2. A travel failure with an unknown ticket id: any live seat is declined; an empty reason gets a generic sentence.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Connecting, TEXT("Found"));
+		Fmms->HandleTravelFailure(nullptr, ETravelFailure::TravelFailure, FString());
+		TestEqual(TEXT("travel failure: Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestFalse(TEXT("travel failure: a sentence, never blank"), Fmms->GetMatchmakingMessage().IsEmpty());
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-7"), TEXT("m-7")));
+		TestEqual(TEXT("travel failure: seat declined"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	}
+	// 3. An UNPLANNED disconnect (ConnectionLost) keeps Reconnect: nothing is released.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->HandleNetworkFailure(nullptr, nullptr, ENetworkFailure::ConnectionLost, TEXT("lost"));
+		TestEqual(TEXT("connection lost: untouched"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Traveling));
+		Fmms->ApplyMySession(EFoundryFsdkResult::Ok, MakeLiveSeat(TEXT("t-3"), TEXT("m-3")));
+		TestEqual(TEXT("connection lost: the live seat is still offered"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Reconnectable));
+	}
+	// 4. No seat held: a failure is not ours and changes nothing.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Searching, TEXT("Searching"));
+		Fmms->HandleTravelFailure(nullptr, ETravelFailure::TravelFailure, TEXT("x"));
+		TestEqual(TEXT("no seat: failure ignored"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Searching));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSCancelKeepsMatchOverMessageTest, "FoundryFSDK.FMMS.CancelAfterMatchEndedKeepsMessage",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSCancelKeepsMatchOverMessageTest::RunTest(const FString& Parameters)
+{
+	// RETURN TO LOBBY after the match ended runs Cancel() with the phase already Idle: the lobby keeps "Match over".
+	UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+	UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+	Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+	Fmms->NotifyMatchEnded();
+	TArray<EFoundryMatchmakingState> Seen;
+	const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
+		[&Seen](EFoundryMatchmakingState State, const FString&) { Seen.Add(State); });
+	Fmms->Cancel();
+	Fmms->OnMatchmakingStateChanged.Remove(Handle);
+	TestEqual(TEXT("message kept"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
+	TestEqual(TEXT("still Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	TestEqual(TEXT("no state churn"), Seen.Num(), 0);
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

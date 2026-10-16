@@ -59,6 +59,7 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultAppBar = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryAppBar.WBP_FoundryAppBar_C")));
 	DefaultMatchCluster = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryMatchCluster.WBP_FoundryMatchCluster_C")));
 	DefaultModeRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryModeRow.WBP_FoundryModeRow_C")));
+	DefaultMatchResults = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryMatchResults.WBP_FoundryMatchResults_C")));
 
 	// The credits view the pause menu's ABOUT button pushes, generated into /FoundryFSDK/UI/Menus.
 	DefaultCreditsView = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryCreditsView.WBP_FoundryCreditsView_C")));

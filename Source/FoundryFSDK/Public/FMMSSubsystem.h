@@ -3,10 +3,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/EngineBaseTypes.h" // ENetworkFailure / ETravelFailure (the join-failure handlers)
 #include "Engine/TimerHandle.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "FoundryFSDKSubsystem.h" // EFoundryFsdkResult / EFoundryMatchStatus / FFoundryConnection
 #include "FMMSSubsystem.generated.h"
+
+class UNetDriver;
+class UWorld;
 
 /** Player-visible matchmaking phase (drives menu UI). */
 UENUM(BlueprintType)
@@ -21,6 +25,8 @@ enum class EFMMSPhase : uint8
 	 *  FFoundryTicketWait / EFoundryWaitReason (S5 "matchmaking wait"). */
 	WaitingForCapacity UMETA(DisplayName = "Waiting For Capacity"),
 	Connecting     UMETA(DisplayName = "Connecting"),
+	/** Stays set for the WHOLE match (the client has travelled). Cancel() releases the seat from here;
+	 *  NotifyMatchEnded() is the game's match-over signal. */
 	Traveling      UMETA(DisplayName = "Joining Server"),
 	Failed         UMETA(DisplayName = "Failed"),
 	/** The platform says this player is seated in a LIVE match - offer Reconnect. */
@@ -46,6 +52,8 @@ enum class EFoundryMatchmakingState : uint8
 	WaitingForCapacity,
 	/** FMMS Connecting: matched, connection being resolved. */
 	Found,
+	/** Joining / inside the match. Cancel() from here RELEASES the seat (a deliberate leave); the game calls
+	 *  NotifyMatchEnded() when the match is over, which returns to Idle with "Match over". */
 	Traveling,
 	Failed,
 	/** Cancel pressed while a request was live; waiting for FMMS to confirm Idle. */
@@ -72,6 +80,7 @@ class FOUNDRYFSDK_API UFMMSSubsystem : public UGameInstanceSubsystem
 	GENERATED_BODY()
 
 public:
+	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
 	/**
@@ -92,10 +101,36 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void FindMatchAuthenticated(const FString& Queue, const FString& AttributesJson);
 
-	/** Cancel an in-flight flow (also cancels the FMMS ticket, best-effort). From
-	 *  Reconnectable this DECLINES the live seat (cancels its ticket server-side). */
+	/**
+	 * Cancel the flow AND release the ticket, from ANY phase. Whenever the SDK holds a ticket handle the
+	 * server-side ticket is cancelled (worker thread, fire-and-forget) - Requesting / Searching /
+	 * WaitingForCapacity / Connecting AND Traveling: the phase stays Traveling for the whole match, so a
+	 * player who deliberately LEAVES a match releases their seat here (Reconnect is for an UNPLANNED
+	 * disconnect only). From Reconnectable this DECLINES the live seat (cancels its ticket). Always ends
+	 * Idle; no ticket held = the SDK call is a no-op. When a SEAT exists (Found / Connecting / Traveling /
+	 * Reconnectable) the released ticket is remembered in EndedTicketId and the same belt as
+	 * NotifyMatchEnded is armed, so a my-session read that races the async cancel (the lobby's
+	 * CheckActiveSession at BeginPlay) declines the seat instead of offering Reconnect.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void Cancel();
+
+	/**
+	 * The game calls this when its MATCH IS OVER (its match-over flag replicated, or the results screen
+	 * opened). Releases the seat NOW instead of waiting for the platform's reaper (up to ~2 min after the
+	 * server exits): cancels the held ticket server-side (same path as Cancel), clears the local handle,
+	 * remembers the ended ticket in EndedTicketId and sets the matchmaking state to Idle with the message
+	 * "Match over" (ONE OnMatchmakingStateChanged broadcast). Idempotent until the next accepted search.
+	 * Fail-soft: a failed cancel (offline, 401) still clears local state and never leaves a zombie
+	 * Traveling state. Belt: a later my-session answer reporting the ended ticket's seat (the reaper lag,
+	 * or a failed cancel) is declined and the state stays Idle, never Reconnectable.
+	 * Runs fully even after a plain Cancel() released the seat (only a repeat NotifyMatchEnded is a no-op).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
+	void NotifyMatchEnded();
+
+	/** The ticket id NotifyMatchEnded / a seat-releasing Cancel released (empty if none was known). */
+	const FString& GetEndedTicketId() const { return EndedTicketId; }
 
 	/**
 	 * Reconnect-aware menu-entry check: ask the PLATFORM whether this player is
@@ -191,6 +226,28 @@ public:
 	/** Pure state-machine step (public for automation tests): maps an FMMS phase onto the matchmaking state. */
 	void ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message);
 
+	/** my-session answer handler (public for automation tests; HandleMySession forwards here). Records the
+	 *  live match id, offers Reconnectable for a live seat - EXCEPT the seat of a match the game already
+	 *  reported over (NotifyMatchEnded), which is declined instead - and resets stale state otherwise. */
+	void ApplyMySession(EFoundryFsdkResult Result, const FFoundrySessionSeat& Seat);
+
+	/**
+	 * A join that never happened or was refused (the server's PreLogin answered e.g. "The match is over.",
+	 * or the travel failed): the engine drops the client back in the lobby with the phase still Traveling /
+	 * Connecting. Treats the seat as RELEASED - records it as ended, arms the ended-seat belt, cancels the
+	 * ticket, goes Idle with Reason as the message (a generic sentence when empty) - so CheckActiveSession
+	 * never offers Reconnect to a seat that refuses again. Ignored unless a seat is held (Found / Connecting
+	 * / Traveling). Public so tests can drive it without an engine failure; the engine delegates below call it.
+	 */
+	void HandleMatchJoinFailure(const FString& Reason);
+
+	/** GEngine->OnNetworkFailure(). Only a REFUSED/failed join counts (PendingConnectionFailure,
+	 *  FailureReceived); ConnectionLost / ConnectionTimeout are UNPLANNED disconnects and keep Reconnect. */
+	void HandleNetworkFailure(UWorld* World, UNetDriver* NetDriver, ENetworkFailure::Type FailureType, const FString& ErrorString);
+
+	/** GEngine->OnTravelFailure(): the client never reached the server. */
+	void HandleTravelFailure(UWorld* World, ETravelFailure::Type FailureType, const FString& ErrorString);
+
 	/**
 	 * Dev fixture: replaces the DISPLAYED state; Request/Decline calls refuse while active; real phase changes are
 	 * ignored. ElapsedSeconds >= 0 starts the clock that far in the past; < 0 = no clock. Returns false in
@@ -220,6 +277,8 @@ private:
 	void StartPolling(float IntervalSeconds);
 	void StopPolling();
 	void AbandonReconnectSeat();
+	/** A seat exists: Found / Connecting / Traveling (phase or displayed state) or a pending Reconnect seat. */
+	bool IsSeatHeld() const;
 	void SetPhase(EFMMSPhase NewPhase, const FString& Message);
 	/** Set the lobby-facing state + message and broadcast OnMatchmakingStateChanged when either changed (or
 	 *  bForceBroadcast). MessageTtlSeconds > 0 arms MessageTtlTimer on the GameInstance timer manager: the
@@ -252,6 +311,21 @@ private:
 	/** Live match id from my-session (survives travel; cleared when the seat
 	 *  is gone / declined / a fresh search starts). */
 	FString CurrentMatchId;
+	/** The ticket id of the seat this player holds, as last reported by my-session (the C ABI exposes no
+	 *  accessor for the SDK's own ticket handle). NotifyMatchEnded promotes it to EndedTicketId; empty when
+	 *  my-session was never asked during the match. Cleared with the seat / on a fresh search. */
+	FString KnownTicketId;
+	/** The ticket NotifyMatchEnded / Cancel released; ApplyMySession declines a seat carrying it. */
+	FString EndedTicketId;
+	/** NotifyMatchEnded ran and no search has been accepted since (idempotence + the belt's arming). With
+	 *  EndedTicketId empty (id never learned) the belt treats ANY live seat as the ended one: a player holds
+	 *  one seat, and a genuinely new seat needs a new search, which clears this. */
+	bool bMatchEndedNotified = false;
+	/** Cancel() released a SEAT (Found / Connecting / Traveling / Reconnectable): arms the same ended-seat
+	 *  belt as NotifyMatchEnded without making a later NotifyMatchEnded a no-op. Cleared by a new search. */
+	bool bSeatReleased = false;
+	FDelegateHandle NetworkFailureHandle;
+	FDelegateHandle TravelFailureHandle;
 	FTimerHandle PollTimer;
 	bool bBound = false;
 	// Wall-clock of the last accepted FindMatch — throttles rapid re-clicks (a fast failure, e.g.

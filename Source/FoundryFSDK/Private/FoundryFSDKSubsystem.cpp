@@ -589,7 +589,13 @@ void UFoundryFSDKSubsystem::CancelMatch()
 		FScopeLock Lock(&CoreRef->CS);
 		if (CoreRef->ActiveTicket != nullptr)
 		{
-			fsdk_cancel_match(CoreRef->Client, CoreRef->ActiveTicket);
+			const fsdk_result CancelResult = fsdk_cancel_match(CoreRef->Client, CoreRef->ActiveTicket);
+			if (CancelResult != FSDK_OK)
+			{
+				// Fail-soft: the handle is dropped regardless (a zombie local ticket is worse); the server-side
+				// ticket then ends via its TTL / the allocation reaper, and FMMS's ended-match belt declines it.
+				UE_LOG(LogFoundryFSDK, Warning, TEXT("CancelMatch: server-side cancel failed (result %d) - local ticket dropped anyway."), static_cast<int32>(CancelResult));
+			}
 			fsdk_ticket_destroy(CoreRef->ActiveTicket);
 			CoreRef->ActiveTicket = nullptr;
 		}

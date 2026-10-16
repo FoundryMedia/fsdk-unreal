@@ -33,7 +33,7 @@ WBP_FoundryMatchCluster
         - TextBlock **CancelText**  (Text=CANCEL SEARCH, FontRole=Heading, FontSize=22.0, Bold=1, Color=Surface, HAlign=Center, VAlign=Center)
   - HorizontalBox **StatusRow**  (ChildVAlign=Center, HAlign=Center, SlotPad=0,10,0,0)
     - Image **Spinner**  (Icon=icon_spinner, IconW=20.0, IconH=20.0, Tint=Primary, Pivot=0.5,0.5)
-    - TextBlock **StatusText**  (FontSize=14.0, Color=TextSecondary, SlotPad=8,0,8,0)
+    - TextBlock **StatusText**  (FontSize=14.0, Color=TextSecondary, Wrap=1, Justify=Center, HAlign=Fill, SlotPad=8,0,8,0)
     - Button **LeaveMatchButton**  (Normal=Transparent, Hovered=SurfaceHigh, Pressed=SurfaceHigh, HalfHeight=1)
       - TextBlock  (Text=Leave match, FontSize=14.0, Bold=1, Color=Secondary, SlotPad=10,4,10,4)
   - TextBlock **PartyText**  (FontSize=12.0, Color=TextSecondary, HAlign=Center, SlotPad=0,6,0,0)
@@ -45,4 +45,16 @@ WBP_FoundryModeRow
       - TextBlock **LabelText**  (FontSize=14.0, Bold=1, Color=Text)
       - TextBlock **DetailText**  (FontSize=12.0, Color=TextSecondary)
     - Image **CheckIcon**  (Icon=icon_check, IconW=16.0, IconH=16.0, Tint=Online, Collapsed=1, SlotPad=12,0,0,0)
+
+WBP_FoundryMatchResults
+- Overlay
+  - Border **Backdrop**  (Fill=Surface, FillAlpha=0.85, Radius=0.0)
+  - SizeBox  (W=640.0, HAlign=Center, VAlign=Center)
+    - Border **Panel**  (Fill=SurfaceHighest, Radius=24.0)
+      - VerticalBox  (SlotPad=32,32,32,32)
+        - TextBlock **TitleText**  (FontSize=40.0, Bold=1, Color=Text, FontRole=Heading, Wrap=1, Justify=Center, HAlign=Fill)
+        - TextBlock **DetailText**  (FontSize=18.0, Color=Text, Wrap=1, Justify=Center, HAlign=Fill, SlotPad=0,12,0,0)
+        - TextBlock **CountdownText**  (FontSize=14.0, Color=TextSecondary, Justify=Center, HAlign=Fill, SlotPad=0,20,0,0)
+        - Button **ReturnButton**  (Normal=Primary, Hovered=PrimaryContainer, HalfHeight=1, SlotPad=0,28,0,0)
+          - TextBlock **ReturnText**  (FontSize=15.0, Bold=1, Color=Surface, HAlign=Center, VAlign=Center, SlotPad=0,14,0,14, Text=RETURN TO LOBBY)
 
