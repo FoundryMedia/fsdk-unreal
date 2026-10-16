@@ -224,7 +224,7 @@ public:
 	void DeclineReconnectSeat();
 
 	/** Pure state-machine step (public for automation tests): maps an FMMS phase onto the matchmaking state. */
-	void ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message);
+	void ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message, double MessageTtlSeconds = 0.0);
 
 	/** my-session answer handler (public for automation tests; HandleMySession forwards here). Records the
 	 *  live match id, offers Reconnectable for a live seat - EXCEPT the seat of a match the game already
@@ -279,7 +279,9 @@ private:
 	void AbandonReconnectSeat();
 	/** A seat exists: Found / Connecting / Traveling (phase or displayed state) or a pending Reconnect seat. */
 	bool IsSeatHeld() const;
-	void SetPhase(EFMMSPhase NewPhase, const FString& Message);
+	/** MessageTtlSeconds > 0 makes an IDLE message transient (cleared by the matchmaking-message TTL; see
+	 *  SetMatchmakingState). Ignored for every other phase. */
+	void SetPhase(EFMMSPhase NewPhase, const FString& Message, double MessageTtlSeconds = 0.0);
 	/** Set the lobby-facing state + message and broadcast OnMatchmakingStateChanged when either changed (or
 	 *  bForceBroadcast). MessageTtlSeconds > 0 arms MessageTtlTimer on the GameInstance timer manager: the
 	 *  message clears (and a Failed state falls back to Idle) when it fires. A null GameInstance = no TTL

@@ -23,7 +23,9 @@
 
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
+#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Misc/CommandLine.h"
 #include "Misc/CoreMisc.h"
 #include "Misc/Parse.h"
@@ -45,6 +47,12 @@ struct FFsdkCoreState
 	fsdk_chat* Chat = nullptr;
 	fsdk_textchat* TextChat = nullptr;
 	FCriticalSection CS;
+
+	/** Match-ended reports queued or in flight. ReportMatchEnded raises it on the CALLER's thread (so the
+	 *  order of the two calls is the order it sees), the worker lowers it after the report returns, and
+	 *  CancelMatch's worker waits for zero before cancelling - the two run on separate threads, and a
+	 *  cancel that wins the race removes the seat the report needs ("no seat" -> match never closed). */
+	FThreadSafeCounter PendingEndedReports;
 
 	// ── Chat WS handoff ──
 	// The WS sink (game thread) appends here under this LIGHT lock (never held
@@ -586,6 +594,12 @@ void UFoundryFSDKSubsystem::CancelMatch()
 	// Fire-and-forget; cancel + drop the ticket under the serialization lock.
 	Async(EAsyncExecution::Thread, [CoreRef]()
 	{
+		// A match-ended report issued BEFORE this cancel goes first (bounded: the report's own HTTP timeout
+		// is the ceiling; a stuck one must never wedge the cancel forever).
+		for (int32 Waited = 0; CoreRef->PendingEndedReports.GetValue() > 0 && Waited < 6000; ++Waited)
+		{
+			FPlatformProcess::Sleep(0.005f);
+		}
 		FScopeLock Lock(&CoreRef->CS);
 		if (CoreRef->ActiveTicket != nullptr)
 		{
@@ -712,6 +726,41 @@ void UFoundryFSDKSubsystem::AbandonMatch(const FString& TicketId)
 			fsdk_cancel_match(CoreRef->Client, Ticket);
 			fsdk_ticket_destroy(Ticket);
 		}
+	});
+}
+
+void UFoundryFSDKSubsystem::ReportMatchEnded(const FString& MatchId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || MatchId.IsEmpty())
+	{
+		return;
+	}
+
+	// Fire-and-forget: the platform closes the match to new seats. Raised here, on the caller's thread, so
+	// a CancelMatch() issued right after this call is guaranteed to see it and wait its turn.
+	CoreRef->PendingEndedReports.Increment();
+	const FString MatchCopy = MatchId;
+	Async(EAsyncExecution::Thread, [CoreRef, MatchCopy]()
+	{
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			const FTCHARToUTF8 MatchUtf8(*MatchCopy);
+			const fsdk_result R = fsdk_report_match_ended(CoreRef->Client, MatchUtf8.Get());
+			if (R == FSDK_OK)
+			{
+				UE_LOG(LogFoundryFSDK, Log, TEXT("ReportMatchEnded: matchmaking closed match %s to new seats."), *MatchCopy);
+			}
+			else
+			{
+				// Fail-soft: the seat's ticket is cancelled right after and the match ends via the
+				// allocation reaper regardless - this only costs the early close.
+				const FString ServerMessage = UTF8_TO_TCHAR(fsdk_last_error_message(CoreRef->Client));
+				UE_LOG(LogFoundryFSDK, Warning, TEXT("ReportMatchEnded: report for match %s failed (result %d): %s"),
+					*MatchCopy, static_cast<int32>(R), *ServerMessage);
+			}
+		}
+		CoreRef->PendingEndedReports.Decrement(); // after the lock: CancelMatch waits on this, then takes it
 	});
 }
 

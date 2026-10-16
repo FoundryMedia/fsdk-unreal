@@ -565,6 +565,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
 	void AbandonMatch(const FString& TicketId);
 
+	/**
+	 * Tell matchmaking the game OBSERVED the match end (POST /v1/fmms/matches/{id}/ended): fid closes the
+	 * match to new seats, so nobody is backfilled into a dead match and my-session stops offering the seat.
+	 * Fire-and-forget on a worker thread (never blocks the game thread); the outcome is logged. Idempotent
+	 * server-side. A later CancelMatch() waits for an in-flight report, so call this FIRST.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void ReportMatchEnded(const FString& MatchId);
+
 	// ── FRC chat (the game's GLOBAL room over the platform realtime socket) ─────
 	// Server-authoritative end to end: the player token only ever grants ROOM
 	// operations (fid pins player sockets room-only), membership + rate limits +

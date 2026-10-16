@@ -536,6 +536,18 @@ fsdk_result fsdk_resume_ticket(fsdk_client* client,
                                const char* ticket_id,
                                fsdk_ticket** out_ticket);
 
+/* Tell matchmaking the game OBSERVED the match end (POST
+ * /v1/fmms/matches/{matchId}/ended, player-scoped, empty body). The platform
+ * closes the match to new seats so nobody is backfilled into a dead match and
+ * fsdk_my_session stops offering the seat. Idempotent - reporting twice is
+ * fine. Returns FSDK_OK on 2xx, FSDK_ERR_NO_MATCH on 404 (the caller holds no
+ * seat in that match - or an older fid without the route; either way there is
+ * nothing to close), FSDK_ERR_INVALID_ARG for a NULL/empty/malformed match id
+ * (letters, digits, '-' and '_' only, at most 63 chars), FSDK_ERR_NOT_AUTHENTICATED
+ * before authenticate. The server's player-facing message for a failure is in
+ * fsdk_last_error_message. Synchronous - drive it from a worker thread. */
+fsdk_result fsdk_report_match_ended(fsdk_client* client, const char* match_id);
+
 /* -------------------------------------------------------------------------- */
 /* CLIENT CHAT API (FRC rooms over the realtime WebSocket)                    */
 /* -------------------------------------------------------------------------- */

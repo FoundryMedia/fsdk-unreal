@@ -45,6 +45,7 @@
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
 #define FSDK_PATH_REGIONS       "/v1/fmms/regions"
 #define FSDK_PATH_MY_SESSION    "/v1/fmms/my-session"
+#define FSDK_PATH_MATCHES       "/v1/fmms/matches"
 
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
@@ -970,6 +971,50 @@ fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out) {
     fsdk_log(FSDK_LOG_INFO, out->active ? "fsdk my_session: active seat"
                                         : "fsdk my_session: no live seat");
     return FSDK_OK;
+}
+
+fsdk_result fsdk_report_match_ended(fsdk_client* client, const char* match_id) {
+    if (client == NULL || match_id == NULL) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    /* The id goes into a URL path: UUID-shaped ids only (letters, digits, '-',
+     * '_'), bounded to fsdk_session_seat.match_id - never trust it in raw. */
+    const size_t len = strlen(match_id);
+    if (len == 0 || len >= sizeof(((fsdk_session_seat*)0)->match_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    for (size_t i = 0; i < len; i++) {
+        const char c = match_id[i];
+        const int ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+                       || (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
+        if (!ok) {
+            return FSDK_ERR_INVALID_ARG;
+        }
+    }
+    if (!client->authenticated || client->player_token == NULL) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+
+    /* POST {base_url}/v1/fmms/matches/{id}/ended, empty body, player bearer.
+     * 200 {matchId,status}; 404 = no seat in that match (or an older fid
+     * without the route); idempotent server-side. */
+    char path[160];
+    snprintf(path, sizeof(path), "%s/%s/ended", FSDK_PATH_MATCHES, match_id);
+
+    client->last_error[0] = '\0';
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_POST, path,
+                                      client->player_token, NULL, &resp, &status);
+    if (r != FSDK_OK) {
+        return r;
+    }
+    fsdk_client_note_error(client, status, resp);
+    fsdk_string_free(resp);
+    if (status >= 200 && status < 300) {
+        fsdk_log(FSDK_LOG_INFO, "fsdk report_match_ended: match closed to new seats");
+    }
+    return http_status_to_result(status);
 }
 
 fsdk_result fsdk_resume_ticket(fsdk_client* client,

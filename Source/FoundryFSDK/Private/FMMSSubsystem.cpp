@@ -16,6 +16,12 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogFMMS, Log, All);
 
+namespace
+{
+	/** How long a lobby-visible Idle notice ("Match over", a refused-join sentence) stays under Find Match. */
+	constexpr double LobbyNoticeTtlSeconds = 8.0;
+}
+
 void UFMMSSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
@@ -229,7 +235,7 @@ void UFMMSSubsystem::HandleMatchJoinFailure(const FString& Reason)
 	CurrentMatchId.Reset();
 	KnownTicketId.Reset();
 	bCancelPending = false;
-	SetPhase(EFMMSPhase::Idle, Message);
+	SetPhase(EFMMSPhase::Idle, Message, LobbyNoticeTtlSeconds); // transient: the refusal must not sit under Find Match
 }
 
 void UFMMSSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*NetDriver*/,
@@ -266,6 +272,14 @@ void UFMMSSubsystem::NotifyMatchEnded()
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		// Tell matchmaking the match is over BEFORE the ticket is cancelled: fid then stops backfilling into
+		// the dead match and my-session stops offering the seat. Copy the id first - nothing below may
+		// invalidate it - and call this before CancelMatch (which waits for the report to finish).
+		const FString EndedMatchId = CurrentMatchId;
+		if (!EndedMatchId.IsEmpty())
+		{
+			Sdk->ReportMatchEnded(EndedMatchId);
+		}
 		Sdk->CancelMatch(); // worker thread, fire-and-forget; a failure is WARN-logged there and changes nothing here
 	}
 	else
@@ -276,7 +290,7 @@ void UFMMSSubsystem::NotifyMatchEnded()
 	CurrentMatchId.Reset();
 	KnownTicketId.Reset();
 	bCancelPending = false; // the Idle below must read "Match over", not "Search cancelled."
-	SetPhase(EFMMSPhase::Idle, TEXT("Match over"));
+	SetPhase(EFMMSPhase::Idle, TEXT("Match over"), LobbyNoticeTtlSeconds); // transient: it must not linger under Find Match
 }
 
 /** Decline any pending reconnect seat: cancel its ticket server-side + forget it. */
@@ -616,7 +630,7 @@ void UFMMSSubsystem::StopPolling()
 	}
 }
 
-void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message)
+void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message, double MessageTtlSeconds)
 {
 	Phase = NewPhase;
 	UE_LOG(LogFMMS, Log, TEXT("[FMMS] phase=%d %s"), (int32)NewPhase, *Message);
@@ -628,7 +642,7 @@ void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message)
 	// The lobby-facing state follows the phase AFTER the status event, so a listener that reads
 	// GetMatchmakingState() from OnFMMSStatus sees the previous state, and one bound to
 	// OnMatchmakingStateChanged sees the new one. A dev fixture freezes it (checked inside).
-	ApplyMatchmakingPhase(NewPhase, Message);
+	ApplyMatchmakingPhase(NewPhase, Message, MessageTtlSeconds);
 }
 
 // -- lobby-facing matchmaking state ---------------------------------------------------------------
@@ -784,7 +798,7 @@ void UFMMSSubsystem::DeclineReconnectSeat()
 	Cancel(); // from Reconnectable this abandons the seat's ticket server-side and resets the phase to Idle
 }
 
-void UFMMSSubsystem::ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message)
+void UFMMSSubsystem::ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message, double MessageTtlSeconds)
 {
 	if (bMatchmakingFixture)
 	{
@@ -802,7 +816,7 @@ void UFMMSSubsystem::ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Me
 		else
 		{
 			bSearchClockRunning = false;
-			SetMatchmakingState(EFoundryMatchmakingState::Idle, Message);
+			SetMatchmakingState(EFoundryMatchmakingState::Idle, Message, MessageTtlSeconds);
 		}
 		break;
 	case EFMMSPhase::Authenticating:

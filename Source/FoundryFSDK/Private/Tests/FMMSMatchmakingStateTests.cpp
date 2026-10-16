@@ -12,6 +12,7 @@
 #include "Engine/GameInstance.h"
 #include "FMMSSubsystem.h"
 #include "Misc/AutomationTest.h"
+#include "TimerManager.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSMatchmakingStateTest, "FoundryFSDK.FMMS.MatchmakingStateMachine",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
@@ -400,6 +401,53 @@ bool FFMMSCancelKeepsMatchOverMessageTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("message kept"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
 	TestEqual(TEXT("still Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
 	TestEqual(TEXT("no state churn"), Seen.Num(), 0);
+	return true;
+}
+
+// -- lobby notices are transient: "Match over" and a refused-join sentence must not sit under Find Match ----------
+// (Justin, 2026-10-16: "there is text under the find match button saying 'The match is over' that shouldnt be
+// there".) The bare GameInstance never ticks its timer manager by itself, so the test advances it ONCE by hand:
+// FTimerManager::Tick returns early on a second call in the same frame, hence one tick per GameInstance.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSLobbyNoticesExpireTest, "FoundryFSDK.FMMS.LobbyNoticesExpire",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
+{
+	// 1. NotifyMatchEnded's "Match over" clears itself and tells listeners.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("in match"));
+		Fmms->NotifyMatchEnded();
+		TestEqual(TEXT("match over: shown first"), Fmms->GetMatchmakingMessage(), FString(TEXT("Match over")));
+
+		TArray<FString> Messages;
+		const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
+			[&Messages](EFoundryMatchmakingState, const FString& Message) { Messages.Add(Message); });
+		GI->GetTimerManager().Tick(60.0f);
+		Fmms->OnMatchmakingStateChanged.Remove(Handle);
+		TestTrue(TEXT("match over: the message expired"), Fmms->GetMatchmakingMessage().IsEmpty());
+		TestEqual(TEXT("match over: expiry stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+		TestEqual(TEXT("match over: expiry is announced once"), Messages.Num(), 1);
+	}
+	// 2. A refused join's sentence clears itself too.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Traveling, TEXT("Joining"));
+		Fmms->HandleNetworkFailure(nullptr, nullptr, ENetworkFailure::PendingConnectionFailure, TEXT("The match is over."));
+		TestEqual(TEXT("refused join: shown first"), Fmms->GetMatchmakingMessage(), FString(TEXT("The match is over.")));
+		GI->GetTimerManager().Tick(60.0f);
+		TestTrue(TEXT("refused join: the sentence expired"), Fmms->GetMatchmakingMessage().IsEmpty());
+		TestEqual(TEXT("refused join: expiry stays Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	}
+	// 3. A plain Idle message ("Ready.") is NOT made transient by the same path.
+	{
+		UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+		Fmms->ApplyMatchmakingPhase(EFMMSPhase::Idle, TEXT("Ready."));
+		GI->GetTimerManager().Tick(60.0f);
+		TestEqual(TEXT("plain Idle message has no TTL"), Fmms->GetMatchmakingMessage(), FString(TEXT("Ready.")));
+	}
 	return true;
 }
 
