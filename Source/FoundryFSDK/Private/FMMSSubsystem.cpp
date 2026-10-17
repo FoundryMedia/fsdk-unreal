@@ -227,7 +227,7 @@ void UFMMSSubsystem::Cancel()
 	// "Match over" message instead of overwriting it with "Cancelled.".
 	if (!(bMatchEndedNotified && Phase == EFMMSPhase::Idle))
 	{
-		SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."));
+		SetPhase(EFMMSPhase::Idle, TEXT("Cancelled."), LobbyNoticeTtlSeconds); // transient: it must not linger under Find Match
 	}
 }
 
