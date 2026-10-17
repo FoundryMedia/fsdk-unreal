@@ -95,8 +95,9 @@ protected:
 	/** Hidden when not joined / blocked. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> PresenceDot;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> NameText;
-	/** Hidden for a joined host (HostBadge shows instead). */
+	/** Always shown: presence, or a party member's ready / in-match line (coloured by it). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> StatusText;
+	/** The party leader's mark, BESIDE the name (joined host only) - the kit's pill; a game may bind a crown. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> HostBadge;
 	/** Party rows only - hidden unless the member is joined AND ready. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> ReadyIcon;

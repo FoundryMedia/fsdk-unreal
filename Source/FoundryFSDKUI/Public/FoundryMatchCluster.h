@@ -83,6 +83,17 @@ public:
 	UFUNCTION(BlueprintImplementableEvent, Category = "Foundry UI")
 	void OnMatchmakingStateChanged(EFoundryMatchmakingState NewState);
 
+	/** True while the primary button IS the cancel (its label reads CANCEL SEARCH: Pending / Searching /
+	 *  WaitingForCapacity while the subsystem can still cancel). The one-button WBP styles from THIS, not
+	 *  from the state enum - the set of cancellable states grew (Pending, WaitingForCapacity) and a graph
+	 *  keyed on Searching alone left CANCEL SEARCH in the primary colour (Goo Crew, 2026-10-17). */
+	UFUNCTION(BlueprintPure, Category = "Foundry UI")
+	bool IsPrimaryCancel() const { return bPrimaryIsCancel; }
+
+	/** Fired when IsPrimaryCancel flips: swap the primary button's style to the danger pack and back. */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Foundry UI")
+	void OnPrimaryCancelChanged(bool bIsCancel);
+
 	/** Native hook, runs BEFORE the BlueprintImplementableEvent above. A game subclass overrides it
 	 *  to mirror the state elsewhere. */
 	virtual void NativeOnMatchmakingStateChanged(EFoundryMatchmakingState NewState) {}
@@ -160,6 +171,7 @@ private:
 	bool bModeMenuOpen = false;
 	bool bHaveLastState = false;
 	EFoundryMatchmakingState LastState = EFoundryMatchmakingState::Idle;
+	bool bPrimaryIsCancel = false;
 	int32 LastElapsedShown = -2;
 	bool bSpinnerBusy = false;
 	float SpinAngle = 0.0f;

@@ -41,11 +41,19 @@ void UFoundryFriendRow::Setup(const FFoundryFriend& InFriend, EFoundryFriendRowK
 	SetText(StatusText, Status);
 	if (StatusText)
 	{
-		StatusText->SetColorAndOpacity(FSlateColor(bBlocked ? Palette.TextSecondary : FoundryUITheme::PresenceColor(InFriend.Presence)));
+		// A joined party member's line is their READY state, coloured like the launcher's chips: green when
+		// ready or in a match, muted otherwise ("Not ready" in presence-green read as ready, 2026-10-17).
+		// Everyone else wears their presence colour; a blocked row the secondary.
+		const bool bReadyLine = InKind == EFoundryFriendRowKind::Party && bInJoined && !InStatusOverride.IsEmpty();
+		const bool bGreen = bInReady || InStatusOverride == TEXT("In match");
+		StatusText->SetColorAndOpacity(FSlateColor(bBlocked ? Palette.TextSecondary
+			: bReadyLine ? (bGreen ? FoundryUITheme::PresenceColor(TEXT("online")) : Palette.TextSecondary)
+			: FoundryUITheme::PresenceColor(InFriend.Presence)));
 	}
-	// The host's status line is normally replaced by the HostBadge; an explicit override ("In match") still
-	// shows, or a party leader in a match would be the one member whose state the lobby cannot show.
-	Show(StatusText, !(bInHost && bInJoined) || !InStatusOverride.IsEmpty());
+	// The status line always shows; the leader's HostBadge sits BESIDE the name in the generated row (and in
+	// the launcher, as a crown). It used to replace the status line - which overflowed the 60 px row the moment
+	// every joined member carried a ready line (2026-10-17).
+	Show(StatusText, true);
 	Show(HostBadge, bInHost && bInJoined);
 	Show(ReadyIcon, InKind == EFoundryFriendRowKind::Party && bInJoined && bInReady);
 

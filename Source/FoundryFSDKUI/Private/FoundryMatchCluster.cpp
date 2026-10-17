@@ -383,6 +383,14 @@ void UFoundryMatchCluster::Refresh()
 	// The label is CANCEL SEARCH exactly when the primary button is the cancel.
 	const bool bCancelLabel = Label == TEXT("CANCEL SEARCH");
 	const bool bSplitCancel = CancelButton != nullptr && bCancelLabel;
+	// A one-button WBP (no CancelButton) restyles its primary from this flip - the label and the look
+	// change on the same refresh, whatever state produced the label.
+	const bool bPrimaryCancelNow = bCancelLabel && !bSplitCancel;
+	if (bPrimaryCancelNow != bPrimaryIsCancel)
+	{
+		bPrimaryIsCancel = bPrimaryCancelNow;
+		OnPrimaryCancelChanged(bPrimaryIsCancel);
+	}
 	if (CancelButton)
 	{
 		SetText(CancelText, TEXT("CANCEL SEARCH"));

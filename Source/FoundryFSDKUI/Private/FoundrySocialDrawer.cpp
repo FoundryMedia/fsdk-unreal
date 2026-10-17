@@ -1102,7 +1102,10 @@ void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2
 	{
 		for (const FFoundryPartyMember& M : Sdk->Party().Members)
 		{
-			if (M.FoundryId == Row->Friend.FoundryId)
+			// JOINED members only: a friend who merely holds a live invite is not "already in your party" -
+			// Invite stays enabled for them and a repeat invite is fid's call (it resets the invite's clock
+			// and re-notifies; Justin, 2026-10-17: "we just don't want to disable the invite button").
+			if (M.FoundryId == Row->Friend.FoundryId && IsJoinedState(M.State))
 			{
 				Ctx.bTargetInLocalParty = true;
 				break;

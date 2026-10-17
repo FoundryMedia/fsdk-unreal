@@ -44,6 +44,7 @@ WBP_FoundryModeRow
     - VerticalBox  (Size=Fill)
       - TextBlock **LabelText**  (FontSize=14.0, Bold=1, Color=Text)
       - TextBlock **DetailText**  (FontSize=12.0, Color=TextSecondary)
+      - TextBlock **PartyTooBigText**  (FontSize=12.0, Color=Error, Collapsed=1)
     - Image **CheckIcon**  (Icon=icon_check, IconW=16.0, IconH=16.0, Tint=Online, Collapsed=1, SlotPad=12,0,0,0)
 
 WBP_FoundryMatchResults

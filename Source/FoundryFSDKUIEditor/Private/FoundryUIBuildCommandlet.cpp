@@ -1327,20 +1327,23 @@ namespace
 					.P(TEXT("ChildVAlign"), TEXT("Center"))
 					.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("NameText"), true }
 						.P(TEXT("FontSize"), 18.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")))
+					// The leader's pill sits BESIDE the name (where the launcher puts its crown), never as a
+					// third line: since ready moved in game every joined member carries a status line, and a
+					// badge stacked under it overflowed the 60 px row into the next one (2026-10-17).
+					.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("HostBadge"), true }
+						.P(TEXT("Fill"), TEXT("Tertiary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("SlotPad"), TEXT("8,0,0,0"))
+						.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
+							.P(TEXT("Text"), TEXT("Host")).P(TEXT("FontSize"), 11.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("HostText"))
+							.P(TEXT("SlotPad"), TEXT("8,1,8,1"))))
 					// Party rows only - hidden unless the member is joined AND ready
 					// (UFoundryFriendRow::Setup).
 					.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("ReadyIcon"), true }
 						.P(TEXT("Icon"), TEXT("icon_check")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("Online"))
 						.P(TEXT("Collapsed"), TEXT("1")).P(TEXT("SlotPad"), TEXT("6,0,0,0"))))
 				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("StatusText"), true }
-					// Resting colour only - UFoundryFriendRow::Setup overrides this per-row from the
-					// friend's live presence (or TextSecondary for a blocked row) on every poll.
-					.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")))
-				.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("HostBadge"), true }
-					.P(TEXT("Fill"), TEXT("Tertiary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Left"))
-					.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
-						.P(TEXT("Text"), TEXT("Host")).P(TEXT("FontSize"), 12.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("HostText"))
-						.P(TEXT("SlotPad"), TEXT("8,1,8,1")))))
+					// Resting colour only - UFoundryFriendRow::Setup overrides this per-row on every poll: the
+					// friend's live presence, a party member's ready state, TextSecondary for a blocked row.
+					.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary"))))
 			.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("ActionButton"), true }
 				.P(TEXT("Normal"), TEXT("Secondary")).P(TEXT("Hovered"), TEXT("SurfaceHigh")).P(TEXT("HalfHeight"), TEXT("1"))
 				.P(TEXT("Collapsed"), TEXT("1"))

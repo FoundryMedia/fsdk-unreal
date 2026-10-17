@@ -77,8 +77,8 @@ void UFoundryAppBar::Refresh()
 	if (SocialButton)
 	{
 		SetKitToolTip(SocialButton, FText::FromString(N > 0
-			? FString::Printf(TEXT("Friends and party - %d new"), N)
-			: FString(TEXT("Friends and party"))));
+			? FString::Printf(TEXT("Social - %d new"), N)
+			: FString(TEXT("Social"))));
 	}
 	OnIdentityUpdated(bIn);
 }

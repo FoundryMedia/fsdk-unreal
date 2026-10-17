@@ -104,6 +104,10 @@ WBP_FoundrySettingsMenu
             - TextBlock  (Text=Reduced motion, FontSize=14.0, Color=Text, Size=Fill)
             - SizeBox  (W=280.0)
               - CheckBox **ReducedMotionCheck**
+          - HorizontalBox **DeveloperModeRow**  (ChildVAlign=Center, SlotPad=0,12,0,0)
+            - TextBlock  (Text=Developer mode, FontSize=14.0, Color=Text, Size=Fill)
+            - SizeBox  (W=280.0)
+              - CheckBox **DeveloperModeCheck**
         - VerticalBox **ControlsSection**  (SlotPad=0,16,0,0)
           - HorizontalBox **ControlsRow**
             - TextBlock  (Text=CONTROLS, FontSize=15.0, Bold=1, Color=TextSecondary, FontRole=Heading)
