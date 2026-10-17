@@ -39,6 +39,11 @@ class UWidgetAnimation;
  * the button ENABLED (a disabled UButton dims its content) but hit-test invisible. LeaveMatchButton
  * (Reconnectable only) declines the live seat.
  *
+ * In a party of 2+ the button is the LEADER's: it reads "FIND MATCH (READY 2 / 3)" and stays disabled until
+ * every joined member is ready in the selected mode's game (the unready names go on the status line); a
+ * non-leader sees no button, "Waiting for <leader> to start", and - once the leader searches -
+ * the subsystem's own "Searching with <leader>" line. The decision is FoundryPartyRules::PlanFindMatch.
+ *
  * The elapsed timer is the subsystem's LOCAL clock and is labelled "Searching for m:ss". The HOST
  * only places the widget; it wires nothing.
  */
@@ -162,4 +167,7 @@ private:
 	bool bDesignerWrapsStatus = false;
 	/** The FindMatchButton width StatusText was last wrapped at (0 = not yet laid out). */
 	float StatusWrapWidth = 0.0f;
+	/** True while the status line shows a live Idle notice (the subsystem's message, TTL'd) - NativeTick
+	 *  re-renders the moment it expires so the Find Match gate sentence is never stuck behind it. */
+	bool bIdleNoticeShown = false;
 };

@@ -536,6 +536,20 @@ fsdk_result fsdk_resume_ticket(fsdk_client* client,
                                const char* ticket_id,
                                fsdk_ticket** out_ticket);
 
+/* The caller's newest LIVE ticket (GET /v1/fmms/tickets/mine -> {ticketId, queueKey,
+ * state, partyId, leaderFoundryId}; QUEUED or MATCHED). Party members follow the
+ * LEADER's search: fid creates one ticket per joined member when the leader starts,
+ * and a member's client finds its own here, then fsdk_resume_ticket + fsdk_poll_match
+ * (a resumed handle polls fine while the server still says QUEUED - poll overwrites
+ * the FOUND the resume seeds) carry it through the normal flow. Outputs are NUL-terminated
+ * and empty when absent (leaderFoundryId is empty for a solo ticket). FSDK_ERR_NO_MATCH
+ * on the quiet 404 (no live ticket - the polled, expected answer), also from an older
+ * fid without the route. Synchronous - worker thread only. */
+fsdk_result fsdk_fmms_my_ticket(fsdk_client* client,
+                                char* out_ticket_id, size_t ticket_id_sz,
+                                char* out_queue_key, size_t queue_key_sz,
+                                char* out_leader_foundry_id, size_t leader_sz);
+
 /* Tell matchmaking the game OBSERVED the match end (POST
  * /v1/fmms/tickets/{ticketId}/match-ended, player-scoped, empty body). The
  * client holds its TICKET (every search and every reconnect carries one), not a
@@ -764,6 +778,11 @@ typedef struct fsdk_party_member {
      * expires_at is in the past - the host renders "expires in N min" / "expired". */
     char invited_at[32];
     char expires_at[32];
+    /* The game this member is READY in (fid readyGameSlug; empty = not ready or an
+     * older server). Ready belongs to the GAME, not the launcher: fid refuses a
+     * ready=true without a game slug, and a Find Match is contingent on every
+     * JOINED member being ready in the queue's game. */
+    char ready_game_slug[65]; /* room for fid's 64-char slug cap + NUL */
 } fsdk_party_member;
 
 /* The party header (id empty when the player is not in a party). */
@@ -837,6 +856,17 @@ fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
  * party_member.ready_at). Idempotent. FSDK_ERR_NO_MATCH on the uniform 404
  * (caller is not a JOINED member of that party / the party doesn't exist). */
 fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready);
+
+/* Ready WITH the game (PUT .../parties/{id}/members/me/ready, body
+   {"ready":true,"gameSlug":"goo-crew"} / {"ready":false}). Round 2: "you shouldn't be
+ * able to ready up in the launcher" - ready=1 REQUIRES a game_slug (fid answers 400
+ * "Ready up from inside the game." otherwise, kept in fsdk_last_error_message);
+ * ready=0 clears both and ignores game_slug. game_slug is validated
+ * ([a-z0-9-], 1..64, fid's slug cap) so it never reaches the body unchecked. fsdk_social_party_set_ready
+ * is this call with a NULL game: it can clear ready, and a ready=1 through it is the
+ * request fid refuses. */
+fsdk_result fsdk_social_party_set_ready_in_game(fsdk_client* client, const char* party_id,
+                                                int ready, const char* game_slug);
 
 /* Set/clear the CALLER's own IN-MATCH flag on a party they have JOINED (fid
  * party_member.in_match_at) - what the lobby reads to show "In match" on a

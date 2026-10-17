@@ -726,6 +726,9 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
             /* The invite's lifetime (INVITED rows only; null on JOINED = empty). */
             (void)json_extract_string(mobj, "invitedAt", m->invited_at, sizeof(m->invited_at));
             (void)json_extract_string(mobj, "expiresAt", m->expires_at, sizeof(m->expires_at));
+            /* null (not ready / older fid) leaves the calloc-zeroed empty string. */
+            (void)json_extract_string(mobj, "readyGameSlug", m->ready_game_slug,
+                                      sizeof(m->ready_game_slug));
             if (m->foundry_id[0] != '\0') {
                 n++;
             }
@@ -859,13 +862,46 @@ fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id) {
     return party_verb(client, party_id, "leave");
 }
 
-fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready) {
+/* A game slug rides the body, so it is checked, not escaped: fid's slug alphabet. */
+static int valid_game_slug(const char* s) {
+    size_t i;
+    if (s == NULL || s[0] == '\0' || strlen(s) > 64) {
+        return 0;
+    }
+    for (i = 0; s[i] != '\0'; i++) {
+        const char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fsdk_result fsdk_social_party_set_ready_in_game(fsdk_client* client, const char* party_id,
+                                                int ready, const char* game_slug) {
     char path[160];
+    char body[128];
     if (!valid_party_id(party_id)) {
         return FSDK_ERR_INVALID_ARG;
     }
     (void)snprintf(path, sizeof(path), "%s/%s/members/me/ready", SOCIAL_PARTIES_PATH, party_id);
-    return social_put(client, path, ready ? "{\"ready\":true}" : "{\"ready\":false}");
+    if (!ready) {
+        return social_put(client, path, "{\"ready\":false}");
+    }
+    if (game_slug == NULL) {
+        /* Sent on purpose: the launcher-shaped request. fid refuses it with "Ready up from
+         * inside the game." and that sentence lands in fsdk_last_error_message. */
+        return social_put(client, path, "{\"ready\":true}");
+    }
+    if (!valid_game_slug(game_slug)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(body, sizeof(body), "{\"ready\":true,\"gameSlug\":\"%s\"}", game_slug);
+    return social_put(client, path, body);
+}
+
+fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready) {
+    return fsdk_social_party_set_ready_in_game(client, party_id, ready, NULL);
 }
 
 fsdk_result fsdk_social_party_set_in_match(fsdk_client* client, const char* party_id,

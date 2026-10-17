@@ -40,6 +40,11 @@ struct FOUNDRYFSDK_API FFoundrySocialFixture
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
 	bool bHasParty = false;
 
+	/** The simulated local player's foundryId while the fixture is active (LocalFoundryId() answers it,
+	 *  and IsLocalLeader / IsSelfReady / AllReadyIn compare against it). Empty = the real signed-in id. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
+	FString LocalFoundryId;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
 	FFoundryParty Party;
 
@@ -102,7 +107,7 @@ public:
 	const TArray<FFoundryJoinRequest>& JoinRequests() const { return Fixture.bActive ? Fixture.JoinRequests : CachedJoinRequests; }
 
 	bool IsSignedIn() const { return bSignedIn; }
-	FString LocalFoundryId() const { return LocalId; }
+	FString LocalFoundryId() const { return EffectiveLocalId(); }
 	FString LocalDisplayName() const { return LocalDisplayNameCached; }
 	FString LocalUsername() const { return LocalUsernameCached; }
 
@@ -111,8 +116,39 @@ public:
 	bool IsLocalLeader() const;
 	/** True when FoundryId leads the current party; false when not in a party or FoundryId is empty. */
 	bool IsLeader(const FString& FoundryId) const;
-	/** The local player's own ready flag from the cached party (false when not in a party). */
+	/** The local player's own ready flag from the cached party (false when not in a party). Ready in ANY
+	 *  game - the Find Match gate is per game, see AllReadyIn. */
 	bool IsSelfReady() const;
+	/** The local player is ready IN THIS GAME (their member row's ReadyGameSlug == GameSlug). False when not
+	 *  in a party or the slug is empty. */
+	bool IsSelfReadyIn(const FString& InGameSlug) const;
+
+	// -- ready belongs to the GAME (Round 2: "you shouldn't be able to ready up in the launcher") ----------
+
+	/** The game slug SetReady sends and the Find Match gate measures against. The UI module pushes
+	 *  UFoundryUISettings::GameSlug here at startup (like the copy overrides); empty clears the override. */
+	void SetGameSlug(const FString& InSlug);
+	/** Fallback when no explicit slug is set: a queue key is "{gameSlug}/{modeSlug}", so the first
+	 *  queueable mode names the game. Accepts the FULL queue key ("goo-crew/solo", or an FRN) and takes its
+	 *  game through FoundryQueueKey::GameSlug. A bare id / UUID leaves the default unset. */
+	void SetDefaultGameSlugFromQueue(const FString& QueueKey);
+	/** The explicit slug, else the one derived from a queue key, else empty. */
+	FString GameSlug() const;
+
+	/** True when every JOINED member (the local player included) is ready in GameSlug - the Find Match gate
+	 *  for a party. A party of one needs nobody, so < 2 joined (or no party) answers true. An EMPTY slug
+	 *  answers false for a party of 2+ (nothing can be ready in no game). */
+	bool AllReadyIn(const FString& InGameSlug) const;
+	/** JOINED members ready in GameSlug (the "2" of "ready 2 / 3"). 0 when not in a party or the slug is empty. */
+	int32 ReadyCountIn(const FString& InGameSlug) const;
+	/** Display names of the JOINED members NOT ready in GameSlug (display name, else username, else id) -
+	 *  the local player included. Empty when not in a party. */
+	TArray<FString> UnreadyNames(const FString& InGameSlug) const;
+	/** The party leader's display name, else empty (not in a party / the leader's row is not loaded). */
+	FString LeaderDisplayName() const;
+	/** True while at least one social surface is registered (RegisterConsumer) - i.e. the cached party is
+	 *  being kept fresh. UFMMSSubsystem's follow-mode poll gates on it (the same idle gating as the poller). */
+	bool HasConsumers() const { return ConsumerCount > 0; }
 	/** The server's MaxSize when known (in a party), else DefaultPartyCapacity. */
 	int32 PartyCapacity() const;
 	/** 1 when not in a party (you are your own one-person "party"); otherwise the number of JOINED
@@ -179,7 +215,10 @@ public:
 	void DeclineInvite(const FString& PartyId);
 	/** Leaves the CACHED party (Party().PartyId); a no-op when not in one. */
 	void LeaveParty();
-	/** Sets your own ready flag on the CACHED party (Party().PartyId); a no-op when not in one. */
+	/** Sets your own ready flag on the CACHED party (Party().PartyId) FOR THIS GAME (GameSlug()); a no-op
+	 *  when not in a party. Ready is only ever set from inside a game - the platform refuses a ready with no
+	 *  game - and fid clears it when you travel into a match, so every match needs a fresh ready-up. With
+	 *  no game slug known a ready=true says so through OnActionFailed instead of sending the refused request. */
 	void SetReady(bool bReady);
 	/** Sets your own in-match flag on the CACHED party (Party().PartyId); a no-op when not in one.
 	 *  UFMMSSubsystem calls it: true when the client travels into a match, false at match end / leave, so
@@ -238,6 +277,8 @@ private:
 	 *  return true (the caller returns) - a simulated state must never reach the platform, and a silent
 	 *  no-op reads as a broken button. */
 	bool RefuseInFixture(const TCHAR* Action);
+	/** The local player's foundryId: the fixture's simulated one when a fixture sets it, else the signed-in id. */
+	FString EffectiveLocalId() const;
 	/** The member row for FoundryId in the (fixture-aware) party, or null. */
 	const FFoundryPartyMember* FindMember(const FString& FoundryId) const;
 	/** The cap an invite is held to right now: the selected mode's party cap when known, else the
@@ -273,6 +314,8 @@ private:
 	FString InFlightFriendRequestUsername; // the one SendFriendRequest just fired; joins the set on Ok
 	TArray<FFoundryJoinRequest> CachedJoinRequests;
 	FString SelectedQueue; // SetSelectedQueueKey - passed as queue_key on invite / re-invite / join-accept
+	FString GameSlugOverride; // SetGameSlug - the kit setting UFoundryUISettings::GameSlug
+	FString DefaultGameSlug;  // SetDefaultGameSlugFromQueue - the first queueable mode's game
 	FString PendingInviteUsername; // queued behind a CreateParty, sent once the new party arrives
 	bool bCreatePartyPending = false; // a CreateParty this subsystem fired is in flight - a second
 	                                   // InviteByUsername queues its name instead of firing another

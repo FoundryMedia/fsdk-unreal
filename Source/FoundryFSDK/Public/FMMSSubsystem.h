@@ -3,12 +3,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Engine/EngineBaseTypes.h" // ENetworkFailure / ETravelFailure (the join-failure handlers)
 #include "Engine/TimerHandle.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "FoundryFSDKSubsystem.h" // EFoundryFsdkResult / EFoundryMatchStatus / FFoundryConnection
 #include "FMMSSubsystem.generated.h"
 
+class UFoundrySocialSubsystem;
 class UNetDriver;
 class UWorld;
 
@@ -228,6 +230,39 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void DeclineReconnectSeat();
 
+	// -- party search (Round 2: the LEADER's Find Match queues the party; members follow) ------------------------
+	// Justin: "find match needs to be contingent on all players ready. that ensures that all players are
+	// actually playing the same game." fid creates ONE ticket per joined member when the leader submits, so a
+	// member never submits - it finds its own ticket (GET tickets/mine) and runs the normal flow on it.
+
+	/** The sentence a party search is refused with, or empty when it may start: a joined member of a party of
+	 *  2+ who is not the leader ("Only the party leader can start a search."), or a leader whose party is not
+	 *  all ready in the queue's game ("Not everyone is ready in <slug>: <names> (<n> of <m>)."). The queue's
+	 *  game comes from FoundryQueueKey::GameSlug (an FRN key is parsed too); a bare id / UUID names no game and
+	 *  skips the ready check (fid decides). Solo / no party = empty. */
+	FString PartySearchRefusal(const FString& Queue) const;
+
+	/** RequestFindMatch's gate (public for automation tests): when PartySearchRefusal is non-empty, shows it as
+	 *  state Failed with an 8 s message TTL (no flow starts, no clock) and returns true. */
+	bool RefuseSearchForParty(const FString& Queue);
+
+	/** True while this client is searching on a ticket the party LEADER started (follow mode). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool IsFollowingParty() const { return bFollowing; }
+
+	/** tickets/mine answer handler (public for automation tests; HandleMyTicket forwards here). A ticket that
+	 *  names a leader other than me, while I am Idle (or Failed - a failed search must not strand a member
+	 *  outside the party's search) and a joined non-leader member of a party of 2+, is ADOPTED: the state becomes Searching "Searching with <leader>" and the normal poll -> connection ->
+	 *  travel flow runs on it. Everything else is ignored: no ticket (the quiet 404), a solo ticket (no
+	 *  leader), my own ticket as leader, a ticket of ANOTHER game than GameSlug() (a member who switched to a
+	 *  different kit game must not travel to the wrong binary), a state that moved on while the read was in
+	 *  flight, and a ticket this client already followed and ended (Cancel / expiry / match over) - its server-side cancel may not have
+	 *  landed when the next 2 s poll asks. */
+	void ApplyMyTicket(EFoundryFsdkResult Result, const FFoundryMyTicket& Ticket);
+
+	/** Test seam: answer Social() from this subsystem (a bare transient GameInstance has none). Never set in a game. */
+	void SetSocialForTesting(UFoundrySocialSubsystem* InSocial);
+
 	/** Pure state-machine step (public for automation tests): maps an FMMS phase onto the matchmaking state. */
 	void ApplyMatchmakingPhase(EFMMSPhase InPhase, const FString& Message, double MessageTtlSeconds = 0.0);
 
@@ -274,6 +309,22 @@ private:
 	UFUNCTION() void HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus Status, FFoundryTicketWait Wait);
 	UFUNCTION() void HandleConnection(EFoundryFsdkResult Result, FFoundryConnection Connection);
 	UFUNCTION() void HandleMySession(EFoundryFsdkResult Result, FFoundrySessionSeat Seat);
+	UFUNCTION() void HandleMyTicket(EFoundryFsdkResult Result, FFoundryMyTicket Ticket);
+
+	/** The social subsystem (the test seam first, else the GameInstance's). */
+	UFoundrySocialSubsystem* Social() const;
+	/** Every 2 s: ask for my ticket while this client is an idle, joined, non-leader member of a party of 2+
+	 *  whose social surfaces are live (the poller's own idle gating - zero consumers, no traffic) and who is
+	 *  READY in this game (fid seats only ready members, so an unready one has nothing to find). */
+	bool TickFollow(float DeltaTime);
+	/** Phase Idle/Failed and state Idle/Failed: the moments a leader's ticket may be adopted. */
+	bool CanAdoptFollowedTicket() const;
+	/** Adopt the leader's ticket: state Searching, then the SDK resumes the handle (see ApplyMyTicket). */
+	void BeginFollow(const FFoundryMyTicket& Ticket);
+	/** Leave follow mode, remembering the ticket so a lagging server-side cancel is not re-followed. */
+	void EndFollow();
+	/** "Searching with <leader>" while following, else the plain server-told searching sentence. */
+	FString SearchingMessage() const;
 
 	void Poll();
 	/** (Re)arm the poll timer as a ONE-SHOT, IntervalSeconds from now - every poll re-arms its own
@@ -333,6 +384,18 @@ private:
 	bool bSeatReleased = false;
 	FDelegateHandle NetworkFailureHandle;
 	FDelegateHandle TravelFailureHandle;
+
+	// -- follow mode (party member searching on the leader's ticket) --
+	bool bFollowing = false;
+	/** BeginFollow asked the SDK to resume the ticket; the next OnRequestMatchComplete is that answer. */
+	bool bFollowResumePending = false;
+	bool bMyTicketQueryInFlight = false;
+	FString FollowedTicketId;
+	FString FollowLeaderName;
+	/** The last followed ticket that ended (cancelled / expired / match over / refused join). */
+	FString DismissedFollowTicketId;
+	TWeakObjectPtr<UFoundrySocialSubsystem> SocialForTest;
+	FTSTicker::FDelegateHandle FollowTickHandle;
 	FTimerHandle PollTimer;
 	bool bBound = false;
 	// Wall-clock of the last accepted FindMatch — throttles rapid re-clicks (a fast failure, e.g.

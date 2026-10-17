@@ -11,6 +11,8 @@
 
 #include "Engine/GameInstance.h"
 #include "FMMSSubsystem.h"
+#include "FoundryQueueKey.h"
+#include "FoundrySocialSubsystem.h"
 #include "Misc/AutomationTest.h"
 #include "TimerManager.h"
 
@@ -458,6 +460,234 @@ bool FFMMSLobbyNoticesExpireTest::RunTest(const FString& Parameters)
 		GI->GetTimerManager().Tick(60.0f); // fires it
 		TestEqual(TEXT("plain Idle message has no TTL"), Fmms->GetMatchmakingMessage(), FString(TEXT("Ready.")));
 	}
+	return true;
+}
+
+// -- party search (Round 2): the leader's Find Match is gated on ready-in-this-game; a member follows ----------
+// "find match needs to be contingent on all players ready. that ensures that all players are actually playing the
+// same game." A bare GameInstance has no social subsystem, so the test hands the FMMS one through the seam and
+// simulates the party with the social fixture (its LocalFoundryId stands in for the signed-in id).
+namespace
+{
+	void AddJoined(FFoundrySocialFixture& Fixture, const TCHAR* Id, const TCHAR* Name, const TCHAR* ReadySlug)
+	{
+		FFoundryPartyMember M;
+		M.FoundryId = Id;
+		M.DisplayName = Name;
+		M.State = TEXT("JOINED");
+		M.bReady = ReadySlug[0] != TEXT('\0');
+		M.ReadyGameSlug = ReadySlug;
+		Fixture.Party.Members.Add(M);
+	}
+
+	FFoundrySocialFixture PartyOfThree(const TCHAR* LocalId, const TCHAR* AdaSlug, const TCHAR* BoSlug)
+	{
+		FFoundrySocialFixture Fixture;
+		Fixture.bActive = true;
+		Fixture.bHasParty = true;
+		Fixture.LocalFoundryId = LocalId;
+		Fixture.Party.PartyId = TEXT("p-1");
+		Fixture.Party.LeaderFoundryId = TEXT("mo-id");
+		Fixture.Party.LeaderDisplayName = TEXT("Mo");
+		Fixture.Party.MaxSize = 4;
+		AddJoined(Fixture, TEXT("mo-id"), TEXT("Mo"), TEXT("goo-crew"));
+		AddJoined(Fixture, TEXT("ada-id"), TEXT("Ada"), AdaSlug);
+		AddJoined(Fixture, TEXT("bo-id"), TEXT("Bo"), BoSlug);
+		return Fixture;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSPartyGateTest, "FoundryFSDK.FMMS.PartyGate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSPartyGateTest::RunTest(const FString& Parameters)
+{
+	UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+	UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+	UFoundrySocialSubsystem* Social = NewObject<UFoundrySocialSubsystem>(GI);
+	Fmms->SetSocialForTesting(Social);
+
+	TestEqual(TEXT("game slug of a queue key"), FoundryQueueKey::GameSlug(TEXT("goo-crew/solo")), FString(TEXT("goo-crew")));
+	TestEqual(TEXT("a bare id names no game"), FoundryQueueKey::GameSlug(TEXT("3f2a9c")), FString());
+	TestEqual(TEXT("an FRN key names the game of its queue tail"),
+		FoundryQueueKey::GameSlug(TEXT("frn:fmms:482910573312:queue/goo-crew/solo")), FString(TEXT("goo-crew")));
+	TestEqual(TEXT("an FRN that is not a queue names no game"), FoundryQueueKey::GameSlug(TEXT("frn:fgs:482910573312:game/goo-crew")), FString());
+	TestEqual(TEXT("whitespace is trimmed"), FoundryQueueKey::GameSlug(TEXT("  goo-crew/solo ")), FString(TEXT("goo-crew")));
+
+	// 1. The LEADER (Mo) with Ada not ready: refused with fid's sentence, before any flow starts.
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT(""), TEXT("goo-crew")));
+	const FString Expected = TEXT("Not everyone is ready in goo-crew: Ada (2 of 3).");
+	TestEqual(TEXT("leader with an unready member is refused"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")), Expected);
+	TestTrue(TEXT("RefuseSearchForParty refuses"), Fmms->RefuseSearchForParty(TEXT("goo-crew/solo")));
+	TestEqual(TEXT("the refusal is a Failed state"), static_cast<int32>(Fmms->GetMatchmakingState()), static_cast<int32>(EFoundryMatchmakingState::Failed));
+	TestEqual(TEXT("with the sentence as its message"), Fmms->GetMatchmakingMessage(), Expected);
+	TestEqual(TEXT("no flow started: the FMMS phase is untouched"), static_cast<int32>(Fmms->GetPhase()), static_cast<int32>(EFMMSPhase::Idle));
+	TestTrue(TEXT("no search clock"), Fmms->GetElapsedSearchSeconds() < 0.0f);
+
+	// The notice is transient (8 s): after it the UI is Idle and a new request is accepted by CanRequest's states.
+	GI->GetTimerManager().Tick(0.0f);
+	++GFrameCounter;
+	GI->GetTimerManager().Tick(60.0f);
+	TestEqual(TEXT("the refusal clears itself to Idle"), static_cast<int32>(Fmms->GetMatchmakingState()), static_cast<int32>(EFoundryMatchmakingState::Idle));
+
+	// 2. Two members, but ready in ANOTHER game is not ready here: names both.
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT("conquest"), TEXT("")));
+	TestEqual(TEXT("ready in a different game does not count"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")),
+		FString(TEXT("Not everyone is ready in goo-crew: Ada, Bo (1 of 3).")));
+
+	// 3. Everyone ready in the queue's game: the leader may search; a key with no slash defers to fid.
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+	TestEqual(TEXT("all ready in the game: allowed"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")), FString());
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT(""), TEXT("")));
+	TestEqual(TEXT("no slash in the key: the client cannot name the game, fid decides"), Fmms->PartySearchRefusal(TEXT("3f2a9c")), FString());
+	TestFalse(TEXT("so nothing is refused locally"), Fmms->RefuseSearchForParty(TEXT("3f2a9c")));
+
+	// 4. A joined NON-leader never submits for the party, ready or not.
+	Social->SetFixture(PartyOfThree(TEXT("ada-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+	TestEqual(TEXT("a member is refused"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")), FString(TEXT("Only the party leader can start a search.")));
+
+	// 4b. An FRN queue key gates like the plain one (its game is read from the queue/<game>/<mode> tail).
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT(""), TEXT("goo-crew")));
+	TestEqual(TEXT("an FRN key gates on its game"), Fmms->PartySearchRefusal(TEXT("frn:fmms:482910573312:queue/goo-crew/solo")),
+		FString(TEXT("Not everyone is ready in goo-crew: Ada (2 of 3).")));
+
+	// 5. Solo: no party, and a party of one, are today's single-ticket path.
+	FFoundrySocialFixture None;
+	None.bActive = true;
+	Social->SetFixture(None);
+	TestEqual(TEXT("no party: nothing to gate"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")), FString());
+	FFoundrySocialFixture Alone = PartyOfThree(TEXT("mo-id"), TEXT(""), TEXT(""));
+	Alone.Party.Members.SetNum(1);
+	Alone.Party.Members[0].ReadyGameSlug.Reset();
+	Alone.Party.Members[0].bReady = false;
+	Social->SetFixture(Alone);
+	TestEqual(TEXT("a party of one needs nobody"), Fmms->PartySearchRefusal(TEXT("goo-crew/solo")), FString());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFMMSPartyFollowTest, "FoundryFSDK.FMMS.PartyFollow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFMMSPartyFollowTest::RunTest(const FString& Parameters)
+{
+	UGameInstance* GI = NewObject<UGameInstance>(GetTransientPackage());
+	UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
+	UFoundrySocialSubsystem* Social = NewObject<UFoundrySocialSubsystem>(GI);
+	Fmms->SetSocialForTesting(Social);
+
+	FFoundryMyTicket Ticket;
+	Ticket.TicketId = TEXT("t-1");
+	Ticket.QueueKey = TEXT("goo-crew/solo");
+	Ticket.LeaderFoundryId = TEXT("mo-id");
+
+	// Ada is a joined non-leader in Mo's party of three.
+	Social->SetFixture(PartyOfThree(TEXT("ada-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+
+	// Things that are not a party search to follow change nothing.
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::NoMatch, FFoundryMyTicket());
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, FFoundryMyTicket());
+	FFoundryMyTicket Solo = Ticket;
+	Solo.LeaderFoundryId.Reset();
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Solo);
+	TestFalse(TEXT("no ticket / a solo ticket is not followed"), Fmms->IsFollowingParty());
+	TestEqual(TEXT("still Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+
+	// The leader's own ticket is the leader's submit, never followed.
+	Social->SetFixture(PartyOfThree(TEXT("mo-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Ticket);
+	TestFalse(TEXT("a leader does not follow its own ticket"), Fmms->IsFollowingParty());
+	Social->SetFixture(PartyOfThree(TEXT("ada-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+
+	// The leader's ticket appears: the member enters Searching, naming the leader.
+	TArray<EFoundryMatchmakingState> Seen;
+	const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
+		[&Seen](EFoundryMatchmakingState State, const FString&) { Seen.Add(State); });
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Ticket);
+	Fmms->OnMatchmakingStateChanged.Remove(Handle);
+	TestTrue(TEXT("following"), Fmms->IsFollowingParty());
+	TestEqual(TEXT("state is Searching"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Searching));
+	TestEqual(TEXT("message names the leader"), Fmms->GetMatchmakingMessage(), FString(TEXT("Searching with Mo")));
+	TestEqual(TEXT("the queue is the leader's"), Fmms->GetQueue(), FString(TEXT("goo-crew/solo")));
+	TestTrue(TEXT("the search clock runs"), Fmms->GetElapsedSearchSeconds() >= 0.0f);
+	TestTrue(TEXT("Cancel is offered"), Fmms->CanCancel());
+	TestTrue(TEXT("Searching was announced"), Seen.Contains(EFoundryMatchmakingState::Searching));
+
+	// A second read of the same ticket while already searching changes nothing.
+	Seen.Reset();
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Ticket);
+	TestEqual(TEXT("an already-following member is not re-adopted"), Seen.Num(), 0);
+
+	// Cancel from a member returns to Idle "Search cancelled." and that ticket is never followed again - fid's
+	// cancel may not have landed when the next 2 s read asks.
+	Fmms->RequestCancel();
+	TestFalse(TEXT("follow mode ended with the cancel"), Fmms->IsFollowingParty());
+	TestEqual(TEXT("cancel resolves to Idle"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+	TestEqual(TEXT("cancel message"), Fmms->GetMatchmakingMessage(), FString(TEXT("Search cancelled.")));
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Ticket);
+	TestFalse(TEXT("the cancelled ticket is not re-followed while the server still lists it"), Fmms->IsFollowingParty());
+	TestEqual(TEXT("still Idle after the lagging read"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+
+	// A genuinely new search by the leader is a new ticket: followed.
+	FFoundryMyTicket Next = Ticket;
+	Next.TicketId = TEXT("t-2");
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Next);
+	TestTrue(TEXT("a new ticket is followed"), Fmms->IsFollowingParty());
+	TestEqual(TEXT("and reads Searching"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Searching));
+
+	// The match ends: Idle "Match over", and the ended ticket is not resumed by the next read either.
+	Fmms->NotifyMatchEnded();
+	TestFalse(TEXT("match over ends follow mode"), Fmms->IsFollowingParty());
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Next);
+	TestEqual(TEXT("the ended ticket is not followed"), StateOf(Fmms), static_cast<int32>(EFoundryMatchmakingState::Idle));
+
+	// A ticket of ANOTHER game is never adopted (a member now in a different kit game must not travel to the
+	// wrong binary): only when both sides name a game, and only a mismatch is refused.
+	{
+		UFMMSSubsystem* Other = NewObject<UFMMSSubsystem>(GI);
+		Other->SetSocialForTesting(Social);
+		FFoundrySocialFixture Fx = PartyOfThree(TEXT("ada-id"), TEXT("goo-crew"), TEXT("goo-crew"));
+		Social->SetFixture(Fx);
+		Social->SetGameSlug(TEXT("conquest"));
+		FFoundryMyTicket GooTicket = Ticket;
+		GooTicket.TicketId = TEXT("t-other");
+		Other->ApplyMyTicket(EFoundryFsdkResult::Ok, GooTicket);
+		TestFalse(TEXT("a goo-crew ticket is ignored by a member whose game is conquest"), Other->IsFollowingParty());
+		Social->SetGameSlug(TEXT("goo-crew"));
+		Other->ApplyMyTicket(EFoundryFsdkResult::Ok, GooTicket);
+		TestTrue(TEXT("the same ticket is followed once the member's game matches"), Other->IsFollowingParty());
+		FFoundryMyTicket BareTicket = Ticket;
+		BareTicket.TicketId = TEXT("t-bare");
+		BareTicket.QueueKey = TEXT("3f2a9c");
+		UFMMSSubsystem* Bare = NewObject<UFMMSSubsystem>(GI);
+		Bare->SetSocialForTesting(Social);
+		Social->SetGameSlug(TEXT("conquest"));
+		Bare->ApplyMyTicket(EFoundryFsdkResult::Ok, BareTicket);
+		TestTrue(TEXT("a bare-id queue key names no game, so it defers to fid and is followed"), Bare->IsFollowingParty());
+		Social->SetGameSlug(FString());
+	}
+
+	// A Failed phase must not strand a member outside the party's search: a failed search leaves Phase on Failed
+	// and nothing returns it to Idle, so the leader's NEXT ticket has to be adopted from Failed too.
+	{
+		Social->SetFixture(PartyOfThree(TEXT("ada-id"), TEXT("goo-crew"), TEXT("goo-crew")));
+		UFMMSSubsystem* Failed = NewObject<UFMMSSubsystem>(GI);
+		Failed->SetSocialForTesting(Social);
+		Failed->FindMatchAuthenticated(FString(), FString()); // no queue -> Fail("No queue specified.")
+		TestEqual(TEXT("precondition: the phase is Failed"), static_cast<int32>(Failed->GetPhase()), static_cast<int32>(EFMMSPhase::Failed));
+		TestEqual(TEXT("precondition: the state is Failed"), StateOf(Failed), static_cast<int32>(EFoundryMatchmakingState::Failed));
+		FFoundryMyTicket After = Ticket;
+		After.TicketId = TEXT("t-after-fail");
+		Failed->ApplyMyTicket(EFoundryFsdkResult::Ok, After);
+		TestTrue(TEXT("a member in Failed follows the leader's next search"), Failed->IsFollowingParty());
+		TestEqual(TEXT("and reads Searching"), StateOf(Failed), static_cast<int32>(EFoundryMatchmakingState::Searching));
+	}
+
+	// Not in a party of 2+ any more: nothing to follow.
+	FFoundrySocialFixture None;
+	None.bActive = true;
+	Social->SetFixture(None);
+	FFoundryMyTicket Later = Ticket;
+	Later.TicketId = TEXT("t-3");
+	Fmms->ApplyMyTicket(EFoundryFsdkResult::Ok, Later);
+	TestFalse(TEXT("no party, no follow"), Fmms->IsFollowingParty());
 	return true;
 }
 

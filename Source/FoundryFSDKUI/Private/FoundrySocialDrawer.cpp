@@ -36,6 +36,26 @@ namespace
 	FString ActionKey(const FString& Action) { return Action; }
 	FString ActionKey(const FName& Action) { return Action.ToString(); }
 
+	/** The local member's ready flag FOR THIS GAME. IsSelfReady() is ready in ANY game: a member ready in
+	 *  another title would read READY-already and the toggle would un-ready them instead of readying here. */
+	bool IsSelfReadyHere(const UFoundrySocialSubsystem& Sdk)
+	{
+		const FString Slug = Sdk.GameSlug();
+		const FString Me = Sdk.LocalFoundryId();
+		if (Slug.IsEmpty() || Me.IsEmpty())
+		{
+			return false;
+		}
+		for (const FFoundryPartyMember& M : Sdk.Party().Members)
+		{
+			if (M.FoundryId == Me)
+			{
+				return M.bReady && M.ReadyGameSlug.Equals(Slug, ESearchCase::IgnoreCase);
+			}
+		}
+		return false;
+	}
+
 	bool IsJoinedState(const FString& State)
 	{
 		return State.IsEmpty() || State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
@@ -173,6 +193,9 @@ void UFoundrySocialDrawer::NativeConstruct()
 	Super::NativeConstruct();
 	if (UFoundrySocialSubsystem* Sdk = Subsystem())
 	{
+		// SetReady sends this slug; the subsystem cannot be reached at module startup, so the first kit widget
+		// to construct pushes it (the match cluster does the same - both are cheap setters).
+		UFoundryUISettings::PushGameSlug(Sdk);
 		Sdk->RegisterConsumer();
 		Sdk->OnChanged.AddUObject(this, &UFoundrySocialDrawer::HandleSocialChanged);
 		Sdk->OnActionFailed.AddWeakLambda(this, [this](const auto& Action, const FString& Message)
@@ -664,9 +687,11 @@ void UFoundrySocialDrawer::Rebuild()
 					if (UFoundryFriendRow* Row = *Found)
 					{
 						// A member in a match reads "In match" (overrides the presence label, which says only
-						// "Playing <game>" for the lobby too); an invitee is still "Invited - not joined".
+						// "Playing <game>" for the lobby too); an invitee is still "Invited - not joined". A member
+						// in the lobby reads "Ready in <game>" / "Not ready": ready lives in the GAME now, so the
+						// row names the game the flag was set in.
 						const FString Status = !bJoinedMember ? FString(TEXT("Invited - not joined"))
-							: (M.bInMatch ? FString(TEXT("In match")) : FString());
+							: (M.bInMatch ? FString(TEXT("In match")) : FoundryPartyRules::ReadyStatusText(M.bReady, M.ReadyGameSlug));
 						Row->Setup(F, EFoundryFriendRowKind::Party, bHost, bLocal, bJoinedMember,
 							GetMemberTint(F.FoundryId, i, bLocal), Status, M.bReady);
 						// A pending row shows how long the invite still lives ("Invited - expires in 3 min").
@@ -916,7 +941,7 @@ void UFoundrySocialDrawer::Rebuild()
 	Show(LeaveButton, bInParty && !bFixture, true);
 
 	// -- ready toggle (visible only while in a party; mirrors your own ready flag)
-	const bool bSelfReady = Sdk && !bFixture && Sdk->IsSelfReady();
+	const bool bSelfReady = Sdk && !bFixture && IsSelfReadyHere(*Sdk);
 	SetText(ReadyToggleText, bSelfReady ? TEXT("UNREADY") : TEXT("READY"));
 	Show(ReadyToggleButton, bInParty && !bFixture, true);
 }
@@ -1042,7 +1067,7 @@ void UFoundrySocialDrawer::HandleReadyToggle()
 {
 	if (UFoundrySocialSubsystem* Sdk = Subsystem())
 	{
-		Sdk->SetReady(!Sdk->IsSelfReady());
+		Sdk->SetReady(!IsSelfReadyHere(*Sdk)); // ready elsewhere still READIES here; only ready-here un-readies
 	}
 }
 

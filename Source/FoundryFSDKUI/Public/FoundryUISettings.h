@@ -239,6 +239,13 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Matchmaking")
 	TArray<FFoundryMatchmakingMode> MatchmakingModes;
 
+	/** The game's catalog slug (e.g. "goo-crew"). Ready belongs to the game, not the launcher: a party
+	 *  member readies up FROM INSIDE this game, carrying this slug, and Find Match waits until every joined
+	 *  member is ready in the slug of the selected mode's queue. Empty = derived from the first mode's
+	 *  queue key (the part before the '/'). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Matchmaking")
+	FString GameSlug;
+
 	/** The sound mix UFoundryGameUserSettings::ApplyAudio pushes. Unset = the volumes persist but
 	 *  are never applied - the same silent no-op posture as an unset default widget class. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Audio")
@@ -343,6 +350,12 @@ public:
 	/** Push bPartyFollowsLeaderOnLeave + the kit's leave executor (IFoundryMenuHost::RequestLeaveMatch) into
 	 *  UFoundryPartyFollowComponent (core module). Call once at startup (FFoundryFSDKUIModule::StartupModule). */
 	static void ApplyPartyDefaults();
+
+	/** Push GameSlug (else the first mode's queue-key slug) into the social subsystem, which sends it when
+	 *  the player readies up. The subsystem is a GameInstance subsystem, so it does not exist at module
+	 *  startup - the kit's drawer and match cluster call this from NativeConstruct instead (a plain
+	 *  setter, safe to repeat). */
+	static void PushGameSlug(class UFoundrySocialSubsystem* Social);
 
 	/** Synchronous load of a soft widget class. Null (and a log line naming the setting) when unset
 	 *  or missing. */

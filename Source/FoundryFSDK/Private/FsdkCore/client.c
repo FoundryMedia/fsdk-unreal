@@ -45,6 +45,7 @@
 #define FSDK_PATH_TICKETS       "/v1/fmms/tickets"
 #define FSDK_PATH_REGIONS       "/v1/fmms/regions"
 #define FSDK_PATH_MY_SESSION    "/v1/fmms/my-session"
+#define FSDK_PATH_MY_TICKET     "/v1/fmms/tickets/mine"
 
 /* Map an HTTP status to a result. 2xx -> OK; 401/403 -> UNAUTHORIZED (the
  * server-side authz boundary); 404 -> NO_MATCH (not found / not yet ready);
@@ -443,12 +444,17 @@ fsdk_result fsdk_request_match(fsdk_client* client,
 
     char* resp = NULL;
     long status = 0;
+    client->last_error[0] = '\0';
     fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_POST, FSDK_PATH_TICKETS,
                                       client->player_token, body, &resp, &status);
     if (r != FSDK_OK) {
         return r;
     }
     if (status < 200 || status >= 300) {
+        /* Keep fid's sentence ("Only the party leader can start a search.", "Not everyone is
+         * ready in goo-crew: ...") - the host shows it verbatim; the bare status code maps to
+         * a generic result that says nothing about WHY a party search was refused. */
+        fsdk_client_note_error(client, status, resp);
         fsdk_string_free(resp);
         fsdk_log(FSDK_LOG_WARN, "fsdk request_match rejected");
         return http_status_to_result(status);
@@ -970,6 +976,53 @@ fsdk_result fsdk_my_session(fsdk_client* client, fsdk_session_seat* out) {
     fsdk_log(FSDK_LOG_INFO, out->active ? "fsdk my_session: active seat"
                                         : "fsdk my_session: no live seat");
     return FSDK_OK;
+}
+
+fsdk_result fsdk_fmms_my_ticket(fsdk_client* client,
+                                char* out_ticket_id, size_t ticket_id_sz,
+                                char* out_queue_key, size_t queue_key_sz,
+                                char* out_leader_foundry_id, size_t leader_sz) {
+    if (client == NULL || out_ticket_id == NULL || ticket_id_sz == 0
+            || out_queue_key == NULL || queue_key_sz == 0
+            || out_leader_foundry_id == NULL || leader_sz == 0) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    /* Empty first so any early return reads as "no ticket", never stale stack data. */
+    out_ticket_id[0] = '\0';
+    out_queue_key[0] = '\0';
+    out_leader_foundry_id[0] = '\0';
+    if (!client->authenticated || client->player_token == NULL) {
+        return FSDK_ERR_NOT_AUTHENTICATED;
+    }
+
+    /* GET {base_url}/v1/fmms/tickets/mine -> {ticketId, queueKey, state, partyId,
+     * leaderFoundryId}: the caller's newest live (QUEUED or MATCHED) ticket. It is POLLED
+     * every ~2 s by party members waiting for their leader's search, so fid answers the
+     * "none" case with a QUIET 404 - not an error worth a log line or a stored sentence. */
+    client->last_error[0] = '\0';
+    char* resp = NULL;
+    long status = 0;
+    fsdk_result r = fsdk_http_request(client->base_url, FSDK_HTTP_GET, FSDK_PATH_MY_TICKET,
+                                      client->player_token, NULL, &resp, &status);
+    if (r != FSDK_OK) {
+        return r;
+    }
+    if (status < 200 || status >= 300) {
+        if (status != 404) {
+            fsdk_client_note_error(client, status, resp);
+        }
+        fsdk_string_free(resp);
+        return http_status_to_result(status);
+    }
+
+    const char* data = json_data_object(resp);
+    json_extract_string(data, "ticketId", out_ticket_id, ticket_id_sz);
+    json_extract_string(data, "queueKey", out_queue_key, queue_key_sz);
+    /* null for a solo ticket - json_extract_string leaves the empty string. */
+    json_extract_string(data, "leaderFoundryId", out_leader_foundry_id, leader_sz);
+    fsdk_string_free(resp);
+    /* A 200 without a ticket id is unusable - treat it as "none". */
+    return out_ticket_id[0] != '\0' ? FSDK_OK : FSDK_ERR_NO_MATCH;
 }
 
 fsdk_result fsdk_report_match_ended(fsdk_client* client, fsdk_ticket* ticket) {

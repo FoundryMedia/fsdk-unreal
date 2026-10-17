@@ -19,6 +19,32 @@ namespace
 	constexpr float ModeMenuSeconds = 0.15f;
 
 	/**
+	 * The Find Match gate for the party the local player is in, measured against the SELECTED queue's game:
+	 * ready is per game, and the queue key's prefix is the slug fid checks every member's ready flag against.
+	 * Ungated (solo, no party, no queue yet) answers a default FFindMatchGate.
+	 */
+	FoundryPartyRules::FFindMatchGate GateFor(const UFoundrySocialSubsystem* S, const FString& QueueKey)
+	{
+		FoundryPartyRules::FFindMatchGateInput In;
+		if (S && S->HasParty() && !QueueKey.IsEmpty())
+		{
+			const FString Slug = FoundryPartyRules::GameSlugOfQueue(QueueKey);
+			In.Joined = S->JoinedCount();
+			In.bLocalLeader = S->IsLocalLeader();
+			In.bAllReady = S->AllReadyIn(Slug);
+			In.UnreadyNames = S->UnreadyNames(Slug);
+			In.LeaderName = S->LeaderDisplayName();
+		}
+		return FoundryPartyRules::PlanFindMatch(In);
+	}
+
+	/** A joined member of a party of 2+ who does not lead it: its search is the leader's, followed. */
+	bool IsFollower(const UFoundrySocialSubsystem* S)
+	{
+		return S && S->HasParty() && S->JoinedCount() >= 2 && !S->IsLocalLeader();
+	}
+
+	/**
 	 * The ticket attributes the cluster submits: the mode's own JSON object (empty -> {}) with the
 	 * party id merged in as "partyId" when the player is in a party. A mode JSON that does not parse
 	 * as an object is replaced by a fresh one when there is a party id to carry (the party matters
@@ -129,6 +155,20 @@ void UFoundryMatchCluster::NativeConstruct()
 	if (UFoundrySocialSubsystem* S = Social())
 	{
 		S->RegisterConsumer(); // the party count reads the roster - keep the poller alive for it
+		// The ready flag and the Find Match gate are per game. The settings push covers GameSlug / the
+		// settings' modes; a game that builds its modes in GetModes has no settings modes, so derive from those.
+		UFoundryUISettings::PushGameSlug(S);
+		if (UFoundryUISettings::Get()->GameSlug.IsEmpty())
+		{
+			for (const FFoundryMatchmakingMode& Mode : GetModes())
+			{
+				if (!Mode.QueueName.IsEmpty())
+				{
+					S->SetDefaultGameSlugFromQueue(Mode.QueueName);
+					break;
+				}
+			}
+		}
 		S->OnChanged.AddUObject(this, &UFoundryMatchCluster::Refresh);
 		S->OnPartyChanged.AddUObject(this, &UFoundryMatchCluster::Refresh);
 	}
@@ -210,6 +250,9 @@ void UFoundryMatchCluster::Refresh()
 	const int32 SelectedModeCap = (S && !SelectedQueue.IsEmpty()) ? S->PartyCapForQueue(SelectedQueue) : -1;
 	const int32 PartyJoined = S ? FMath::Max(1, S->JoinedCount()) : 1;
 	const bool bPartyTooBig = FoundryPartyRules::IsTooBig(PartyJoined, SelectedModeCap);
+	const FoundryPartyRules::FFindMatchGate Gate = GateFor(S, SelectedQueue);
+	// A member following its leader's search reads the subsystem's own sentence ("Searching with Ada").
+	const FString FollowLead = (IsFollower(S) && !Message.IsEmpty()) ? Message : FString();
 
 	// -- mode pill
 	if (Modes.IsValidIndex(SelectedModeIndex))
@@ -264,7 +307,7 @@ void UFoundryMatchCluster::Refresh()
 		Label = bPrimaryEnabled ? TEXT("CANCEL SEARCH") : TEXT("REQUESTING...");
 		break;
 	case EState::Searching:
-		Status = TEXT("Searching for"); bShowSpinner = true;
+		Status = FollowLead.IsEmpty() ? FString(TEXT("Searching for")) : FollowLead; bShowSpinner = true;
 		bPrimaryEnabled = bCanCancel;
 		Label = bPrimaryEnabled ? TEXT("CANCEL SEARCH") : TEXT("SEARCHING...");
 		break;
@@ -305,6 +348,38 @@ void UFoundryMatchCluster::Refresh()
 		bPrimaryEnabled = false;
 	}
 
+	// Ready belongs to the game: in a party of 2+ only the LEADER starts a search, and only once every joined
+	// member is ready in this game (the party-cap sentence above still comes first). Start states only - a
+	// running search keeps its CANCEL SEARCH whoever started it.
+	const bool bStartState = State == EState::Idle || State == EState::Failed;
+	bool bHideFind = false;
+	bool bGateStatusShown = false;
+	const bool bLiveIdleNotice = State == EState::Idle && bSigned && !bFixture && !Message.IsEmpty();
+	bIdleNoticeShown = bLiveIdleNotice;
+	if (Gate.bGated && bSigned && bStartState)
+	{
+		if (!Gate.bShowButton)
+		{
+			bHideFind = true;
+			bPrimaryEnabled = false;
+		}
+		else
+		{
+			bPrimaryEnabled = bPrimaryEnabled && Gate.bEnabled;
+			if (!Gate.Label.IsEmpty())
+			{
+				Label = Gate.Label;
+			}
+		}
+		// A live Idle notice ("Your party's search was cancelled.", "Match over") is news the player has not read
+		// yet and it carries its own TTL - it keeps the line until it expires, then the waiting sentence takes over.
+		if (!bTooBigBlocksFind && !bLiveIdleNotice && !Gate.Status.IsEmpty())
+		{
+			Status = Gate.Status;
+			bGateStatusShown = true;
+		}
+	}
+
 	// The label is CANCEL SEARCH exactly when the primary button is the cancel.
 	const bool bCancelLabel = Label == TEXT("CANCEL SEARCH");
 	const bool bSplitCancel = CancelButton != nullptr && bCancelLabel;
@@ -319,13 +394,18 @@ void UFoundryMatchCluster::Refresh()
 	{
 		const bool bBusy = !bPrimaryEnabled && State != EState::Idle && State != EState::Failed;
 		FindMatchButton->SetIsEnabled(bPrimaryEnabled || bBusy);
+		// Hidden, not Collapsed, for a waiting member: the cluster keeps its height, so the party's state
+		// changing never shifts the layout.
 		FindMatchButton->SetVisibility(bSplitCancel ? ESlateVisibility::Collapsed
+			: bHideFind ? ESlateVisibility::Hidden
 			: bBusy ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Visible);
 	}
 	SetText(StatusText, Status.IsEmpty() ? FString(TEXT(" ")) : Status); // a blank line keeps the row's height
 	if (StatusText && bStatusColorCaptured)
 	{
-		StatusText->SetColorAndOpacity((State == EState::Failed || bTooBigBlocksFind) ? FSlateColor(UFoundryUISettings::Get()->Palette.Error) : StatusNormalColor);
+		// "Waiting for X to ready up" is not an error, even where it replaced a stale failure sentence.
+		const bool bErrorStatus = (State == EState::Failed && !bGateStatusShown) || bTooBigBlocksFind;
+		StatusText->SetColorAndOpacity(bErrorStatus ? FSlateColor(UFoundryUISettings::Get()->Palette.Error) : StatusNormalColor);
 	}
 	RefreshSpinner(bShowSpinner);
 	Show(LeaveMatchButton, bShowLeave, true);
@@ -395,6 +475,12 @@ void UFoundryMatchCluster::NativeTick(const FGeometry& MyGeometry, float InDelta
 	}
 
 	const UFMMSSubsystem* F = Fmms();
+	// A TTL'd Idle notice leaves no state change behind when it expires: without this the waiting sentence it
+	// was holding back would not appear until the next party poll.
+	if (bIdleNoticeShown && F && F->GetMatchmakingMessage().IsEmpty())
+	{
+		Refresh();
+	}
 	if (!F || !StatusText)
 	{
 		return;
@@ -407,8 +493,12 @@ void UFoundryMatchCluster::NativeTick(const FGeometry& MyGeometry, float InDelta
 		if (Seconds != LastElapsedShown)
 		{
 			LastElapsedShown = Seconds;
-			SetText(StatusText, FString::Printf(TEXT("%s %d:%02d"),
-				State == EFoundryMatchmakingState::Searching ? TEXT("Searching for") : TEXT("Requesting"), Seconds / 60, Seconds % 60));
+			FString Lead = State == EFoundryMatchmakingState::Searching ? FString(TEXT("Searching for")) : FString(TEXT("Requesting"));
+			if (State == EFoundryMatchmakingState::Searching && IsFollower(Social()) && !F->GetMatchmakingMessage().IsEmpty())
+			{
+				Lead = F->GetMatchmakingMessage(); // "Searching with Ada" - same sentence Refresh renders
+			}
+			SetText(StatusText, FString::Printf(TEXT("%s %d:%02d"), *Lead, Seconds / 60, Seconds % 60));
 		}
 	}
 }
@@ -570,6 +660,17 @@ void UFoundryMatchCluster::HandleFindMatch()
 			{
 				Refresh();
 				break;
+			}
+			// Ready belongs to the game: a waiting member never starts a search, and the leader waits for everyone
+			// (the subsystem and fid refuse too - this keeps a key binding from even asking).
+			if (S && S->IsSignedIn())
+			{
+				const FoundryPartyRules::FFindMatchGate Gate = GateFor(S, Modes[SelectedModeIndex].QueueName);
+				if (Gate.bGated && (!Gate.bShowButton || !Gate.bEnabled))
+				{
+					Refresh();
+					break;
+				}
 			}
 			const FString PartyId = S ? S->Party().PartyId : FString();
 			// Values, not references: RequestFindMatch broadcasts Pending before it consumes its arguments and

@@ -6,6 +6,7 @@
 #include "FoundryMatchmakingCopy.h"
 #include "FoundryMenuHost.h"
 #include "FoundryPartyFollowComponent.h"
+#include "FoundrySocialSubsystem.h"
 #include "GameFramework/PlayerController.h"
 #include "UObject/SoftObjectPath.h"
 
@@ -111,6 +112,29 @@ void UFoundryUISettings::ApplyPartyDefaults()
 		IFoundryMenuHost::Execute_RequestLeaveMatch(Controller);
 		return true;
 	});
+}
+
+void UFoundryUISettings::PushGameSlug(UFoundrySocialSubsystem* Social)
+{
+	const UFoundryUISettings* Settings = Get();
+	if (Social == nullptr || Settings == nullptr)
+	{
+		return;
+	}
+	if (!Settings->GameSlug.IsEmpty())
+	{
+		Social->SetGameSlug(Settings->GameSlug);
+		return;
+	}
+	// No explicit slug: a queue key is "{gameSlug}/{modeSlug}", so the first queueable mode names the game.
+	for (const FFoundryMatchmakingMode& Mode : Settings->MatchmakingModes)
+	{
+		if (!Mode.QueueName.IsEmpty())
+		{
+			Social->SetDefaultGameSlugFromQueue(Mode.QueueName);
+			return;
+		}
+	}
 }
 
 TSubclassOf<UUserWidget> UFoundryUISettings::LoadWidgetClass(const TSoftClassPtr<UUserWidget>& Soft, const TCHAR* SettingName)

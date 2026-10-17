@@ -1,6 +1,7 @@
 #include "FoundrySocialSubsystem.h"
 
 #include "Engine/GameInstance.h"
+#include "FoundryQueueKey.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFoundrySocial, Log, All);
 
@@ -27,6 +28,17 @@ void UFoundrySocialSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UFoundrySocialSubsystem::Deinitialize()
 {
+	// A quit must not leave a stale ready behind: fid clears ready only when the member travels into a match, so
+	// a player who readied and then closed the game would hold the whole party's gate open for a game nobody is
+	// in. Best effort - the worker may or may not finish before the process exits (the member's party row is
+	// also dropped when they leave or time out), but when it does the leader's gate is truthful again.
+	if (!Fixture.bActive && bSignedIn && HasParty() && IsSelfReady())
+	{
+		if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+		{
+			Sdk->SetPartyReadyInGame(CachedParty.PartyId, false, GameSlug());
+		}
+	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
 		Sdk->OnLoginComplete.RemoveAll(this);
@@ -99,11 +111,20 @@ void UFoundrySocialSubsystem::Tick(float /*DeltaTime*/)
 		return;
 	}
 	// Polling with idle controls: every 10s while any panel is open, every 30s while every panel is
-	// closed (SetPanelOpen).
+	// closed (SetPanelOpen) - and the FAST cadence too while the local player LEADS a party of 2+ that is not
+	// yet all ready in this game: the leader's Find Match gate opens the moment the last member readies, and
+	// at the closed-drawer cadence it lagged up to 30 s behind (Find Match stayed disabled with everyone ready).
 	const double Now = FPlatformTime::Seconds();
+	const bool bLeaderWaitingOnReady = HasParty() && JoinedCount() >= 2 && IsLocalLeader()
+		&& !GameSlug().IsEmpty() && !AllReadyIn(GameSlug());
+	const double Interval = (bPanelOpen || bLeaderWaitingOnReady) ? 10.0 : 30.0;
+	if (NextPollTime > Now + Interval)
+	{
+		NextPollTime = Now + Interval; // the fast cadence just began (a member joined, the drawer closed): do not wait out the slow slot
+	}
 	if (Now >= NextPollTime)
 	{
-		NextPollTime = Now + (bPanelOpen ? 10.0 : 30.0);
+		NextPollTime = Now + Interval;
 		RefreshNow();
 	}
 }
@@ -202,6 +223,11 @@ void UFoundrySocialSubsystem::MaybeFlushPollNotify()
 	OnChanged.Broadcast();
 }
 
+FString UFoundrySocialSubsystem::EffectiveLocalId() const
+{
+	return (Fixture.bActive && !Fixture.LocalFoundryId.IsEmpty()) ? Fixture.LocalFoundryId : LocalId;
+}
+
 bool UFoundrySocialSubsystem::IsLocalLeader() const
 {
 	if (!HasParty())
@@ -209,7 +235,8 @@ bool UFoundrySocialSubsystem::IsLocalLeader() const
 		return true; // alone you are your own host
 	}
 	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
-	return !LocalId.IsEmpty() && P.LeaderFoundryId == LocalId;
+	const FString Me = EffectiveLocalId();
+	return !Me.IsEmpty() && P.LeaderFoundryId == Me;
 }
 
 bool UFoundrySocialSubsystem::IsLeader(const FString& FoundryId) const
@@ -224,19 +251,177 @@ bool UFoundrySocialSubsystem::IsLeader(const FString& FoundryId) const
 
 bool UFoundrySocialSubsystem::IsSelfReady() const
 {
-	if (!HasParty() || LocalId.IsEmpty())
+	const FString Me = EffectiveLocalId();
+	if (!HasParty() || Me.IsEmpty())
 	{
 		return false;
 	}
 	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
 	for (const FFoundryPartyMember& M : P.Members)
 	{
-		if (M.FoundryId == LocalId)
+		if (M.FoundryId == Me)
 		{
 			return M.bReady;
 		}
 	}
 	return false;
+}
+
+bool UFoundrySocialSubsystem::IsSelfReadyIn(const FString& InGameSlug) const
+{
+	const FString Me = EffectiveLocalId();
+	const FString Slug = InGameSlug.TrimStartAndEnd();
+	if (!HasParty() || Me.IsEmpty() || Slug.IsEmpty())
+	{
+		return false;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		if (M.FoundryId == Me)
+		{
+			return M.ReadyGameSlug.Equals(Slug, ESearchCase::IgnoreCase);
+		}
+	}
+	return false;
+}
+
+// -- ready belongs to the GAME -------------------------------------------------------------------------------
+// Justin, Round 2: "you shouldn't be able to ready up in the launcher. there is nothing to ready up for ...
+// find match needs to be contingent on all players ready. that ensures that all players are actually playing
+// the same game." fid stores WHICH game each member readied in (readyGameSlug) and refuses a search unless
+// every joined member is ready in the queue's game; these reads are the client's view of the same rule.
+
+namespace
+{
+	bool IsJoinedRow(const FFoundryPartyMember& M)
+	{
+		// Same test JoinedCount uses: an older fid sends no state on a joined row.
+		return M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
+	}
+
+	bool IsReadyIn(const FFoundryPartyMember& M, const FString& Slug)
+	{
+		return !Slug.IsEmpty() && M.ReadyGameSlug.Equals(Slug, ESearchCase::IgnoreCase);
+	}
+
+	FString MemberLabel(const FFoundryPartyMember& M)
+	{
+		return !M.DisplayName.IsEmpty() ? M.DisplayName : (!M.Username.IsEmpty() ? M.Username : M.FoundryId);
+	}
+}
+
+void UFoundrySocialSubsystem::SetGameSlug(const FString& InSlug)
+{
+	const FString Slug = InSlug.TrimStartAndEnd();
+	if (Slug == GameSlugOverride)
+	{
+		return;
+	}
+	const FString Before = GameSlug();
+	GameSlugOverride = Slug;
+	if (GameSlug() != Before)
+	{
+		OnChanged.Broadcast(); // a ready label / the Find Match gate reads the slug
+	}
+}
+
+void UFoundrySocialSubsystem::SetDefaultGameSlugFromQueue(const FString& QueueKey)
+{
+	const FString Slug = FoundryQueueKey::GameSlug(QueueKey); // one shared parser: plain keys AND FRNs
+	if (Slug == DefaultGameSlug)
+	{
+		return;
+	}
+	const FString Before = GameSlug();
+	DefaultGameSlug = Slug;
+	if (GameSlug() != Before)
+	{
+		OnChanged.Broadcast();
+	}
+}
+
+FString UFoundrySocialSubsystem::GameSlug() const
+{
+	return !GameSlugOverride.IsEmpty() ? GameSlugOverride : DefaultGameSlug;
+}
+
+bool UFoundrySocialSubsystem::AllReadyIn(const FString& InGameSlug) const
+{
+	if (!HasParty() || JoinedCount() < 2)
+	{
+		return true; // a party of one needs nobody
+	}
+	const FString Slug = InGameSlug.TrimStartAndEnd();
+	if (Slug.IsEmpty())
+	{
+		return false;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		if (IsJoinedRow(M) && !IsReadyIn(M, Slug))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+int32 UFoundrySocialSubsystem::ReadyCountIn(const FString& InGameSlug) const
+{
+	if (!HasParty())
+	{
+		return 0;
+	}
+	const FString Slug = InGameSlug.TrimStartAndEnd();
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	int32 N = 0;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		N += (IsJoinedRow(M) && IsReadyIn(M, Slug)) ? 1 : 0;
+	}
+	return N;
+}
+
+TArray<FString> UFoundrySocialSubsystem::UnreadyNames(const FString& InGameSlug) const
+{
+	TArray<FString> Names;
+	if (!HasParty())
+	{
+		return Names;
+	}
+	const FString Slug = InGameSlug.TrimStartAndEnd();
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		if (IsJoinedRow(M) && !IsReadyIn(M, Slug))
+		{
+			Names.Add(MemberLabel(M));
+		}
+	}
+	return Names;
+}
+
+FString UFoundrySocialSubsystem::LeaderDisplayName() const
+{
+	if (!HasParty())
+	{
+		return FString();
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	if (!P.LeaderDisplayName.IsEmpty())
+	{
+		return P.LeaderDisplayName;
+	}
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		if (!P.LeaderFoundryId.IsEmpty() && M.FoundryId == P.LeaderFoundryId)
+		{
+			return M.DisplayName;
+		}
+	}
+	return FString();
 }
 
 int32 UFoundrySocialSubsystem::PartyCapacity() const
@@ -667,9 +852,17 @@ void UFoundrySocialSubsystem::SetReady(bool bReady)
 	{
 		return;
 	}
+	// Ready belongs to the game: the platform stores WHICH game (and refuses a ready with none), so the slug
+	// rides every ready=true. No slug known = a misconfigured kit; say so rather than send the refused request.
+	const FString Slug = GameSlug();
+	if (bReady && Slug.IsEmpty())
+	{
+		OnActionFailed.Broadcast(TEXT("party.ready"), TEXT("This game hasn't told Foundry which game it is, so it can't ready up."));
+		return;
+	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
-		Sdk->SetPartyReady(CachedParty.PartyId, bReady);
+		Sdk->SetPartyReadyInGame(CachedParty.PartyId, bReady, Slug);
 	}
 }
 

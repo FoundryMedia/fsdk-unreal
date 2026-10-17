@@ -1,5 +1,6 @@
 #include "FoundryPartyRules.h"
 
+#include "FoundryQueueKey.h"
 #include "FoundrySocialSubsystem.h"
 
 namespace FoundryPartyRules
@@ -84,6 +85,90 @@ namespace FoundryPartyRules
 		return PresenceGame.IsEmpty()
 			? FString::Printf(TEXT("In a party %s"), *Count)
 			: FString::Printf(TEXT("Playing %s - party %s"), *PresenceGame, *Count);
+	}
+
+	FString GameSlugOfQueue(const FString& QueueKey)
+	{
+		// ONE parser for the core subsystems and this module (an FRN key's game is read from its queue/<game>/<mode>
+		// tail; a bare id / UUID names no game) - the two can no longer disagree about which game a queue is.
+		return FoundryQueueKey::GameSlug(QueueKey);
+	}
+
+	FString GameDisplayName(const FString& Slug)
+	{
+		FString Out;
+		bool bWordStart = true;
+		for (const TCHAR Ch : Slug)
+		{
+			if (Ch == TEXT('-') || Ch == TEXT('_') || Ch == TEXT(' '))
+			{
+				Out.AppendChar(TEXT(' '));
+				bWordStart = true;
+				continue;
+			}
+			Out.AppendChar(bWordStart ? FChar::ToUpper(Ch) : Ch);
+			bWordStart = false;
+		}
+		return Out;
+	}
+
+	FString ReadyStatusText(bool bReady, const FString& ReadyGameSlug)
+	{
+		if (!bReady)
+		{
+			return TEXT("Not ready");
+		}
+		return ReadyGameSlug.IsEmpty() ? FString(TEXT("Ready")) : FString::Printf(TEXT("Ready in %s"), *GameDisplayName(ReadyGameSlug));
+	}
+
+	FString JoinNames(const TArray<FString>& Names)
+	{
+		if (Names.Num() == 0)
+		{
+			return FString();
+		}
+		if (Names.Num() == 1)
+		{
+			return Names[0];
+		}
+		FString Head;
+		for (int32 i = 0; i < Names.Num() - 1; ++i)
+		{
+			Head += (i > 0 ? FString(TEXT(", ")) : FString()) + Names[i];
+		}
+		return FString::Printf(TEXT("%s and %s"), *Head, *Names.Last());
+	}
+
+	FFindMatchGate PlanFindMatch(const FFindMatchGateInput& In)
+	{
+		FFindMatchGate Gate;
+		if (In.Joined < 2)
+		{
+			return Gate; // solo / a party of one: nothing to wait for
+		}
+		Gate.bGated = true;
+
+		if (!In.bLocalLeader)
+		{
+			// Only the leader's Find Match queues the party (fid creates every member's ticket from it).
+			Gate.bShowButton = false;
+			Gate.bEnabled = false;
+			Gate.Status = FString::Printf(TEXT("Waiting for %s to start"), In.LeaderName.IsEmpty() ? TEXT("the party leader") : *In.LeaderName);
+			return Gate;
+		}
+
+		// The count comes from the same names the status line shows, so the two can never disagree; a blocked
+		// gate with no names still means at least one member is not ready, so it never reads "2 / 2" disabled.
+		const int32 Ready = In.bAllReady ? In.Joined : FMath::Clamp(In.Joined - FMath::Max(1, In.UnreadyNames.Num()), 0, In.Joined);
+		Gate.Label = FString::Printf(TEXT("FIND MATCH (READY %d / %d)"), Ready, In.Joined);
+		Gate.bEnabled = In.bAllReady;
+		if (!In.bAllReady)
+		{
+			Gate.Status = In.UnreadyNames.Num() > 0
+				? FString::Printf(TEXT("Waiting for %s to ready up"), *JoinNames(In.UnreadyNames))
+				: FString(TEXT("Waiting for everyone to ready up"));
+		}
+		return Gate;
 	}
 
 	FFriendMenuPlan PlanFriendMenu(const FFriendMenuContext& C)

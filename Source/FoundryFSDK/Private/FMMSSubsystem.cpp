@@ -3,6 +3,7 @@
 #include "FMMSSubsystem.h"
 
 #include "FoundryMatchmakingCopy.h"
+#include "FoundryQueueKey.h"
 #include "FoundrySocialSubsystem.h"
 #include "foundry/fsdk.h" // fsdk_wait_reason_str (diagnostics only - never player-facing text)
 
@@ -31,6 +32,10 @@ void UFMMSSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		NetworkFailureHandle = GEngine->OnNetworkFailure().AddUObject(this, &UFMMSSubsystem::HandleNetworkFailure);
 		TravelFailureHandle = GEngine->OnTravelFailure().AddUObject(this, &UFMMSSubsystem::HandleTravelFailure);
 	}
+	// Follow mode's 2 s read of tickets/mine. A core ticker, not a GameInstance timer: it must survive the
+	// timer manager being rebuilt across travel, and TickFollow gates on everything itself.
+	FollowTickHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateUObject(this, &UFMMSSubsystem::TickFollow), 2.0f);
 }
 
 void UFMMSSubsystem::Deinitialize()
@@ -42,6 +47,8 @@ void UFMMSSubsystem::Deinitialize()
 	}
 	NetworkFailureHandle.Reset();
 	TravelFailureHandle.Reset();
+	FTSTicker::GetCoreTicker().RemoveTicker(FollowTickHandle);
+	FollowTickHandle.Reset();
 	StopPolling();
 	if (UGameInstance* GI = GetGameInstance())
 	{
@@ -77,6 +84,7 @@ void UFMMSSubsystem::BindOnce(UFoundryFSDKSubsystem* Sdk)
 	Sdk->OnPollMatchComplete.AddDynamic(this, &UFMMSSubsystem::HandlePoll);
 	Sdk->OnGetConnectionComplete.AddDynamic(this, &UFMMSSubsystem::HandleConnection);
 	Sdk->OnMySessionComplete.AddDynamic(this, &UFMMSSubsystem::HandleMySession);
+	Sdk->OnMyTicketComplete.AddDynamic(this, &UFMMSSubsystem::HandleMyTicket);
 	bBound = true;
 }
 
@@ -205,6 +213,12 @@ void UFMMSSubsystem::Cancel()
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
 		Sdk->CancelMatch();
+		if (bFollowResumePending && !FollowedTicketId.IsEmpty())
+		{
+			// Cancelled while the SDK was still adopting the leader's ticket: CancelMatch may have run first and
+			// found no active ticket, so cancel this one by id (idempotent; fid cancels the party's search).
+			Sdk->AbandonMatch(FollowedTicketId);
+		}
 	}
 	AbandonReconnectSeat(); // Cancel from Reconnectable = decline the live seat
 	CurrentMatchId.Reset();
@@ -448,12 +462,41 @@ void UFMMSSubsystem::HandleAuth(EFoundryFsdkResult Result)
 
 void UFMMSSubsystem::HandleRequest(EFoundryFsdkResult Result)
 {
+	if (bFollowResumePending && Phase == EFMMSPhase::Searching)
+	{
+		// The SDK's answer to ResumeFollowedTicket (a submit never ran): the leader's ticket is now the
+		// active one. Same clock reset as a fresh ticket, then the normal poll loop takes over.
+		bFollowResumePending = false;
+		if (Result != EFoundryFsdkResult::Ok)
+		{
+			UE_LOG(LogFMMS, Log, TEXT("[FMMS] could not adopt the leader's ticket (result %d)."), (int32)Result);
+			SetPhase(EFMMSPhase::Idle, TEXT("Couldn't join your party's search."), LobbyNoticeTtlSeconds);
+			return;
+		}
+		SearchStartedSeconds = FPlatformTime::Seconds();
+		TicketExpiresAtUnix = 0;
+		Poll();
+		return;
+	}
 	if (Phase != EFMMSPhase::Requesting)
 	{
 		return;
 	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
+		// A refused search (fid: "Only the party leader can start a search." 403, "Not everyone is ready in
+		// <game>: <names> (2 of 3)." 409) has a sentence written for the player - show it verbatim whenever fid
+		// gave one. Not gated on the client's cached party size: the just-joined / just-left race is exactly when
+		// the cache is wrong and the platform's sentence is the truth.
+		const UFoundryFSDKSubsystem* PartySdk = Fsdk();
+		if (PartySdk != nullptr
+			&& (Result == EFoundryFsdkResult::Unauthorized || Result == EFoundryFsdkResult::Protocol)
+			&& !PartySdk->LastMatchRequestError().IsEmpty())
+		{
+			UE_LOG(LogFMMS, Log, TEXT("[FMMS] party search refused (result %d)"), (int32)Result);
+			Fail(PartySdk->LastMatchRequestError());
+			return;
+		}
 		// Covers the server rejecting the search up front too (503/Unavailable: no capacity for this
 		// queue) - stop here with a human message rather than searching forever, a match could never
 		// form right now. FoundryMatchmakingCopy::ForResult carries that exact sentence.
@@ -464,7 +507,7 @@ void UFMMSSubsystem::HandleRequest(EFoundryFsdkResult Result)
 	// back to this when the server hasn't told us an expiresAt yet.
 	SearchStartedSeconds = FPlatformTime::Seconds();
 	TicketExpiresAtUnix = 0;
-	SetPhase(EFMMSPhase::Searching, FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::Searching, 0).ToString());
+	SetPhase(EFMMSPhase::Searching, SearchingMessage());
 	Poll(); // immediate first poll - its OWN completion decides the next poll's cadence (S5)
 }
 
@@ -535,6 +578,16 @@ void UFMMSSubsystem::HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus S
 	case EFoundryMatchStatus::Pending:
 		break; // keep waiting - the wait-reason dispatch below picks the exact phase/message
 	case EFoundryMatchStatus::Cancelled:
+		if (bFollowing || (Social() != nullptr && Social()->HasParty() && Social()->JoinedCount() >= 2))
+		{
+			// A member (or the leader) stopped the search - fid cancels every ticket of the party, so the
+			// leader's own poll sees CANCELED too. Not a failure of this client: both sides read the same
+			// notice and land on Idle (SetPhase ends follow mode + remembers the followed ticket). Our own
+			// Cancel() leaves the phase Idle first, so a poll that reaches here was somebody else's cancel.
+			StopPolling();
+			SetPhase(EFMMSPhase::Idle, TEXT("Your party's search was cancelled."), LobbyNoticeTtlSeconds);
+			return;
+		}
 		Fail(TEXT("Match was cancelled."));
 		return;
 	case EFoundryMatchStatus::Expired:
@@ -558,7 +611,7 @@ void UFMMSSubsystem::HandlePoll(EFoundryFsdkResult Result, EFoundryMatchStatus S
 		break;
 	case EFoundryWaitReason::Searching:
 	default:
-		SetPhase(EFMMSPhase::Searching, FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::Searching, 0).ToString());
+		SetPhase(EFMMSPhase::Searching, SearchingMessage());
 		break;
 	}
 
@@ -620,6 +673,200 @@ void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnect
 	PC->ClientTravel(Url, TRAVEL_Absolute);
 }
 
+// -- party search: the leader's Find Match queues everyone, members follow ------------------------------------
+
+UFoundrySocialSubsystem* UFMMSSubsystem::Social() const
+{
+	if (SocialForTest.IsValid())
+	{
+		return SocialForTest.Get();
+	}
+	const UGameInstance* GI = GetGameInstance();
+	return GI ? GI->GetSubsystem<UFoundrySocialSubsystem>() : nullptr;
+}
+
+void UFMMSSubsystem::SetSocialForTesting(UFoundrySocialSubsystem* InSocial)
+{
+	SocialForTest = InSocial;
+}
+
+FString UFMMSSubsystem::PartySearchRefusal(const FString& Queue) const
+{
+	const UFoundrySocialSubsystem* S = Social();
+	if (S == nullptr || !S->HasParty() || S->JoinedCount() < 2)
+	{
+		return FString(); // solo (or a party of one): today's single-ticket path
+	}
+	if (!S->IsLocalLeader())
+	{
+		return TEXT("Only the party leader can start a search.");
+	}
+	// Ready is per GAME and the queue's game is the slug fid checks every member against (an FRN key is parsed
+	// by the shared parser). A bare id / UUID names no game: the client cannot say, so fid's own 409 is the gate.
+	const FString Slug = FoundryQueueKey::GameSlug(Queue);
+	if (Slug.IsEmpty() || S->AllReadyIn(Slug))
+	{
+		return FString();
+	}
+	return FString::Printf(TEXT("Not everyone is ready in %s: %s (%d of %d)."),
+		*Slug, *FString::Join(S->UnreadyNames(Slug), TEXT(", ")), S->ReadyCountIn(Slug), S->JoinedCount());
+}
+
+bool UFMMSSubsystem::RefuseSearchForParty(const FString& Queue)
+{
+	const FString Refusal = PartySearchRefusal(Queue);
+	if (Refusal.IsEmpty())
+	{
+		return false;
+	}
+	UE_LOG(LogFMMS, Log, TEXT("[FMMS] party search refused before it started."));
+	// State only: no flow ran, so there is no phase to fail. Failed accepts a new request (CanRequest) and the TTL
+	// returns the UI to Idle.
+	SetMatchmakingState(EFoundryMatchmakingState::Failed, Refusal, LobbyNoticeTtlSeconds);
+	return true;
+}
+
+FString UFMMSSubsystem::SearchingMessage() const
+{
+	if (bFollowing)
+	{
+		return FString::Printf(TEXT("Searching with %s"),
+			FollowLeaderName.IsEmpty() ? TEXT("your party leader") : *FollowLeaderName);
+	}
+	return FoundryMatchmakingCopy::ForWait(EFoundryWaitReason::Searching, 0).ToString();
+}
+
+bool UFMMSSubsystem::TickFollow(float /*DeltaTime*/)
+{
+	// Idle, joined, NOT the leader (a leader's search is its own submit), in a party of 2+, with live social
+	// surfaces: exactly the lobby moment a leader's Find Match creates this member's ticket. Anything else
+	// costs nothing - same idle gating as the social poller (zero consumers = no network at all).
+	if (bMyTicketQueryInFlight || bMatchmakingFixture || !CanAdoptFollowedTicket())
+	{
+		return true;
+	}
+	const UFoundrySocialSubsystem* S = Social();
+	if (S == nullptr || S->IsFixtureActive() || !S->IsSignedIn() || !S->HasConsumers() || !S->HasParty()
+		|| S->JoinedCount() < 2 || S->IsLocalLeader())
+	{
+		return true;
+	}
+	// fid creates a ticket ONLY for members ready in the queue's game, so an unready member has nothing to find
+	// - and every read takes the core mutex, which the game thread can end up waiting on (a chat-channel call
+	// parks behind a worker's HTTP round trip; fsdk-core-lock-ui.md). No ready flag in this game, no poll.
+	if (!S->IsSelfReadyIn(S->GameSlug()))
+	{
+		return true;
+	}
+	UFoundryFSDKSubsystem* Sdk = Fsdk();
+	if (Sdk == nullptr || !Sdk->IsLoggedIn())
+	{
+		return true;
+	}
+	BindOnce(Sdk);
+	bMyTicketQueryInFlight = true;
+	Sdk->QueryMyTicket(); // worker thread; answers HandleMyTicket on the game thread
+	return true;
+}
+
+bool UFMMSSubsystem::CanAdoptFollowedTicket() const
+{
+	// Idle, or Failed: a failed search (a solo one, an expired followed ticket, a refused submit) leaves the
+	// phase on Failed - nothing returns it to Idle by itself, and a member stuck there would never follow the
+	// leader's next start, seating the party a man short. Failed accepts a new request everywhere else too.
+	const bool bPhaseOk = Phase == EFMMSPhase::Idle || Phase == EFMMSPhase::Failed;
+	const bool bStateOk = MatchmakingState == EFoundryMatchmakingState::Idle
+		|| MatchmakingState == EFoundryMatchmakingState::Failed;
+	return bPhaseOk && bStateOk;
+}
+
+void UFMMSSubsystem::HandleMyTicket(EFoundryFsdkResult Result, FFoundryMyTicket Ticket)
+{
+	bMyTicketQueryInFlight = false;
+	ApplyMyTicket(Result, Ticket);
+}
+
+void UFMMSSubsystem::ApplyMyTicket(EFoundryFsdkResult Result, const FFoundryMyTicket& InTicket)
+{
+	const FFoundryMyTicket Ticket = InTicket; // copy first: BeginFollow's broadcasts re-enter other listeners
+	if (Result != EFoundryFsdkResult::Ok || Ticket.TicketId.IsEmpty() || Ticket.LeaderFoundryId.IsEmpty())
+	{
+		return; // no live ticket (the quiet 404), or a SOLO ticket - nothing of a party's to follow
+	}
+	// The read raced the UI: a search, a cancel or a fixture may have started while it was in flight.
+	if (bMatchmakingFixture || !CanAdoptFollowedTicket())
+	{
+		return;
+	}
+	const UFoundrySocialSubsystem* S = Social();
+	if (S == nullptr || !S->HasParty() || S->JoinedCount() < 2)
+	{
+		return;
+	}
+	// Ready is per game: a member who readied in Goo and is now inside another kit game must not adopt a
+	// goo-crew ticket and travel to the wrong binary. Compared only when both sides name a game (a bare id
+	// key, or a kit with no slug, defers to fid).
+	{
+		const FString TicketGame = FoundryQueueKey::GameSlug(Ticket.QueueKey);
+		const FString MyGame = S->GameSlug();
+		if (!TicketGame.IsEmpty() && !MyGame.IsEmpty() && !TicketGame.Equals(MyGame, ESearchCase::IgnoreCase))
+		{
+			return;
+		}
+	}
+	if (Ticket.LeaderFoundryId == S->LocalFoundryId())
+	{
+		return; // the leader's own ticket is its own submit, never followed (its id is not tracked: a cancel race could resume a zombie)
+	}
+	if (Ticket.TicketId == DismissedFollowTicketId || Ticket.TicketId == EndedTicketId)
+	{
+		return; // a ticket this client already followed and ended, or a seat it released: fid's cancel may lag
+	}
+	BeginFollow(Ticket);
+}
+
+void UFMMSSubsystem::BeginFollow(const FFoundryMyTicket& Ticket)
+{
+	UE_LOG(LogFMMS, Log, TEXT("[FMMS] following the party leader's search."));
+	FollowedTicketId = Ticket.TicketId;
+	FollowLeaderName = Social() ? Social()->LeaderDisplayName() : FString();
+	bFollowing = true;
+	bFollowResumePending = true;
+	// A new search is accepted: the previous match's end no longer applies (FindMatch does the same resets).
+	bMatchEndedNotified = false;
+	bSeatReleased = false;
+	EndedTicketId.Reset();
+	KnownTicketId = Ticket.TicketId; // so NotifyMatchEnded / Cancel know which seat this client holds
+	CurrentMatchId.Reset();
+	PendingQueue = Ticket.QueueKey;
+	PendingAttributes = TEXT("{}");
+	bCancelPending = false;
+	SetPhase(EFMMSPhase::Searching, SearchingMessage());
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		BindOnce(Sdk);
+		Sdk->ResumeFollowedTicket(Ticket.TicketId); // answers HandleRequest (bFollowResumePending)
+	}
+	else
+	{
+		// Unreachable in a running game (the ticket came from the SDK); the state above is still advanced so
+		// the automation test can pin it on a bare GameInstance.
+		UE_LOG(LogFMMS, Log, TEXT("[FMMS] follow without an SDK - state set, ticket not adopted."));
+	}
+}
+
+void UFMMSSubsystem::EndFollow()
+{
+	if (!FollowedTicketId.IsEmpty())
+	{
+		DismissedFollowTicketId = FollowedTicketId;
+	}
+	bFollowing = false;
+	bFollowResumePending = false;
+	FollowedTicketId.Reset();
+	FollowLeaderName.Reset();
+}
+
 void UFMMSSubsystem::Poll()
 {
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
@@ -649,6 +896,13 @@ void UFMMSSubsystem::StopPolling()
 void UFMMSSubsystem::SetPhase(EFMMSPhase NewPhase, const FString& Message, double MessageTtlSeconds)
 {
 	Phase = NewPhase;
+	// Follow mode lasts exactly as long as the search: any phase that is not a live search (Idle after a
+	// cancel / match over / refused join, Failed, Traveling, Reconnectable) ends it and remembers the ticket.
+	if (bFollowing && NewPhase != EFMMSPhase::Searching && NewPhase != EFMMSPhase::WaitingForCapacity
+		&& NewPhase != EFMMSPhase::Requesting && NewPhase != EFMMSPhase::Connecting)
+	{
+		EndFollow();
+	}
 	UE_LOG(LogFMMS, Log, TEXT("[FMMS] phase=%d %s"), (int32)NewPhase, *Message);
 	// The dev console mirrors these itself: it subscribes OnFMMSStatus at Initialize
 	// (HandleFmmsStatus -> "[fmms] ..."), which survives Shipping (event-driven, not a
@@ -765,6 +1019,12 @@ bool UFMMSSubsystem::RequestFindMatch(const FString& Queue, const FString& Attri
 	// a delegate this object fires.
 	const FString QueueCopy = Queue;
 	const FString AttributesCopy = AttributesJson;
+	// A party search is the LEADER's, and only once everyone is ready in this queue's game. Refused here,
+	// before the Pending broadcast, so no clock starts and no flow begins (fid enforces the same rules).
+	if (RefuseSearchForParty(QueueCopy))
+	{
+		return false;
+	}
 	const EFoundryMatchmakingState Before = MatchmakingState;
 	SearchClockStartedAt = MatchmakingClockNow();
 	bSearchClockRunning = true;

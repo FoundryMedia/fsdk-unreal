@@ -91,6 +91,99 @@ bool FFoundryPartyRulesCapTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFoundryPartyRulesReadyGateTest, "FoundryFSDKUI.PartyRules.FindMatchGate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+bool FFoundryPartyRulesReadyGateTest::RunTest(const FString& Parameters)
+{
+	// -- the slug a queue key names (the prefix fid checks the ready flag against)
+	TestEqual(TEXT("queue key -> game slug"), GameSlugOfQueue(TEXT("goo-crew/solo")), FString(TEXT("goo-crew")));
+	TestEqual(TEXT("a bare key (id / name) names no game: fid decides"), GameSlugOfQueue(TEXT("conquest")), FString());
+	TestEqual(TEXT("a queue FRN names its game"), GameSlugOfQueue(TEXT("frn:fmms:482910573312:queue/goo-crew/solo")), FString(TEXT("goo-crew")));
+	TestEqual(TEXT("an empty key has no slug"), GameSlugOfQueue(FString()), FString());
+	TestEqual(TEXT("only the first slash splits"), GameSlugOfQueue(TEXT("a/b/c")), FString(TEXT("a")));
+
+	// -- the row sentences
+	TestEqual(TEXT("slug to a player-facing name"), GameDisplayName(TEXT("goo-crew")), FString(TEXT("Goo Crew")));
+	TestEqual(TEXT("ready row names the game"), ReadyStatusText(true, TEXT("goo-crew")), FString(TEXT("Ready in Goo Crew")));
+	TestEqual(TEXT("ready with no game (older fid)"), ReadyStatusText(true, FString()), FString(TEXT("Ready")));
+	TestEqual(TEXT("not ready"), ReadyStatusText(false, TEXT("goo-crew")), FString(TEXT("Not ready")));
+	TestEqual(TEXT("one name"), JoinNames({ TEXT("Ada") }), FString(TEXT("Ada")));
+	TestEqual(TEXT("two names"), JoinNames({ TEXT("Ada"), TEXT("Bo") }), FString(TEXT("Ada and Bo")));
+	TestEqual(TEXT("three names"), JoinNames({ TEXT("Ada"), TEXT("Bo"), TEXT("Cy") }), FString(TEXT("Ada, Bo and Cy")));
+
+	// -- solo / a party of one: not gated, the cluster is unchanged
+	{
+		FFindMatchGateInput In;
+		In.Joined = 1;
+		In.bAllReady = false; // would block a real party; a party of one never waits
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestFalse(TEXT("solo: not gated"), G.bGated);
+		TestTrue(TEXT("solo: button shown + enabled"), G.bShowButton && G.bEnabled);
+		TestTrue(TEXT("solo: label + status left to the caller"), G.Label.IsEmpty() && G.Status.IsEmpty());
+	}
+	// -- the leader, two of three ready: disabled, the unready name on the status line
+	{
+		FFindMatchGateInput In;
+		In.Joined = 3;
+		In.bLocalLeader = true;
+		In.bAllReady = false;
+		In.UnreadyNames = { TEXT("Jedebiah") };
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestTrue(TEXT("leader waiting: gated"), G.bGated);
+		TestTrue(TEXT("leader waiting: button shown"), G.bShowButton);
+		TestFalse(TEXT("leader waiting: disabled"), G.bEnabled);
+		TestEqual(TEXT("leader waiting: label counts the ready"), G.Label, FString(TEXT("FIND MATCH (READY 2 / 3)")));
+		TestEqual(TEXT("leader waiting: status names who"), G.Status, FString(TEXT("Waiting for Jedebiah to ready up")));
+	}
+	// -- two unready names read as a list
+	{
+		FFindMatchGateInput In;
+		In.Joined = 3;
+		In.bAllReady = false;
+		In.UnreadyNames = { TEXT("Ada"), TEXT("Bo") };
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestEqual(TEXT("two waiting: label"), G.Label, FString(TEXT("FIND MATCH (READY 1 / 3)")));
+		TestEqual(TEXT("two waiting: status"), G.Status, FString(TEXT("Waiting for Ada and Bo to ready up")));
+	}
+	// -- the leader, everyone ready: enabled, nothing on the status line
+	{
+		FFindMatchGateInput In;
+		In.Joined = 3;
+		In.bAllReady = true;
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestTrue(TEXT("all ready: enabled"), G.bShowButton && G.bEnabled);
+		TestEqual(TEXT("all ready: label"), G.Label, FString(TEXT("FIND MATCH (READY 3 / 3)")));
+		TestTrue(TEXT("all ready: no waiting sentence"), G.Status.IsEmpty());
+	}
+	// -- not ready but no names known: still blocked, with a sentence
+	{
+		FFindMatchGateInput In;
+		In.Joined = 2;
+		In.bAllReady = false;
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestFalse(TEXT("unknown names: disabled"), G.bEnabled);
+		TestEqual(TEXT("unknown names: generic sentence"), G.Status, FString(TEXT("Waiting for everyone to ready up")));
+		TestEqual(TEXT("unknown names: never reads 2 / 2 on a disabled button"), G.Label, FString(TEXT("FIND MATCH (READY 1 / 2)")));
+	}
+	// -- a non-leader: no button, waiting for the leader, however ready everyone is
+	{
+		FFindMatchGateInput In;
+		In.Joined = 3;
+		In.bLocalLeader = false;
+		In.bAllReady = true;
+		In.LeaderName = TEXT("Justin");
+		const FFindMatchGate G = PlanFindMatch(In);
+		TestTrue(TEXT("member: gated"), G.bGated);
+		TestFalse(TEXT("member: no button"), G.bShowButton);
+		TestFalse(TEXT("member: disabled"), G.bEnabled);
+		TestEqual(TEXT("member: status"), G.Status, FString(TEXT("Waiting for Justin to start")));
+
+		In.LeaderName.Empty();
+		TestEqual(TEXT("member, leader name unknown"), PlanFindMatch(In).Status, FString(TEXT("Waiting for the party leader to start")));
+	}
+	return true;
+}
+
 namespace
 {
 	FFriendMenuContext LeaderContext(EFoundryFriendRowKind Kind)

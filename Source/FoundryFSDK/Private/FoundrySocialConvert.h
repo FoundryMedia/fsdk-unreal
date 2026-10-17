@@ -60,6 +60,7 @@ namespace FoundrySocialConvert
 		M.Username = UTF8_TO_TCHAR(Row.username);
 		M.State = UTF8_TO_TCHAR(Row.state);
 		M.bReady = Row.ready != 0;
+		M.ReadyGameSlug = UTF8_TO_TCHAR(Row.ready_game_slug);
 		M.bInMatch = Row.in_match != 0;
 		M.InvitedAt = ParseIso8601Utc(Row.invited_at);
 		M.ExpiresAt = ParseIso8601Utc(Row.expires_at);

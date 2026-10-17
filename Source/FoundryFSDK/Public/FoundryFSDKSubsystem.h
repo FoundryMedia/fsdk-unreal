@@ -93,6 +93,29 @@ struct FFoundrySessionSeat
 };
 
 /**
+ * The caller's newest live ticket (fsdk_fmms_my_ticket, GET /v1/fmms/tickets/mine). A party member
+ * FOLLOWS the leader's search: fid creates one ticket per joined member when the leader starts, and the
+ * member's client finds its own here (UFMMSSubsystem resumes it and runs the normal poll flow).
+ */
+USTRUCT(BlueprintType)
+struct FFoundryMyTicket
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString TicketId;
+
+	/** The queue's submit key, e.g. "goo-crew/solo". */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString QueueKey;
+
+	/** The party leader's foundryId; EMPTY for a solo ticket (no party) - a client following a party's
+	 *  search ignores a ticket that names no leader. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|FSDK")
+	FString LeaderFoundryId;
+};
+
+/**
  * Server-told reason a ticket is still QUEUED (S5 "matchmaking wait"), mirrors fsdk_wait_reason.
  * Present only while the ticket is QUEUED - read it off FFoundryTicketWait on every
  * OnPollMatchComplete. An older fid that sends no "wait" object degrades to Searching with a 2s
@@ -146,6 +169,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFoundryFsdkResultEvent, EFoundryFsd
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FFoundryFsdkStatusEvent, EFoundryFsdkResult, Result, EFoundryMatchStatus, Status, FFoundryTicketWait, Wait);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkConnectionEvent, EFoundryFsdkResult, Result, FFoundryConnection, Connection);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkSessionSeatEvent, EFoundryFsdkResult, Result, FFoundrySessionSeat, Seat);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFsdkMyTicketEvent, EFoundryFsdkResult, Result, FFoundryMyTicket, Ticket);
 
 // Auth completion delegates - broadcast on the GAME THREAD.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryLoginEvent, EFoundryFsdkResult, Result, const FString&, DisplayName);
@@ -285,6 +309,12 @@ struct FFoundryPartyMember
 	 *  remove / leader-change / disband; a JOIN always starts not-ready. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	bool bReady = false;
+
+	/** The GAME this member is ready in (fid readyGameSlug; empty = not ready, or an older fid). Ready
+	 *  belongs to the game, not the launcher: Find Match is contingent on every joined member being ready
+	 *  in the QUEUE's game, so bReady alone ("ready somewhere") is not enough to search. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString ReadyGameSlug;
 
 	/** Platform in-match flag (fsdk_party_member.in_match): the member's own client set it when it
 	 *  travelled into a match and cleared it at match end / leave; the server also lets it expire (a
@@ -635,6 +665,26 @@ public:
 	void AbandonMatch(const FString& TicketId);
 
 	/**
+	 * Ask the platform for the caller's newest live ticket (GET /v1/fmms/tickets/mine) - how a party
+	 * MEMBER learns the leader's search started (fid creates one ticket per joined member). Async:
+	 * broadcasts OnMyTicketComplete on the game thread. NoMatch = no live ticket (the quiet 404 - the
+	 * normal answer, polled every ~2 s by UFMMSSubsystem's follow mode; also an older fid without the
+	 * route). Runs on a worker thread; never blocks the game thread.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void QueryMyTicket();
+
+	/**
+	 * Adopt a ticket id from QueryMyTicket as the ACTIVE ticket (replaces any current one) so PollMatch /
+	 * GetConnection / CancelMatch drive it like a ticket this client submitted. Local only - no network;
+	 * a resumed handle polls fine while the server still says QUEUED (the poll overwrites the Found the
+	 * resume seeds). Async on a worker (it takes the core lock): broadcasts OnRequestMatchComplete (Ok
+	 * once adopted), the same event a submit answers, so the FMMS flow continues unchanged.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|FSDK")
+	void ResumeFollowedTicket(const FString& TicketId);
+
+	/**
 	 * Tell matchmaking the game OBSERVED the match end (POST /v1/fmms/tickets/{ticketId}/match-ended, keyed on
 	 * the ACTIVE ticket - the one thing every search and reconnect holds, unlike a match id): fid closes that
 	 * match to new seats, so nobody is backfilled into a dead match and my-session stops offering the seat.
@@ -864,11 +914,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void LeaveParty(const FString& PartyId);
 
-	/** Set your own ready flag on the party you're in. Async: OnSocialActionComplete
-	 *  ("party.ready"), followed by an automatic RefreshParty. Cleared server-side on leave/
-	 *  remove/leader-change/disband - never cleared by this subsystem itself. */
+	/** Set your own ready flag on the party you're in, WITHOUT a game: only bReady=false does anything -
+	 *  fid refuses ready=true with "Ready up from inside the game." (the launcher can no longer ready
+	 *  anyone). Same as SetPartyReadyInGame with an empty slug. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void SetPartyReady(const FString& PartyId, bool bReady);
+
+	/** Ready (or un-ready) for a GAME: PUT .../parties/{id}/members/me/ready {ready, gameSlug}. The game
+	 *  slug rides a ready=true (empty slug on ready=true is the refused launcher-shaped request; its
+	 *  sentence lands in LastSocialActionError). Async: OnSocialActionComplete ("party.ready"), followed
+	 *  by an automatic RefreshParty. Cleared server-side on leave/remove/disband and when the member
+	 *  travels into a match (every match needs a fresh ready-up) - never cleared by this subsystem. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void SetPartyReadyInGame(const FString& PartyId, bool bReady, const FString& GameSlug);
 
 	/** Set/clear your own in-match flag on the party you're in. Async: OnSocialActionComplete
 	 *  ("party.in_match"), followed by an automatic RefreshParty. UFMMSSubsystem drives it (set on
@@ -1213,6 +1271,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry|Social")
 	FString LastSocialActionError() const { return CachedLastSocialActionError; }
 
+	/** The platform's own sentence for the LAST refused match request ("Only the party leader can start a
+	 *  search.", "Not everyone is ready in goo-crew: Bo (2 of 3)."), set right before OnRequestMatchComplete
+	 *  fires with a non-Ok result; empty when the platform gave none (offline, a transport failure) or the
+	 *  request was accepted. Safe to show a player. */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FSDK")
+	FString LastMatchRequestError() const { return CachedLastMatchRequestError; }
+
 	/** Login established/refreshed (DisplayName empty for BYO). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Auth")
 	FFoundryLoginEvent OnLoginComplete;
@@ -1235,6 +1300,10 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|FSDK")
 	FFoundryFsdkSessionSeatEvent OnMySessionComplete;
+
+	/** QueryMyTicket answered (game thread). */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|FSDK")
+	FFoundryFsdkMyTicketEvent OnMyTicketComplete;
 
 private:
 	/** Ensure a client exists (lazily create one bound to the default api base). */
@@ -1324,6 +1393,7 @@ private:
 	FString CachedFoundryId;
 	FString CachedUsername;
 	FString CachedLastSocialActionError;
+	FString CachedLastMatchRequestError;
 
 	// ── Chat state ──
 	// The fsdk_chat handle lives inside FFsdkCoreState (same lock as the client -

@@ -459,6 +459,7 @@ void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& At
 	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, QueueCopy, AttrsCopy, bAutoRegion]()
 	{
 		fsdk_result R;
+		FString ServerMessage;
 		{
 			// The auto path may ping each region's probe URL on a cache miss (~once per
 			// 5 min): a few hundred ms holding the core lock, on this worker - other SDK
@@ -481,12 +482,19 @@ void UFoundryFSDKSubsystem::RequestMatch(const FString& Queue, const FString& At
 			{
 				CoreRef->ActiveTicket = Ticket;
 			}
+			else
+			{
+				// fid's sentence for the refusal (a party search the caller does not lead, or one whose
+				// members are not all ready) - read under the same lock, shown verbatim by FMMS.
+				ServerMessage = UTF8_TO_TCHAR(fsdk_last_error_message(CoreRef->Client));
+			}
 		}
 		const EFoundryFsdkResult Result = ToBlueprintResult(R);
-		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, ServerMessage]()
 		{
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
+				Self->CachedLastMatchRequestError = ServerMessage;
 				Self->OnRequestMatchComplete.Broadcast(Result);
 			}
 		});
@@ -701,6 +709,90 @@ void UFoundryFSDKSubsystem::ReconnectMatch(const FString& TicketId)
 			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
 			{
 				Self->OnGetConnectionComplete.Broadcast(Result, Out);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::QueryMyTicket()
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnMyTicketComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundryMyTicket());
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	{
+		fsdk_result R;
+		char TicketId[128] = {};
+		char QueueKey[128] = {};
+		char Leader[64] = {};
+		{
+			// One short GET under the core lock, on this worker - the game thread never waits on it
+			// (fsdk-core-lock-ui.md). Polled every ~2 s while a party member sits Idle, so a 404 is the
+			// expected answer and is not logged.
+			FScopeLock Lock(&CoreRef->CS);
+			R = fsdk_fmms_my_ticket(CoreRef->Client, TicketId, sizeof(TicketId), QueueKey, sizeof(QueueKey),
+				Leader, sizeof(Leader));
+		}
+		FFoundryMyTicket Out;
+		if (R == FSDK_OK)
+		{
+			Out.TicketId = UTF8_TO_TCHAR(TicketId);
+			Out.QueueKey = UTF8_TO_TCHAR(QueueKey);
+			Out.LeaderFoundryId = UTF8_TO_TCHAR(Leader);
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Out]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnMyTicketComplete.Broadcast(Result, Out);
+			}
+		});
+	});
+}
+
+void UFoundryFSDKSubsystem::ResumeFollowedTicket(const FString& TicketId)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = Core;
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr || TicketId.IsEmpty())
+	{
+		OnRequestMatchComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated);
+		return;
+	}
+
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	const FString TicketCopy = TicketId;
+	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, TicketCopy]()
+	{
+		fsdk_result R;
+		{
+			// Adopt the ticket as the ACTIVE one under the lock (the core is not thread-safe, and a poll
+			// worker may be holding it): from here PollMatch / GetConnection / CancelMatch drive it.
+			FScopeLock Lock(&CoreRef->CS);
+			const FTCHARToUTF8 TicketUtf8(*TicketCopy);
+			fsdk_ticket* Ticket = nullptr;
+			R = fsdk_resume_ticket(CoreRef->Client, TicketUtf8.Get(), &Ticket);
+			if (R == FSDK_OK)
+			{
+				if (CoreRef->ActiveTicket != nullptr)
+				{
+					fsdk_ticket_destroy(CoreRef->ActiveTicket);
+				}
+				CoreRef->ActiveTicket = Ticket;
+			}
+		}
+		const EFoundryFsdkResult Result = ToBlueprintResult(R);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->CachedLastMatchRequestError.Reset();
+				Self->OnRequestMatchComplete.Broadcast(Result);
 			}
 		});
 	});
@@ -1590,9 +1682,18 @@ void UFoundryFSDKSubsystem::LeaveParty(const FString& PartyId)
 
 void UFoundryFSDKSubsystem::SetPartyReady(const FString& PartyId, bool bReady)
 {
-	RunSocialAction(TEXT("party.ready"), true, [PartyId, bReady](FFsdkCoreState& State)
+	SetPartyReadyInGame(PartyId, bReady, FString());
+}
+
+void UFoundryFSDKSubsystem::SetPartyReadyInGame(const FString& PartyId, bool bReady, const FString& GameSlug)
+{
+	RunSocialAction(TEXT("party.ready"), true, [PartyId, bReady, GameSlug](FFsdkCoreState& State)
 	{
-		return (int32)fsdk_social_party_set_ready(State.Client, TCHAR_TO_UTF8(*PartyId), bReady ? 1 : 0);
+		// Ready belongs to the GAME: the slug rides a ready=true. An empty slug sends fid the launcher-shaped
+		// request on purpose (NULL) - fid refuses it and its sentence reaches the player via LastSocialActionError.
+		const FTCHARToUTF8 SlugUtf8(*GameSlug);
+		return (int32)fsdk_social_party_set_ready_in_game(State.Client, TCHAR_TO_UTF8(*PartyId), bReady ? 1 : 0,
+			GameSlug.IsEmpty() ? nullptr : SlugUtf8.Get());
 	});
 }
 

@@ -63,6 +63,57 @@ namespace FoundryPartyRules
 	 *  its own presence label. */
 	FOUNDRYFSDKUI_API FString FriendPartyLine(const FString& PresenceGame, bool bInParty, int32 Size, int32 MaxSize);
 
+	// -- ready belongs to the game; Find Match is the leader's, and waits for everyone ----------------------
+
+	/** The game slug a queue key names: "goo-crew/solo" -> "goo-crew" (the key is "{gameSlug}/{modeSlug}", the
+	 *  same prefix fid checks a member's ready slug against). Delegates to FoundryQueueKey::GameSlug: an FRN key
+	 *  ("frn:fmms:<org>:queue/<game>/<mode>") gives its game; a bare id / UUID / name gives "" (the client cannot
+	 *  name the game - fid decides); an empty key gives "". */
+	FOUNDRYFSDKUI_API FString GameSlugOfQueue(const FString& QueueKey);
+
+	/** "goo-crew" -> "Goo Crew": a slug is a URL token, not something to put in front of a player. */
+	FOUNDRYFSDKUI_API FString GameDisplayName(const FString& Slug);
+
+	/** A joined party member's row status: "Ready in Goo Crew" / "Ready" (an older fid sent no game) /
+	 *  "Not ready". The ready flag lives in the GAME, so the row says which game. */
+	FOUNDRYFSDKUI_API FString ReadyStatusText(bool bReady, const FString& ReadyGameSlug);
+
+	/** "Ada" / "Ada and Bo" / "Ada, Bo and Cy". */
+	FOUNDRYFSDKUI_API FString JoinNames(const TArray<FString>& Names);
+
+	/** What the cluster knows about the party when it decides Find Match. A party is 2+ JOINED members; below
+	 *  that nothing here applies (Joined < 2 -> FFindMatchGate stays ungated). */
+	struct FFindMatchGateInput
+	{
+		int32 Joined = 1;
+		bool bLocalLeader = true;
+		/** UFoundrySocialSubsystem::AllReadyIn(the selected queue's game slug). */
+		bool bAllReady = true;
+		/** UnreadyNames(slug): joined members not ready in this game. */
+		TArray<FString> UnreadyNames;
+		/** LeaderDisplayName() - what a waiting member reads. */
+		FString LeaderName;
+	};
+
+	struct FFindMatchGate
+	{
+		/** False = a solo player / one-person party: the cluster behaves exactly as before. */
+		bool bGated = false;
+		/** False for a non-leader: only the leader's Find Match queues the party, so the button is not offered. */
+		bool bShowButton = true;
+		bool bEnabled = true;
+		/** The button label while gated and shown ("FIND MATCH (READY 2 / 3)"); empty keeps the caller's. */
+		FString Label;
+		/** The status line while gated and blocked ("Waiting for Jedebiah to ready up"); empty keeps the caller's. */
+		FString Status;
+	};
+
+	/** The pure gate decision: the leader's button reads "FIND MATCH (READY n / total)" and is enabled only when
+	 *  every joined member is ready in this game (the unready names go on the status line); a non-leader gets no
+	 *  button and "Waiting for <leader> to start". Justin: "find match needs to be contingent on all players ready.
+	 *  that ensures that all players are actually playing the same game." */
+	FOUNDRYFSDKUI_API FFindMatchGate PlanFindMatch(const FFindMatchGateInput& Input);
+
 	// -- which entries a row's context menu offers -----------------------------------------------------
 
 	struct FMenuItemState
