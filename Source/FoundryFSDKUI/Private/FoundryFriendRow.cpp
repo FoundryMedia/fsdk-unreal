@@ -3,8 +3,10 @@
 #include "Components/Button.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
+#include "FoundryPartyRules.h"
 #include "FoundryUISettings.h"
 #include "FoundryUITheme.h"
+#include "HAL/PlatformTime.h"
 
 void UFoundryFriendRow::Setup(const FFoundryFriend& InFriend, EFoundryFriendRowKind InKind, bool bInHost, bool bInLocal,
 	bool bInJoined, const FLinearColor& InTint, const FString& InStatusOverride, bool bInReady)
@@ -15,6 +17,8 @@ void UFoundryFriendRow::Setup(const FFoundryFriend& InFriend, EFoundryFriendRowK
 	bIsLocal = bInLocal;
 	bIsJoined = bInJoined;
 	bIsReady = bInReady;
+	InviteClock = FoundryPartyRules::FInviteClock(); // only SetInviteExpiry (after this Setup) arms the expiry line
+	InviteExpiryAccumulator = 0.0f;
 	Presence = InFriend.Presence;
 	Tint = InTint;
 
@@ -39,7 +43,9 @@ void UFoundryFriendRow::Setup(const FFoundryFriend& InFriend, EFoundryFriendRowK
 	{
 		StatusText->SetColorAndOpacity(FSlateColor(bBlocked ? Palette.TextSecondary : FoundryUITheme::PresenceColor(InFriend.Presence)));
 	}
-	Show(StatusText, !(bInHost && bInJoined));
+	// The host's status line is normally replaced by the HostBadge; an explicit override ("In match") still
+	// shows, or a party leader in a match would be the one member whose state the lobby cannot show.
+	Show(StatusText, !(bInHost && bInJoined) || !InStatusOverride.IsEmpty());
 	Show(HostBadge, bInHost && bInJoined);
 	Show(ReadyIcon, InKind == EFoundryFriendRowKind::Party && bInJoined && bInReady);
 
@@ -57,6 +63,52 @@ void UFoundryFriendRow::Setup(const FFoundryFriend& InFriend, EFoundryFriendRowK
 	// already starts it Collapsed in the tree; a game that wires its own inline action controls it).
 	SetRenderOpacity(bBlocked ? 0.6f : 1.0f);
 	OnRowUpdated();
+}
+
+void UFoundryFriendRow::SetInviteExpiry(const FoundryPartyRules::FInviteClock& InClock)
+{
+	InviteClock = InClock;
+	InviteExpiryAccumulator = 0.0f;
+	RefreshInviteStatus();
+}
+
+bool UFoundryFriendRow::IsInviteExpired() const
+{
+	return !bIsJoined && FoundryPartyRules::IsExpired(InviteClock.RemainingNow(FPlatformTime::Seconds()));
+}
+
+void UFoundryFriendRow::RefreshInviteStatus()
+{
+	if (bIsJoined || !InviteClock.IsSet())
+	{
+		return;
+	}
+	const double Remaining = InviteClock.RemainingNow(FPlatformTime::Seconds());
+	const bool bExpiredNow = FoundryPartyRules::IsExpired(Remaining);
+	SetText(StatusText, bExpiredNow
+		? FString(TEXT("Invite expired"))
+		: FString::Printf(TEXT("Invited - %s"), *FoundryPartyRules::ExpiryText(Remaining)));
+	if (StatusText)
+	{
+		const FFoundryUIPalette& Palette = UFoundryUISettings::Get()->Palette;
+		StatusText->SetColorAndOpacity(FSlateColor(bExpiredNow ? Palette.Error : Palette.TextSecondary));
+	}
+}
+
+void UFoundryFriendRow::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+	// Pending rows only: once a second is enough for a minutes-granular line.
+	if (bIsJoined || !InviteClock.IsSet())
+	{
+		return;
+	}
+	InviteExpiryAccumulator += InDeltaTime;
+	if (InviteExpiryAccumulator >= 1.0f)
+	{
+		InviteExpiryAccumulator = 0.0f;
+		RefreshInviteStatus();
+	}
 }
 
 FReply UFoundryFriendRow::NativeOnMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)

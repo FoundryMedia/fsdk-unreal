@@ -69,7 +69,9 @@ void UFoundryAppBar::Refresh()
 	}
 	SetText(TitleText, GetTitle().ToString());
 
-	const int32 N = S ? (S->Invites().Num() + S->PendingRequests()) : 0;
+	// Party invites + friend requests + (leader only - the list is empty for everyone else) the players
+	// asking to join your party: all three wait on the player, so all three light the badge.
+	const int32 N = S ? (S->Invites().Num() + S->PendingRequests() + S->JoinRequests().Num()) : 0;
 	Show(SocialBadge, N > 0);
 	SetText(SocialBadgeText, N > 9 ? FString(TEXT("9+")) : FString::FromInt(N));
 	if (SocialButton)

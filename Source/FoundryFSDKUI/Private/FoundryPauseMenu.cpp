@@ -171,11 +171,8 @@ void UFoundryPauseMenu::HandleConfirmedPrimary()
 
 	if (ConfirmedContext == EFoundryPauseContext::Match)
 	{
-		if (UObject* Host = FindMenuHost())
-		{
-			IFoundryMenuHost::Execute_RequestLeaveMatch(Host);
-		}
-		else
+		// Through the shared helper so a party leader's leave also takes the party (post-horn only).
+		if (!LeaveMatchViaHost())
 		{
 			UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[UI] %s confirmed LEAVE MATCH with no menu host - nothing to leave to."), *GetClass()->GetName());
 		}

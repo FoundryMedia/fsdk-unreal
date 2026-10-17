@@ -7,6 +7,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
 #include "FoundryFSDKUILog.h"
+#include "FoundryPartyRules.h"
 #include "FoundrySocialSubsystem.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
@@ -117,6 +118,7 @@ void UFoundryMatchCluster::NativeConstruct()
 	{
 		StatusNormalColor = StatusText->GetColorAndOpacity(); // the designer's colour
 		bStatusColorCaptured = true;
+		bDesignerWrapsStatus = StatusText->GetWrapTextAt() > 0.0f || StatusText->GetAutoWrapText();
 	}
 	Super::NativeConstruct();
 
@@ -170,6 +172,22 @@ void UFoundryMatchCluster::ResolveSelectedMode()
 	}
 }
 
+void UFoundryMatchCluster::SyncSelectedQueueKey()
+{
+	UFoundrySocialSubsystem* S = Social();
+	if (!S)
+	{
+		return;
+	}
+	// The drawer's invite gate and header measure the party against THIS mode's cap in game (D4a), so
+	// the subsystem has to know which queue is picked. Only on a change: SetSelectedQueueKey may notify.
+	const FString Key = Modes.IsValidIndex(SelectedModeIndex) ? Modes[SelectedModeIndex].QueueName : FString();
+	if (S->SelectedQueueKey() != Key)
+	{
+		S->SetSelectedQueueKey(Key);
+	}
+}
+
 void UFoundryMatchCluster::Refresh()
 {
 	using EState = EFoundryMatchmakingState;
@@ -184,6 +202,14 @@ void UFoundryMatchCluster::Refresh()
 
 	Modes = GetModes();
 	ResolveSelectedMode();
+	SyncSelectedQueueKey();
+
+	// The selected mode's party cap (-1 until the platform answered) vs the party - a party bigger than
+	// the mode holds can neither queue for it nor be seated by it (fid answers 409 on submit).
+	const FString SelectedQueue = Modes.IsValidIndex(SelectedModeIndex) ? Modes[SelectedModeIndex].QueueName : FString();
+	const int32 SelectedModeCap = (S && !SelectedQueue.IsEmpty()) ? S->PartyCapForQueue(SelectedQueue) : -1;
+	const int32 PartyJoined = S ? FMath::Max(1, S->JoinedCount()) : 1;
+	const bool bPartyTooBig = FoundryPartyRules::IsTooBig(PartyJoined, SelectedModeCap);
 
 	// -- mode pill
 	if (Modes.IsValidIndex(SelectedModeIndex))
@@ -270,6 +296,15 @@ void UFoundryMatchCluster::Refresh()
 		break;
 	}
 
+	// Find Match is refused, with the reason on the status line, while the party does not fit the mode
+	// (Idle / Failed are the only states a new search can start from; the sentence replaces a stale failure).
+	const bool bTooBigBlocksFind = bPartyTooBig && bSigned && (State == EState::Idle || State == EState::Failed);
+	if (bTooBigBlocksFind)
+	{
+		Status = FoundryPartyRules::TooBigText(PartyJoined, SelectedModeCap);
+		bPrimaryEnabled = false;
+	}
+
 	// The label is CANCEL SEARCH exactly when the primary button is the cancel.
 	const bool bCancelLabel = Label == TEXT("CANCEL SEARCH");
 	const bool bSplitCancel = CancelButton != nullptr && bCancelLabel;
@@ -290,7 +325,7 @@ void UFoundryMatchCluster::Refresh()
 	SetText(StatusText, Status.IsEmpty() ? FString(TEXT(" ")) : Status); // a blank line keeps the row's height
 	if (StatusText && bStatusColorCaptured)
 	{
-		StatusText->SetColorAndOpacity(State == EState::Failed ? FSlateColor(UFoundryUISettings::Get()->Palette.Error) : StatusNormalColor);
+		StatusText->SetColorAndOpacity((State == EState::Failed || bTooBigBlocksFind) ? FSlateColor(UFoundryUISettings::Get()->Palette.Error) : StatusNormalColor);
 	}
 	RefreshSpinner(bShowSpinner);
 	Show(LeaveMatchButton, bShowLeave, true);
@@ -303,7 +338,7 @@ void UFoundryMatchCluster::Refresh()
 	}
 
 	// -- "Party N / cap": solo reads as a party of one
-	SetText(PartyText, S && bSigned ? FString::Printf(TEXT("Party %d / %d"), FMath::Max(1, S->JoinedCount()), S->PartyCapacity()) : FString());
+	SetText(PartyText, S && bSigned ? FString::Printf(TEXT("Party %d / %d"), PartyJoined, FoundryPartyRules::CapFor(*S)) : FString());
 
 	LastElapsedShown = -2;
 	if (!bHaveLastState || State != LastState)
@@ -343,6 +378,20 @@ void UFoundryMatchCluster::NativeTick(const FGeometry& MyGeometry, float InDelta
 	{
 		SpinAngle = FMath::Fmod(SpinAngle + 360.0f * InDeltaTime, 360.0f);
 		Spinner->SetRenderTransformAngle(SpinAngle);
+	}
+
+	// A long status line ("we're starting a server for you ... (~8 min left)") must never run out
+	// from under the button into whatever sits beside the cluster (the lobby chat panel): wrap it at
+	// the FindMatchButton's rendered width unless the Designer wraps it already. The button is the one
+	// element whose width is a design constant, and its geometry exists only once laid out - hence here.
+	if (StatusText && FindMatchButton && !bDesignerWrapsStatus)
+	{
+		const float ButtonWidth = FindMatchButton->GetCachedGeometry().GetLocalSize().X;
+		if (ButtonWidth > 0.0f && !FMath::IsNearlyEqual(ButtonWidth, StatusWrapWidth))
+		{
+			StatusWrapWidth = ButtonWidth;
+			StatusText->SetWrapTextAt(ButtonWidth);
+		}
 	}
 
 	const UFMMSSubsystem* F = Fmms();
@@ -389,6 +438,12 @@ void UFoundryMatchCluster::RebuildModeRows()
 		}
 		ModeList->AddChild(Row);
 		Row->Setup(i, Mode.DisplayName, Mode.Detail, i == SelectedModeIndex, !Mode.QueueName.IsEmpty());
+		// "Which modes fit the current party": a mode that holds fewer players than the party shows why and
+		// cannot be picked.
+		if (const UFoundrySocialSubsystem* S = Social())
+		{
+			Row->SetPartyGate(FMath::Max(1, S->JoinedCount()), Mode.QueueName.IsEmpty() ? -1 : S->PartyCapForQueue(Mode.QueueName));
+		}
 		Row->OnPicked.AddWeakLambda(this, [this](int32 Index)
 		{
 			// Close first: SelectMode refreshes, and a refresh with the menu still open would rebuild
@@ -414,6 +469,7 @@ void UFoundryMatchCluster::SelectMode(int32 Index)
 		return;
 	}
 	SelectedModeIndex = Index;
+	SyncSelectedQueueKey();
 	Refresh();
 }
 
@@ -508,6 +564,13 @@ void UFoundryMatchCluster::HandleFindMatch()
 				break;
 			}
 			const UFoundrySocialSubsystem* S = Social();
+			// Refused here too (the button is disabled, but a key binding / Blueprint can still call this):
+			// the same sentence the status line shows.
+			if (S && FoundryPartyRules::IsTooBig(FMath::Max(1, S->JoinedCount()), S->PartyCapForQueue(Modes[SelectedModeIndex].QueueName)))
+			{
+				Refresh();
+				break;
+			}
 			const FString PartyId = S ? S->Party().PartyId : FString();
 			// Values, not references: RequestFindMatch broadcasts Pending before it consumes its arguments and
 			// this widget's HandleFmmsState -> Refresh() reassigns Modes on that broadcast (the 0.1.1 crash).

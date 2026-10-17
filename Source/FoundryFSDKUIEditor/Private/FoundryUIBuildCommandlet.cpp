@@ -1357,8 +1357,20 @@ namespace
 		Root.P(TEXT("Fill"), TEXT("SurfaceLow")).P(TEXT("Radius"), 16.0f);
 		Root.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
 			.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("12,8,12,8"))
-			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("LeaderText"), true }
-				.P(TEXT("FontSize"), 16.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("Size"), TEXT("Fill")))
+			// Leader line on top, "N / cap" + the live "expires in 3 min" / "Expired" line under it
+			// (UFoundryInviteRow: an invite has a lifetime on the wire, so the row says how long is left).
+			// The same row serves the leader's join-request block ("<name> wants to join your party"),
+			// which hides both lines.
+			.C(FFoundryWidgetSpec{ TEXT("VerticalBox") }
+				.P(TEXT("Size"), TEXT("Fill"))
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("LeaderText"), true }
+					.P(TEXT("FontSize"), 16.0f).P(TEXT("Color"), TEXT("Text")))
+				.C(FFoundryWidgetSpec{ TEXT("HorizontalBox") }
+					.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("SizeText"), true }
+						.P(TEXT("FontSize"), 13.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("SlotPad"), TEXT("0,0,12,0")))
+					// Resting colour only - UFoundryInviteRow turns it Error once the invite has expired.
+					.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("ExpiryText"), true }
+						.P(TEXT("FontSize"), 13.0f).P(TEXT("Color"), TEXT("TextSecondary")))))
 			.C(FFoundryWidgetSpec{ TEXT("Button"), TEXT("AcceptButton"), true }
 				.P(TEXT("Normal"), TEXT("Secondary")).P(TEXT("HalfHeight"), TEXT("1"))
 				.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
@@ -1400,7 +1412,11 @@ namespace
 			.C(FFoundryWidgetSpec{ TEXT("VerticalBox"), TEXT("ItemsPanel"), true }
 				.C(MenuItemButton(TEXT("SendMessageButton"), TEXT("icon_send"), TEXT("Send Message"), TEXT("Text")))
 				.C(MenuItemButton(TEXT("InviteButton"), TEXT("icon_group_plus"), TEXT("Invite"), TEXT("Text")))
-				.C(MenuItemButton(TEXT("RequestJoinButton"), TEXT("icon_group_question"), TEXT("Request to Join"), TEXT("Text")))
+				.C(MenuItemButton(TEXT("RequestJoinButton"), TEXT("icon_group_question"), TEXT("Ask to Join"), TEXT("Text")))
+				// Party roster entries (leader only; the runtime shows each only on the rows it applies to).
+				.C(MenuItemButton(TEXT("ReInviteButton"), TEXT("icon_send"), TEXT("Re-invite"), TEXT("Text")))
+				.C(MenuItemButton(TEXT("CancelInviteButton"), TEXT("icon_close"), TEXT("Cancel Invite"), TEXT("Text")))
+				.C(MenuItemButton(TEXT("KickButton"), TEXT("icon_person_minus"), TEXT("Remove from Party"), TEXT("Error")))
 				.C(MenuItemButton(TEXT("RemoveFriendButton"), TEXT("icon_person_minus"), TEXT("Remove Friend"), TEXT("Text")))
 				.C(MenuItemButton(TEXT("BlockButton"), TEXT("icon_block"), TEXT("Block Player"), TEXT("Error")))
 				.C(MenuItemButton(TEXT("UnblockButton"), TEXT("icon_block"), TEXT("Unblock"), TEXT("Text"))))
@@ -1448,7 +1464,15 @@ namespace
 					.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("6,0,0,0")))
 				.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("ReadyIcon"), true }
 					.P(TEXT("Icon"), TEXT("icon_check")).P(TEXT("IconW"), 14.0f).P(TEXT("IconH"), 14.0f).P(TEXT("Tint"), TEXT("Online"))
-					.P(TEXT("SlotPad"), TEXT("6,0,0,0")))));
+					.P(TEXT("SlotPad"), TEXT("6,0,0,0")))
+				// Inline at the end of the pill row (not an overlay) so it can never cover the name; shown
+				// only while the member is in a match (UFoundryPartyNameplate::Setup bInMatch).
+				.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("InMatchBadge"), true }
+					.P(TEXT("Fill"), TEXT("Secondary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("Collapsed"), TEXT("1"))
+					.P(TEXT("SlotPad"), TEXT("8,0,0,0"))
+					.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
+						.P(TEXT("Text"), TEXT("IN MATCH")).P(TEXT("FontSize"), 10.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Surface"))
+						.P(TEXT("SlotPad"), TEXT("8,1,8,1"))))));
 
 		Root.C(FFoundryWidgetSpec{ TEXT("Border"), TEXT("HostBadge"), true }
 			.P(TEXT("Fill"), TEXT("Tertiary")).P(TEXT("HalfHeight"), TEXT("1")).P(TEXT("HAlign"), TEXT("Center")).P(TEXT("VAlign"), TEXT("Bottom"))
@@ -1561,6 +1585,14 @@ namespace
 				.P(TEXT("Text"), TEXT("PARTY INVITES")).P(TEXT("FontSize"), 18.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text"))
 				.P(TEXT("FontRole"), TEXT("Heading")))
 			.C(FFoundryWidgetSpec{ TEXT("VerticalBox"), TEXT("InvitesList"), true }));
+		// The leader's "who asked to join my party" block - invite rows in join-request mode
+		// (UFoundrySocialDrawer shows it only while the local player leads and the list is non-empty).
+		Scroll.C(FFoundryWidgetSpec{ TEXT("VerticalBox"), TEXT("JoinRequestsSection"), true }
+			.P(TEXT("SlotPad"), TEXT("0,16,0,0"))
+			.C(FFoundryWidgetSpec{ TEXT("TextBlock") }
+				.P(TEXT("Text"), TEXT("JOIN REQUESTS")).P(TEXT("FontSize"), 18.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text"))
+				.P(TEXT("FontRole"), TEXT("Heading")))
+			.C(FFoundryWidgetSpec{ TEXT("VerticalBox"), TEXT("JoinRequestsList"), true }));
 		Scroll.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("RequestsNote"), true }
 			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("Wrap"), TEXT("1")).P(TEXT("SlotPad"), TEXT("0,12,0,0")));
 
@@ -1838,6 +1870,7 @@ namespace
 		FFoundryWidgetSpec InterfaceSection = SettingsSection(TEXT("InterfaceSection"), TEXT("INTERFACE"));
 		InterfaceSection.C(SettingsRow(TEXT("UIScaleRow"), TEXT("UI scale"), SliderControl(TEXT("UIScaleSlider"), TEXT("UIScaleValueText"), 0.75f, 1.5f)));
 		InterfaceSection.C(SettingsRow(TEXT("ReducedMotionRow"), TEXT("Reduced motion"), FFoundryWidgetSpec{ TEXT("CheckBox"), TEXT("ReducedMotionCheck"), true }));
+		InterfaceSection.C(SettingsRow(TEXT("DeveloperModeRow"), TEXT("Developer mode"), FFoundryWidgetSpec{ TEXT("CheckBox"), TEXT("DeveloperModeCheck"), true }));
 
 		// CONTROLS - the header is its OWN named row (ControlsRow), built inline rather than via
 		// SettingsSection, so the hover-to-describe pass treats it like every other row; the keybind
@@ -2164,7 +2197,11 @@ namespace
 				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("LabelText"), true }
 					.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")))
 				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("DetailText"), true }
-					.P(TEXT("FontSize"), 12.0f).P(TEXT("Color"), TEXT("TextSecondary"))))
+					.P(TEXT("FontSize"), 12.0f).P(TEXT("Color"), TEXT("TextSecondary")))
+				// "Party too big (8 > 4)" - UFoundryModeRow::SetPartyGate shows it (and disables the row)
+				// only while the party exceeds this mode's cap.
+				.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("PartyTooBigText"), true }
+					.P(TEXT("FontSize"), 12.0f).P(TEXT("Color"), TEXT("Error")).P(TEXT("Collapsed"), TEXT("1"))))
 			.C(FFoundryWidgetSpec{ TEXT("Image"), TEXT("CheckIcon"), true }
 				.P(TEXT("Icon"), TEXT("icon_check")).P(TEXT("IconW"), 16.0f).P(TEXT("IconH"), 16.0f).P(TEXT("Tint"), TEXT("Online"))
 				.P(TEXT("Collapsed"), TEXT("1")).P(TEXT("SlotPad"), TEXT("12,0,0,0"))));

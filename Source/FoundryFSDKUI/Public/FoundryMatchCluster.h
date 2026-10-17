@@ -131,6 +131,8 @@ private:
 	void HandleFmmsState(EFoundryMatchmakingState State, const FString& Message);
 
 	void Refresh();
+	/** Tells the social subsystem which queue the picked mode is, so party caps follow the mode. */
+	void SyncSelectedQueueKey();
 	void RefreshSpinner(bool bShow);
 	void SetModeMenuOpen(bool bOpen);
 	void RebuildModeRows();
@@ -156,4 +158,8 @@ private:
 	int32 LastElapsedShown = -2;
 	bool bSpinnerBusy = false;
 	float SpinAngle = 0.0f;
+	/** True when the WBP wraps StatusText itself (Wrap Text At / Auto Wrap Text set in the Designer). */
+	bool bDesignerWrapsStatus = false;
+	/** The FindMatchButton width StatusText was last wrapped at (0 = not yet laid out). */
+	float StatusWrapWidth = 0.0f;
 };

@@ -258,6 +258,16 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Input")
 	TArray<TSoftObjectPtr<UInputMappingContext>> RebindableContexts;
 
+	/**
+	 * When the party LEADER leaves a FINISHED match, the rest of their party leaves with them (a leader who
+	 * leaves a match that is still running leaves alone). Applies to a game whose PlayerController carries a
+	 * UFoundryPartyFollowComponent; set false to keep every member's leave their own. Pushed into the core
+	 * FoundryFSDK module once at FoundryFSDKUI startup (ApplyPartyDefaults) - the core module never
+	 * references this class.
+	 */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Party")
+	bool bPartyFollowsLeaderOnLeave = true;
+
 	/** Master switch for the boot splash (UFoundryBootSplashSubsystem::TryPlay). False = the game goes straight to its menu. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	bool bShowBootSplash = true;
@@ -329,6 +339,10 @@ public:
 	 *  before any matchmaking flow runs (FoundryMatchmakingCopy's override hooks are "set once",
 	 *  not thread-safe for repeated calls). */
 	static void ApplyMatchmakingCopyOverrides();
+
+	/** Push bPartyFollowsLeaderOnLeave + the kit's leave executor (IFoundryMenuHost::RequestLeaveMatch) into
+	 *  UFoundryPartyFollowComponent (core module). Call once at startup (FFoundryFSDKUIModule::StartupModule). */
+	static void ApplyPartyDefaults();
 
 	/** Synchronous load of a soft widget class. Null (and a log line naming the setting) when unset
 	 *  or missing. */

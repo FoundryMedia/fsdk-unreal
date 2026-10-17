@@ -36,6 +36,8 @@ void UFoundrySocialSubsystem::Deinitialize()
 		Sdk->OnFriendsUpdated.RemoveAll(this);
 		Sdk->OnPendingUpdated.RemoveAll(this);
 		Sdk->OnBlockedUpdated.RemoveAll(this);
+		Sdk->OnPartyJoinRequestsUpdated.RemoveAll(this);
+		Sdk->OnPartyCapUpdated.RemoveAll(this);
 		Sdk->OnSocialActionComplete.RemoveAll(this);
 	}
 	Super::Deinitialize();
@@ -60,6 +62,8 @@ void UFoundrySocialSubsystem::BindOnce()
 	Sdk->OnFriendsUpdated.AddDynamic(this, &UFoundrySocialSubsystem::HandleFriends);
 	Sdk->OnPendingUpdated.AddDynamic(this, &UFoundrySocialSubsystem::HandlePending);
 	Sdk->OnBlockedUpdated.AddDynamic(this, &UFoundrySocialSubsystem::HandleBlocked);
+	Sdk->OnPartyJoinRequestsUpdated.AddDynamic(this, &UFoundrySocialSubsystem::HandleJoinRequests);
+	Sdk->OnPartyCapUpdated.AddDynamic(this, &UFoundrySocialSubsystem::HandlePartyCap);
 	Sdk->OnSocialActionComplete.AddDynamic(this, &UFoundrySocialSubsystem::HandleSocialAction);
 	bBound = true;
 }
@@ -146,10 +150,12 @@ void UFoundrySocialSubsystem::RefreshNow()
 				Now - LastPollStartTime, PollReadsOutstanding);
 		}
 		LastPollStartTime = Now;
-		// RefreshParty + RefreshPartyInvites + RefreshFriends + RefreshPendingRequests + RefreshBlocked -
-		// NotePollAnswered (one per handler below) counts these five down and coalesces them into ONE
-		// OnChanged broadcast instead of up to five separate drawer rebuilds.
-		PollReadsOutstanding = 5;
+		// RefreshParty + RefreshPartyInvites + RefreshFriends + RefreshPendingRequests + RefreshBlocked
+		// (+ the join requests while I lead a party) - NotePollAnswered (one per handler below) counts
+		// these down and coalesces them into ONE OnChanged broadcast instead of up to six drawer rebuilds.
+		// Join requests are leader-only server-side, so a non-leader never asks (it would only 404).
+		const bool bPollJoinRequests = HasParty() && IsLocalLeader();
+		PollReadsOutstanding = bPollJoinRequests ? 6 : 5;
 		bPollNotifyPending = false;
 		PollFirstAnswerTime = -1.0;
 		Sdk->RefreshParty();
@@ -157,6 +163,14 @@ void UFoundrySocialSubsystem::RefreshNow()
 		Sdk->RefreshFriends();
 		Sdk->RefreshPendingRequests();
 		Sdk->RefreshBlocked();
+		if (bPollJoinRequests)
+		{
+			Sdk->RefreshPartyJoinRequests(CachedParty.PartyId);
+		}
+		else
+		{
+			CachedJoinRequests.Reset(); // not leading a party: nobody can be waiting on me
+		}
 	}
 }
 
@@ -246,6 +260,137 @@ int32 UFoundrySocialSubsystem::JoinedCount() const
 	return N;
 }
 
+int32 UFoundrySocialSubsystem::LiveInvitedCount() const
+{
+	if (!HasParty())
+	{
+		return 0;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	const FDateTime Now = FDateTime::UtcNow();
+	int32 N = 0;
+	for (const FFoundryPartyMember& M : P.Members)
+	{
+		// Zero ExpiresAt = absent (an older fid never expires an invite).
+		const bool bLive = M.ExpiresAt.GetTicks() == 0 || M.ExpiresAt > Now;
+		N += (M.State.Equals(TEXT("INVITED"), ESearchCase::IgnoreCase) && bLive) ? 1 : 0;
+	}
+	return N;
+}
+
+int32 UFoundrySocialSubsystem::PartyCapForQueue(const FString& InQueueKey) const
+{
+	const FString QueueKey = InQueueKey.TrimStartAndEnd();
+	if (QueueKey.IsEmpty())
+	{
+		return -1;
+	}
+	if (Fixture.bActive)
+	{
+		// A fixture answers from its own table and never reaches the platform.
+		const int32* Simulated = Fixture.PartyCaps.Find(QueueKey);
+		return Simulated != nullptr ? *Simulated : -1;
+	}
+	FPartyCapEntry& Entry = PartyCaps.FindOrAdd(QueueKey);
+	const double Now = FPlatformTime::Seconds();
+	// Unknown, or known but >5 min old: ask once per window. A known value keeps answering meanwhile -
+	// the cap only changes when a dev edits the queue, so a stale number beats flicker.
+	if (Now - Entry.LastRequestTime > 300.0)
+	{
+		Entry.LastRequestTime = Now;
+		const_cast<UFoundrySocialSubsystem*>(this)->RefreshPartyCap(QueueKey);
+	}
+	return Entry.Cap;
+}
+
+void UFoundrySocialSubsystem::SetSelectedQueueKey(const FString& InKey)
+{
+	const FString Key = InKey.TrimStartAndEnd();
+	if (Key == SelectedQueue)
+	{
+		return;
+	}
+	SelectedQueue = Key;
+	(void)PartyCapForQueue(Key); // warm the mode's cap so the picker can show which modes fit the party
+	OnChanged.Broadcast();
+}
+
+void UFoundrySocialSubsystem::RefreshPartyCap(const FString& QueueKey)
+{
+	if (Fixture.bActive || QueueKey.IsEmpty())
+	{
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->RefreshPartyCap(QueueKey);
+	}
+}
+
+bool UFoundrySocialSubsystem::RefuseInFixture(const TCHAR* Action)
+{
+	if (!Fixture.bActive)
+	{
+		return false;
+	}
+	OnActionFailed.Broadcast(Action, TEXT("Dev fixture active - actions are disabled."));
+	return true;
+}
+
+const FFoundryPartyMember* UFoundrySocialSubsystem::FindMember(const FString& FoundryId) const
+{
+	if (!HasParty() || FoundryId.IsEmpty())
+	{
+		return nullptr;
+	}
+	const FFoundryParty& P = Fixture.bActive ? Fixture.Party : CachedParty;
+	return P.Members.FindByPredicate([&FoundryId](const FFoundryPartyMember& M) { return M.FoundryId == FoundryId; });
+}
+
+int32 UFoundrySocialSubsystem::EffectiveInviteCap() const
+{
+	if (!SelectedQueue.IsEmpty())
+	{
+		const int32 ModeCap = PartyCapForQueue(SelectedQueue);
+		if (ModeCap > 0)
+		{
+			return ModeCap;
+		}
+	}
+	const FFoundryParty& P = Party();
+	return P.PlatformMaxSize > 0 ? P.PlatformMaxSize : PartyCapacity();
+}
+
+bool UFoundrySocialSubsystem::PartyIsFull(FString& OutMessage) const
+{
+	// The server's own count: JOINED + live INVITED (an expired invite frees its seat).
+	const int32 Held = JoinedCount() + LiveInvitedCount();
+	const int32 Cap = EffectiveInviteCap();
+	if (Held < Cap)
+	{
+		return false;
+	}
+	const bool bModeCap = !SelectedQueue.IsEmpty() && PartyCapForQueue(SelectedQueue) == Cap;
+	OutMessage = (bModeCap && JoinedCount() > Cap)
+		? FString::Printf(TEXT("This mode's parties hold up to %d (you have %d)."), Cap, JoinedCount())
+		: FString::Printf(TEXT("This party is full (%d of %d)."), Held, Cap);
+	return true;
+}
+
+void UFoundrySocialSubsystem::ExpectSuccess(const TCHAR* Action, const FString& Message)
+{
+	ExpectedSuccess.FindOrAdd(Action).Add(Message);
+}
+
+void UFoundrySocialSubsystem::SendInvite(const FString& Username)
+{
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		ExpectSuccess(TEXT("party.invite"), FString::Printf(TEXT("Invite sent to %s"), *Username));
+		Sdk->InviteToPartyForQueue(CachedParty.PartyId, Username, SelectedQueue);
+	}
+}
+
 // -- actions -------------------------------------------------------------------------------------------
 
 void UFoundrySocialSubsystem::SendFriendRequest(const FString& InUsername)
@@ -255,9 +400,8 @@ void UFoundrySocialSubsystem::SendFriendRequest(const FString& InUsername)
 	{
 		return;
 	}
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("friend.request")))
 	{
-		OnActionFailed.Broadcast(TEXT("friend.request"), TEXT("Dev fixture active - actions are disabled."));
 		return;
 	}
 	// fid answers a repeat request with the same 200 as a fresh one (idempotent by design), so the
@@ -279,6 +423,7 @@ void UFoundrySocialSubsystem::SendFriendRequest(const FString& InUsername)
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
 		InFlightFriendRequestUsername = Key;
+		ExpectSuccess(TEXT("friend.request"), FString::Printf(TEXT("Friend request sent to %s"), *Username));
 		Sdk->SendFriendRequest(Username);
 	}
 }
@@ -290,9 +435,8 @@ void UFoundrySocialSubsystem::InviteByUsername(const FString& InUsername)
 	{
 		return;
 	}
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("party.invite")))
 	{
-		OnActionFailed.Broadcast(TEXT("party.invite"), TEXT("Dev fixture active - actions are disabled."));
 		return;
 	}
 	if (!bSignedIn)
@@ -300,14 +444,35 @@ void UFoundrySocialSubsystem::InviteByUsername(const FString& InUsername)
 		OnActionFailed.Broadcast(TEXT("party.invite"), TEXT("Sign in through the Foundry launcher before inviting."));
 		return;
 	}
-	if (JoinedCount() >= PartyCapacity())
-	{
-		OnActionFailed.Broadcast(TEXT("party.invite"), FString::Printf(TEXT("Party full (%d / %d)."), JoinedCount(), PartyCapacity()));
-		return;
-	}
 	if (HasParty() && !IsLocalLeader())
 	{
 		OnActionFailed.Broadcast(TEXT("party.invite"), TEXT("Only the party host can invite."));
+		return;
+	}
+	// A name already on the roster: JOINED is refused, INVITED is a RE-invite (resets the clock and
+	// re-notifies server-side). An INVITED row must never read as "already in your party" - that made
+	// re-inviting impossible from the game, and a lapsed invite is exactly when you need it.
+	bool bReInvite = false;
+	if (HasParty())
+	{
+		for (const FFoundryPartyMember& M : Party().Members)
+		{
+			if (M.Username.Equals(Username, ESearchCase::IgnoreCase))
+			{
+				if (!M.State.Equals(TEXT("INVITED"), ESearchCase::IgnoreCase))
+				{
+					OnActionFailed.Broadcast(TEXT("party.invite"), FString::Printf(TEXT("%s is already in your party."), *M.DisplayName));
+					return;
+				}
+				bReInvite = true;
+				break;
+			}
+		}
+	}
+	FString FullMessage;
+	if (!bReInvite && PartyIsFull(FullMessage))
+	{
+		OnActionFailed.Broadcast(TEXT("party.invite"), FullMessage);
 		return;
 	}
 	UFoundryFSDKSubsystem* Sdk = Fsdk();
@@ -324,7 +489,7 @@ void UFoundrySocialSubsystem::InviteByUsername(const FString& InUsername)
 	}
 	if (HasParty())
 	{
-		Sdk->InviteToParty(CachedParty.PartyId, Username);
+		SendInvite(Username);
 	}
 	else
 	{
@@ -335,45 +500,170 @@ void UFoundrySocialSubsystem::InviteByUsername(const FString& InUsername)
 	}
 }
 
+void UFoundrySocialSubsystem::ReInvite(const FString& FoundryId)
+{
+	if (RefuseInFixture(TEXT("party.invite")))
+	{
+		return;
+	}
+	if (!HasParty() || !IsLocalLeader())
+	{
+		OnActionFailed.Broadcast(TEXT("party.invite"), TEXT("Only the party host can invite."));
+		return;
+	}
+	const FFoundryPartyMember* M = FindMember(FoundryId);
+	if (M == nullptr)
+	{
+		OnActionFailed.Broadcast(TEXT("party.invite"), TEXT("That player isn't on your invite list any more."));
+		return;
+	}
+	if (!M->State.Equals(TEXT("INVITED"), ESearchCase::IgnoreCase))
+	{
+		OnActionFailed.Broadcast(TEXT("party.invite"), FString::Printf(TEXT("%s is already in your party."), *M->DisplayName));
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		// No fullness pre-check: an INVITED row already holds its seat, so a re-invite never grows the party.
+		ExpectSuccess(TEXT("party.invite"), FString::Printf(TEXT("Invite sent to %s"), *M->DisplayName));
+		Sdk->InviteToPartyById(CachedParty.PartyId, FoundryId, SelectedQueue);
+	}
+}
+
+void UFoundrySocialSubsystem::CancelInvite(const FString& FoundryId)
+{
+	if (RefuseInFixture(TEXT("party.cancel_invite")))
+	{
+		return;
+	}
+	if (!HasParty() || !IsLocalLeader())
+	{
+		OnActionFailed.Broadcast(TEXT("party.cancel_invite"), TEXT("Only the party host can cancel an invite."));
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		ExpectSuccess(TEXT("party.cancel_invite"), TEXT("Invite cancelled"));
+		Sdk->CancelPartyInvite(CachedParty.PartyId, FoundryId);
+	}
+}
+
+void UFoundrySocialSubsystem::Kick(const FString& FoundryId)
+{
+	if (RefuseInFixture(TEXT("party.kick")))
+	{
+		return;
+	}
+	if (!HasParty() || !IsLocalLeader())
+	{
+		OnActionFailed.Broadcast(TEXT("party.kick"), TEXT("Only the party host can remove a member."));
+		return;
+	}
+	if (FoundryId == LocalId)
+	{
+		OnActionFailed.Broadcast(TEXT("party.kick"), TEXT("To go, leave the party."));
+		return;
+	}
+	const FFoundryPartyMember* M = FindMember(FoundryId);
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		ExpectSuccess(TEXT("party.kick"), FString::Printf(TEXT("%s removed from the party"), M != nullptr ? *M->DisplayName : TEXT("Player")));
+		Sdk->KickFromParty(CachedParty.PartyId, FoundryId);
+	}
+}
+
+void UFoundrySocialSubsystem::AcceptJoinRequest(const FString& FoundryId)
+{
+	if (RefuseInFixture(TEXT("party.join_accept")))
+	{
+		return;
+	}
+	if (!HasParty() || !IsLocalLeader())
+	{
+		OnActionFailed.Broadcast(TEXT("party.join_accept"), TEXT("Only the party host can answer a request."));
+		return;
+	}
+	FString FullMessage;
+	if (PartyIsFull(FullMessage))
+	{
+		OnActionFailed.Broadcast(TEXT("party.join_accept"), FullMessage);
+		return;
+	}
+	const FFoundryJoinRequest* Req = JoinRequests().FindByPredicate([&FoundryId](const FFoundryJoinRequest& R) { return R.FoundryId == FoundryId; });
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		ExpectSuccess(TEXT("party.join_accept"), FString::Printf(TEXT("%s joined the party"), Req != nullptr ? *Req->DisplayName : TEXT("Player")));
+		Sdk->AcceptPartyJoinRequestForQueue(CachedParty.PartyId, FoundryId, SelectedQueue);
+	}
+}
+
+void UFoundrySocialSubsystem::DeclineJoinRequest(const FString& FoundryId)
+{
+	if (RefuseInFixture(TEXT("party.join_decline")))
+	{
+		return;
+	}
+	if (!HasParty() || !IsLocalLeader())
+	{
+		OnActionFailed.Broadcast(TEXT("party.join_decline"), TEXT("Only the party host can answer a request."));
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		ExpectSuccess(TEXT("party.join_decline"), TEXT("Request declined"));
+		Sdk->DeclinePartyJoinRequest(CachedParty.PartyId, FoundryId);
+	}
+}
+
 void UFoundrySocialSubsystem::AcceptInvite(const FString& PartyId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("party.accept")))
 	{
 		return;
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		const FFoundryParty* Invite = CachedInvites.FindByPredicate([&PartyId](const FFoundryParty& P) { return P.PartyId == PartyId; });
+		ExpectSuccess(TEXT("party.accept"), (Invite != nullptr && !Invite->LeaderDisplayName.IsEmpty())
+			? FString::Printf(TEXT("Joined %s's party"), *Invite->LeaderDisplayName)
+			: FString(TEXT("Joined the party")));
 		Sdk->AcceptPartyInvite(PartyId);
 	}
 }
 
 void UFoundrySocialSubsystem::DeclineInvite(const FString& PartyId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("party.decline")))
 	{
 		return;
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		ExpectSuccess(TEXT("party.decline"), TEXT("Invite declined"));
 		Sdk->DeclinePartyInvite(PartyId);
 	}
 }
 
 void UFoundrySocialSubsystem::LeaveParty()
 {
-	if (Fixture.bActive || !HasParty())
+	if (RefuseInFixture(TEXT("party.leave")))
+	{
+		return;
+	}
+	if (!HasParty())
 	{
 		return;
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		ExpectSuccess(TEXT("party.leave"), TEXT("You left the party"));
 		Sdk->LeaveParty(CachedParty.PartyId);
 	}
 }
 
 void UFoundrySocialSubsystem::SetReady(bool bReady)
 {
-	if (Fixture.bActive || !HasParty())
+	if (RefuseInFixture(TEXT("party.ready")) || !HasParty())
 	{
 		return;
 	}
@@ -383,9 +673,21 @@ void UFoundrySocialSubsystem::SetReady(bool bReady)
 	}
 }
 
+void UFoundrySocialSubsystem::SetInMatch(bool bInMatch)
+{
+	if (Fixture.bActive || !HasParty())
+	{
+		return;
+	}
+	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
+	{
+		Sdk->SetPartyInMatch(CachedParty.PartyId, bInMatch);
+	}
+}
+
 void UFoundrySocialSubsystem::RemoveFriend(const FString& FoundryId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("friend.remove")))
 	{
 		return;
 	}
@@ -397,7 +699,7 @@ void UFoundrySocialSubsystem::RemoveFriend(const FString& FoundryId)
 
 void UFoundrySocialSubsystem::BlockPlayer(const FString& FoundryId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("friend.block")))
 	{
 		return;
 	}
@@ -409,7 +711,7 @@ void UFoundrySocialSubsystem::BlockPlayer(const FString& FoundryId)
 
 void UFoundrySocialSubsystem::UnblockPlayer(const FString& FoundryId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("friend.unblock")))
 	{
 		return;
 	}
@@ -421,12 +723,16 @@ void UFoundrySocialSubsystem::UnblockPlayer(const FString& FoundryId)
 
 void UFoundrySocialSubsystem::RequestToJoin(const FString& FriendFoundryId)
 {
-	if (Fixture.bActive)
+	if (RefuseInFixture(TEXT("party.join_request")))
 	{
 		return;
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
+		const FFoundryFriend* Friend = Friends().FindByPredicate([&FriendFoundryId](const FFoundryFriend& F) { return F.FoundryId == FriendFoundryId; });
+		ExpectSuccess(TEXT("party.join_request"), (Friend != nullptr && !Friend->DisplayName.IsEmpty())
+			? FString::Printf(TEXT("Asked to join %s's party"), *Friend->DisplayName)
+			: FString(TEXT("Asked to join their party")));
 		Sdk->RequestToJoinParty(FriendFoundryId);
 	}
 }
@@ -467,6 +773,8 @@ void UFoundrySocialSubsystem::HandleLoggedOut()
 	CachedInvites.Reset();
 	CachedFriends.Reset();
 	CachedBlocked.Reset();
+	CachedJoinRequests.Reset();
+	ExpectedSuccess.Reset();
 	CachedPendingRequests = 0;
 	OnChanged.Broadcast();
 	OnPartyChanged.Broadcast();
@@ -484,12 +792,15 @@ void UFoundrySocialSubsystem::HandleParty(EFoundryFsdkResult Result, const FFoun
 			if (!PendingInviteUsername.IsEmpty())
 			{
 				// The invite InviteByUsername queued behind its CreateParty.
-				if (UFoundryFSDKSubsystem* Sdk = Fsdk())
-				{
-					Sdk->InviteToParty(CachedParty.PartyId, PendingInviteUsername);
-				}
+				const FString Queued = PendingInviteUsername;
 				PendingInviteUsername.Reset();
+				SendInvite(Queued);
 			}
+		}
+
+		if (!HasParty() || !IsLocalLeader())
+		{
+			CachedJoinRequests.Reset(); // only a leader sees requests; losing the crown / the party clears them
 		}
 
 		TArray<FString> MemberLines;
@@ -545,11 +856,43 @@ void UFoundrySocialSubsystem::HandleBlocked(EFoundryFsdkResult Result, const TAr
 	NotePollAnswered();
 }
 
+void UFoundrySocialSubsystem::HandleJoinRequests(EFoundryFsdkResult Result, const TArray<FFoundryJoinRequest>& Requests)
+{
+	if (Result == EFoundryFsdkResult::Ok)
+	{
+		CachedJoinRequests = Requests;
+	}
+	else if (Result == EFoundryFsdkResult::NoMatch)
+	{
+		CachedJoinRequests.Reset(); // fid's uniform 404: I no longer lead that party
+	}
+	// any other failure keeps the last list: a blip must not hide a request someone is waiting on
+	NotePollAnswered();
+}
+
+void UFoundrySocialSubsystem::HandlePartyCap(EFoundryFsdkResult Result, const FString& QueueKey, int32 PartyCap, int32 TeamSize)
+{
+	if (Result != EFoundryFsdkResult::Ok)
+	{
+		// Stays unknown (-1) or keeps the last value; LastRequestTime already throttles the retry.
+		UE_LOG(LogFoundrySocial, Log, TEXT("[Social] party cap for '%s' not read (%d)"), *QueueKey, static_cast<int32>(Result));
+		return;
+	}
+	FPartyCapEntry& Entry = PartyCaps.FindOrAdd(QueueKey);
+	const bool bChanged = Entry.Cap != PartyCap || Entry.TeamSize != TeamSize;
+	Entry.Cap = PartyCap;
+	Entry.TeamSize = TeamSize;
+	if (bChanged)
+	{
+		OnChanged.Broadcast(); // the mode picker re-evaluates which modes fit the party
+	}
+}
+
 namespace
 {
 	// Player-facing copy for a result the platform gave no sentence for (offline, a transport
 	// failure, a refused token). Same tone as the matchmaking copy table.
-	FString FallbackActionMessage(EFoundryFsdkResult Result)
+	FString FallbackActionMessage(EFoundryFsdkResult Result, const FString& Action)
 	{
 		switch (Result)
 		{
@@ -558,7 +901,11 @@ namespace
 		case EFoundryFsdkResult::Network:
 		case EFoundryFsdkResult::Timeout: return TEXT("Can't reach Foundry right now. Check your connection and try again.");
 		case EFoundryFsdkResult::RateLimited: return TEXT("Slow down - try that again in a moment.");
-		case EFoundryFsdkResult::NoMatch: return TEXT("No one found by that name.");
+		case EFoundryFsdkResult::NoMatch:
+			// fid answers a party row that is gone (expired invite, disbanded party, not the leader) with its
+			// uniform 404; "no one found by that name" would be a lie for those.
+			return Action.StartsWith(TEXT("party.")) ? TEXT("That invite or party is gone - it may have expired.")
+			                                           : TEXT("No one found by that name.");
 		case EFoundryFsdkResult::Unavailable: return TEXT("Foundry is busy right now. Try again in a moment.");
 		case EFoundryFsdkResult::InvalidArg: return TEXT("That doesn't look right - check what you typed.");
 		default: return TEXT("Something went wrong. Try again.");
@@ -568,6 +915,17 @@ namespace
 
 void UFoundrySocialSubsystem::HandleSocialAction(EFoundryFsdkResult Result, const FString& Action)
 {
+	// Consume this completion's queued success sentence (FIFO per action) whatever the outcome, so a
+	// failure never leaves its sentence behind for the next success of the same action.
+	FString SuccessMessage;
+	if (TArray<FString>* Queued = ExpectedSuccess.Find(Action))
+	{
+		if (Queued->Num() > 0)
+		{
+			SuccessMessage = (*Queued)[0];
+			Queued->RemoveAt(0);
+		}
+	}
 	if (Result != EFoundryFsdkResult::Ok)
 	{
 		// The platform's own sentence when it gave one ("No player found. Ask your friend for their
@@ -575,9 +933,17 @@ void UFoundrySocialSubsystem::HandleSocialAction(EFoundryFsdkResult Result, cons
 		// the enum's display name (Justin, 2026-10-13: add-friend showed "No Match / Not Ready").
 		const UFoundryFSDKSubsystem* Sdk = Fsdk();
 		FString Message = Sdk ? Sdk->LastSocialActionError() : FString();
+		if (Action == TEXT("party.in_match"))
+		{
+			// Background bookkeeping the player never asked for (an older fid, a party that just
+			// dissolved): log it, never put it in front of them.
+			UE_LOG(LogFoundrySocial, Log, TEXT("[Social] in-match flag not recorded (%s)"),
+				Message.IsEmpty() ? TEXT("no server message") : *Message);
+			return;
+		}
 		if (Message.IsEmpty())
 		{
-			Message = FallbackActionMessage(Result);
+			Message = FallbackActionMessage(Result, Action);
 		}
 		if (Action == TEXT("friend.request"))
 		{
@@ -596,7 +962,11 @@ void UFoundrySocialSubsystem::HandleSocialAction(EFoundryFsdkResult Result, cons
 		SentFriendRequests.Add(InFlightFriendRequestUsername);
 		InFlightFriendRequestUsername.Reset();
 	}
+	if (!SuccessMessage.IsEmpty())
+	{
+		OnActionSucceeded.Broadcast(FName(*Action), SuccessMessage);
+	}
 	// The platform follows every party mutation with its own RefreshParty; freshen everything else
-	// (invites, blocked, pending) on the very next tick too.
+	// (invites, blocked, pending, join requests) on the very next tick too.
 	NextPollTime = 0.0;
 }

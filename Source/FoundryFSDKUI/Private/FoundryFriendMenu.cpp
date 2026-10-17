@@ -2,15 +2,7 @@
 
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
-#include "Engine/GameInstance.h"
-#include "FoundrySocialSubsystem.h"
 #include "FoundryUIWidgetBase.h"
-
-UFoundrySocialSubsystem* UFoundryFriendMenu::Subsystem() const
-{
-	const UGameInstance* GI = GetGameInstance();
-	return GI ? GI->GetSubsystem<UFoundrySocialSubsystem>() : nullptr;
-}
 
 void UFoundryFriendMenu::NativeOnInitialized()
 {
@@ -18,6 +10,9 @@ void UFoundryFriendMenu::NativeOnInitialized()
 	if (SendMessageButton) { SendMessageButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleSendMessage); }
 	if (InviteButton) { InviteButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleInvite); }
 	if (RequestJoinButton) { RequestJoinButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleRequestJoin); }
+	if (ReInviteButton) { ReInviteButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleReInvite); }
+	if (CancelInviteButton) { CancelInviteButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleCancelInvite); }
+	if (KickButton) { KickButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleKick); }
 	if (RemoveFriendButton) { RemoveFriendButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleRemoveFriend); }
 	if (BlockButton) { BlockButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleBlock); }
 	if (UnblockButton) { UnblockButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleUnblock); }
@@ -25,56 +20,33 @@ void UFoundryFriendMenu::NativeOnInitialized()
 	if (CancelButton) { CancelButton->OnClicked.AddDynamic(this, &UFoundryFriendMenu::HandleCancel); }
 }
 
-void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InName, bool bCanInvite, const FString& InInviteDisabledReason, bool bCanRequestJoin)
+void UFoundryFriendMenu::ApplyItem(UButton* Button, const FoundryPartyRules::FMenuItemState& State)
+{
+	if (!Button)
+	{
+		return;
+	}
+	Show(Button, State.bShown, true);
+	Button->SetIsEnabled(State.bEnabled);
+	// A disabled UButton still shows its own tooltip; an enabled one clears it.
+	SetKitToolTip(Button, FText::FromString(State.bEnabled ? FString() : State.Reason));
+}
+
+void UFoundryFriendMenu::Setup(EFoundryFriendRowKind InKind, const FString& InName, const FoundryPartyRules::FFriendMenuPlan& Plan)
 {
 	Kind = InKind;
 	TargetName = InName;
 	SetText(TitleText, InName);
 
-	const bool bOnline = InKind == EFoundryFriendRowKind::Online;
-	const bool bOffline = InKind == EFoundryFriendRowKind::Offline;
-	const bool bBlocked = InKind == EFoundryFriendRowKind::Blocked;
-	const bool bParty = InKind == EFoundryFriendRowKind::Party;
-
-	Show(SendMessageButton, bOnline || bOffline || bParty, true);
-	Show(InviteButton, bOnline || bOffline, true);
-	Show(RequestJoinButton, bOnline || bOffline, true);
-	Show(RemoveFriendButton, bOnline || bOffline, true);
-	Show(BlockButton, bOnline || bOffline, true);
-	Show(UnblockButton, bBlocked, true);
-
-	// Offline friends never get Invite/RequestToJoin (forced disabled); Online honors the caller's
-	// flags (the drawer computes them from party/signed-in state).
-	const bool bInviteEnabled = bOnline && bCanInvite;
-	if (InviteButton)
-	{
-		InviteButton->SetIsEnabled(bInviteEnabled);
-		// InInviteDisabledReason already accounts for offline (the drawer checks Row->Kind too) - a
-		// disabled UButton still shows its own tooltip, same as RequestJoinButton below.
-		SetKitToolTip(InviteButton, FText::FromString(bInviteEnabled ? FString() : InInviteDisabledReason));
-	}
-	const bool bRequestJoinEnabled = bOnline && bCanRequestJoin;
-	if (RequestJoinButton)
-	{
-		RequestJoinButton->SetIsEnabled(bRequestJoinEnabled);
-		// Say why when disabled. This slice's RequestToJoinParty call always exists - "Coming soon"
-		// is reserved for a future binding whose platform lacks the call entirely, never reached
-		// from this Setup signature.
-		FString Reason;
-		if (!bRequestJoinEnabled)
-		{
-			if (bOffline)
-			{
-				Reason = TEXT("They're offline.");
-			}
-			else
-			{
-				const UFoundrySocialSubsystem* Sdk = Subsystem();
-				Reason = (Sdk && !Sdk->IsSignedIn()) ? TEXT("Sign in to ask to join a party.") : TEXT("You're already in a party.");
-			}
-		}
-		SetKitToolTip(RequestJoinButton, FText::FromString(Reason));
-	}
+	ApplyItem(SendMessageButton, Plan.SendMessage);
+	ApplyItem(InviteButton, Plan.Invite);
+	ApplyItem(RequestJoinButton, Plan.AskToJoin);
+	ApplyItem(ReInviteButton, Plan.ReInvite);
+	ApplyItem(CancelInviteButton, Plan.CancelInvite);
+	ApplyItem(KickButton, Plan.Kick);
+	ApplyItem(RemoveFriendButton, Plan.RemoveFriend);
+	ApplyItem(BlockButton, Plan.Block);
+	ApplyItem(UnblockButton, Plan.Unblock);
 
 	Show(ItemsPanel, true, true);
 	Show(ConfirmPanel, false);
@@ -97,6 +69,9 @@ void UFoundryFriendMenu::ShowItems()
 void UFoundryFriendMenu::HandleSendMessage() { OnItem.Broadcast(EFoundryFriendMenuItem::SendMessage); }
 void UFoundryFriendMenu::HandleInvite() { OnItem.Broadcast(EFoundryFriendMenuItem::Invite); }
 void UFoundryFriendMenu::HandleRequestJoin() { OnItem.Broadcast(EFoundryFriendMenuItem::RequestToJoin); }
+void UFoundryFriendMenu::HandleReInvite() { OnItem.Broadcast(EFoundryFriendMenuItem::ReInvite); }
+void UFoundryFriendMenu::HandleCancelInvite() { OnItem.Broadcast(EFoundryFriendMenuItem::CancelInvite); }
+void UFoundryFriendMenu::HandleKick() { OnItem.Broadcast(EFoundryFriendMenuItem::RemoveFromParty); }
 void UFoundryFriendMenu::HandleRemoveFriend() { OnItem.Broadcast(EFoundryFriendMenuItem::RemoveFriend); }
 void UFoundryFriendMenu::HandleBlock() { OnItem.Broadcast(EFoundryFriendMenuItem::Block); }
 void UFoundryFriendMenu::HandleUnblock() { OnItem.Broadcast(EFoundryFriendMenuItem::Unblock); }

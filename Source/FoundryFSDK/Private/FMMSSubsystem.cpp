@@ -3,6 +3,7 @@
 #include "FMMSSubsystem.h"
 
 #include "FoundryMatchmakingCopy.h"
+#include "FoundrySocialSubsystem.h"
 #include "foundry/fsdk.h" // fsdk_wait_reason_str (diagnostics only - never player-facing text)
 
 #include "Engine/Engine.h"
@@ -53,6 +54,16 @@ UFoundryFSDKSubsystem* UFMMSSubsystem::Fsdk() const
 {
 	UGameInstance* GI = GetGameInstance();
 	return GI ? GI->GetSubsystem<UFoundryFSDKSubsystem>() : nullptr;
+}
+
+/** Tell the party whether THIS client is in a match (fid party_member.in_match_at). A no-op without a
+ *  party; the social subsystem logs, never shows, a failed write. */
+static void FlagPartyInMatch(const UGameInstance* GI, bool bInMatch)
+{
+	if (UFoundrySocialSubsystem* Social = GI ? GI->GetSubsystem<UFoundrySocialSubsystem>() : nullptr)
+	{
+		Social->SetInMatch(bInMatch);
+	}
 }
 
 void UFMMSSubsystem::BindOnce(UFoundryFSDKSubsystem* Sdk)
@@ -189,6 +200,7 @@ void UFMMSSubsystem::Cancel()
 			EndedTicketId = Released;
 		}
 		bSeatReleased = true;
+		FlagPartyInMatch(GetGameInstance(), false); // a held seat may have been flagged in-match at travel
 	}
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
@@ -227,6 +239,7 @@ void UFMMSSubsystem::HandleMatchJoinFailure(const FString& Reason)
 		EndedTicketId = Released;
 	}
 	bSeatReleased = true; // arms the ended-seat belt: a later my-session read of this seat is declined
+	FlagPartyInMatch(GetGameInstance(), false); // the flag went up at ClientTravel; the join never happened
 	if (UFoundryFSDKSubsystem* Sdk = Fsdk())
 	{
 		Sdk->CancelMatch(); // worker thread, no-op without a ticket handle
@@ -262,6 +275,9 @@ void UFMMSSubsystem::NotifyMatchEnded()
 	}
 	bMatchEndedNotified = true;
 	StopPolling();
+	// The match is over for this client: the lobby stops showing it as "In match" even while it still sits
+	// on the results screen (and WasMatchEnded() now answers true for the party-follow component).
+	FlagPartyInMatch(GetGameInstance(), false);
 	// Remember WHICH seat ended (the pending reconnect seat wins, else the one my-session last reported).
 	// Copy before AbandonReconnectSeat() clears ReconnectTicketId.
 	// (A plain Cancel() may already have recorded it: never overwrite a known id with an empty one.)
@@ -598,6 +614,9 @@ void UFMMSSubsystem::HandleConnection(EFoundryFsdkResult Result, FFoundryConnect
 	// The URL carries the match token AND the endpoint - do NOT log it.
 	const FString Url = FString::Printf(TEXT("%s:%d?token=%s%s"),
 	                                    *Connection.Ip, Connection.Port, *Connection.MatchToken, *NameOption);
+	// The party sees "In match" from the moment this client leaves for the server (also the Reconnect path:
+	// both resolve through here). Cleared in NotifyMatchEnded / Cancel / a refused join.
+	FlagPartyInMatch(GI, true);
 	PC->ClientTravel(Url, TRAVEL_Absolute);
 }
 

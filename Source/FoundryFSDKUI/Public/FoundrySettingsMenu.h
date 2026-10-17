@@ -115,6 +115,7 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> SFXRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> UIScaleRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> ReducedMotionRow;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> DeveloperModeRow;
 	/** The Controls SECTION HEADER's row (not an individual keybind row - those are hover-tested
 	 *  separately, by walking KeybindList's own children). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> ControlsRow;
@@ -133,6 +134,8 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<USlider> UIScaleSlider;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> UIScaleValueText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UCheckBox> ReducedMotionCheck;
+	/** Ticking it lets the console key (Tilde) open the Foundry console - Foundry and game commands only. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UCheckBox> DeveloperModeCheck;
 
 	// -- Controls (Enhanced Input) --
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> ControlsSection;
@@ -182,6 +185,8 @@ private:
 	UFUNCTION() void HandleSFXVolumeChanged(float Value);
 	UFUNCTION() void HandleUIScaleChanged(float Value);
 	UFUNCTION() void HandleReducedMotionChanged(bool bIsChecked);
+	/** Set, SaveSettings, then ApplyDeveloperMode on the game instance - live, no restart. */
+	UFUNCTION() void HandleDeveloperModeChanged(bool bIsChecked);
 	/** Shared by Master/Music/SFX/UIScale - a drag-end is when the (debounced) save actually happens. */
 	UFUNCTION() void HandleAudioSliderCaptureEnd();
 	/** Per-tick: a hovered slider gets a lit-up bar/handle (FoundryUITheme::CompositeOver), same

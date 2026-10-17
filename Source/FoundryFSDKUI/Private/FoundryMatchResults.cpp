@@ -97,13 +97,17 @@ void UFoundryMatchResults::HandleReturnButtonClicked()
 		ReturnButton->SetIsEnabled(false);
 	}
 
+	// The results screen is the post-horn leave: a party leader's RETURN takes the party (the component
+	// checks leader + match-over itself). Notified before either branch so a game that binds its own
+	// OnReturnRequested gets the same behavior as the host path.
 	if (OnReturnRequested.IsBound())
 	{
+		NotifyPartyOfLeave();
 		OnReturnRequested.Broadcast();
 	}
-	else if (UObject* Host = FindMenuHost())
+	else if (LeaveMatchViaHost())
 	{
-		IFoundryMenuHost::Execute_RequestLeaveMatch(Host);
+		// left through the host
 	}
 	else
 	{

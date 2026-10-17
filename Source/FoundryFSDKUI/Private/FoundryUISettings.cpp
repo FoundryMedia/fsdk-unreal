@@ -4,6 +4,9 @@
 #include "Engine/Texture2D.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryMatchmakingCopy.h"
+#include "FoundryMenuHost.h"
+#include "FoundryPartyFollowComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "UObject/SoftObjectPath.h"
 
 namespace
@@ -91,6 +94,23 @@ void UFoundryUISettings::ApplyMatchmakingCopyOverrides()
 	{
 		FoundryMatchmakingCopy::SetResultOverride(Pair.Key, Pair.Value);
 	}
+}
+
+void UFoundryUISettings::ApplyPartyDefaults()
+{
+	const UFoundryUISettings* Settings = Get();
+	UFoundryPartyFollowComponent::SetFollowLeaderOnLeave(Settings == nullptr || Settings->bPartyFollowsLeaderOnLeave);
+	// The core module cannot see IFoundryMenuHost, so the way a receiving member actually leaves is
+	// installed from here: the same RequestLeaveMatch the kit's own leave buttons use.
+	UFoundryPartyFollowComponent::SetLeaveExecutor([](APlayerController* Controller)
+	{
+		if (Controller == nullptr || !Controller->Implements<UFoundryMenuHost>())
+		{
+			return false;
+		}
+		IFoundryMenuHost::Execute_RequestLeaveMatch(Controller);
+		return true;
+	});
 }
 
 TSubclassOf<UUserWidget> UFoundryUISettings::LoadWidgetClass(const TSoftClassPtr<UUserWidget>& Soft, const TCHAR* SettingName)

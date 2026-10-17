@@ -25,9 +25,10 @@ class FOUNDRYFSDKUI_API UFoundryPartyNameplate : public UFoundryUIWidgetBase
 public:
 	/** Fills the plate: Name shown as NameText (tinted via GetNameTint); bLeader shows CrownIcon AND
 	 *  HostBadge (both mark the party LEADER); bReady shows ReadyIcon; bLocal selects the tint
-	 *  GetNameTint resolves (the local player's own plate vs. everyone else's). */
+	 *  GetNameTint resolves (the local player's own plate vs. everyone else's); bInMatch shows InMatchBadge
+	 *  (the member is in a match right now - FFoundryPartyMember::bInMatch). */
 	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
-	void Setup(const FString& Name, bool bLeader, bool bReady, bool bLocal);
+	void Setup(const FString& Name, bool bLeader, bool bReady, bool bLocal, bool bInMatch = false);
 
 	/** NameText's colour: Palette.Primary for the local player's own plate, Palette.Text otherwise.
 	 *  Override for a game's own hero tint (e.g. Goo Crew's HeroPink). */
@@ -47,4 +48,6 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> HostBadge;
 	/** Shown only while the member is ready. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> ReadyIcon;
+	/** Shown only while the member is in a match (a pill reading IN MATCH in the default WBP). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> InMatchBadge;
 };

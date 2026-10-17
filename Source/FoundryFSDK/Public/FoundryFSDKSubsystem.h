@@ -188,6 +188,24 @@ struct FFoundryFriend
 	/** Running game title, empty when none ("In game: Conquest"). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	FString PresenceGame;
+
+	/** The friend is in a party (the friends list's nullable `party` block). fid never sends the party
+	 *  id - FMMS groups tickets by partyId, so it must not leak - only its shape, below. All four stay
+	 *  zero/false on rows that carry no party block (pending, blocked, join requests, an older fid). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bInParty = false;
+
+	/** Joined members in the friend's party ("In a party 2/6"). */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int32 PartySize = 0;
+
+	/** The platform cap of that party. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int32 PartyMaxSize = 0;
+
+	/** The party has room under the platform cap and you are not already in it - gates "Ask to join". */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bPartyJoinable = false;
 };
 
 /** One whisper conversation summary (newest activity first). */
@@ -267,6 +285,21 @@ struct FFoundryPartyMember
 	 *  remove / leader-change / disband; a JOIN always starts not-ready. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	bool bReady = false;
+
+	/** Platform in-match flag (fsdk_party_member.in_match): the member's own client set it when it
+	 *  travelled into a match and cleared it at match end / leave; the server also lets it expire (a
+	 *  crash). What the lobby reads to show "In match" - never inferred from tickets. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	bool bInMatch = false;
+
+	/** When an INVITED member was invited / when that invite expires (UTC). Zero ticks (FDateTime(0))
+	 *  = absent: a JOINED member has no invite clock, and an older fid sends none (never expires). An
+	 *  invite whose ExpiresAt is non-zero and in the past is dead - render "expired", never offer Accept. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FDateTime InvitedAt = FDateTime(0);
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FDateTime ExpiresAt = FDateTime(0);
 };
 
 /** The player's current party (PartyId empty when not in one). */
@@ -288,8 +321,38 @@ struct FFoundryParty
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	int32 MaxSize = 0;
 
+	/** The launcher's party cap (fid platformMaxSize; MaxSize from an older fid). A party that grew in a
+	 *  game mode can sit OVER it ("8 / 6"): nobody is kicked, invites outside a mode are just blocked. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	int32 PlatformMaxSize = 0;
+
+	/** On a RECEIVED invite row (OnPartyInvitesUpdated) only: THIS invite's clock - the caller's own
+	 *  member row's invitedAt / expiresAt. Zero ticks when absent (older fid, or the session's foundry id
+	 *  not known to the core yet). Always zero on the party from RefreshParty. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FDateTime InvitedAt = FDateTime(0);
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FDateTime InviteExpiresAt = FDateTime(0);
+
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
 	TArray<FFoundryPartyMember> Members;
+};
+
+/** One pending request to join the party the local player LEADS (fid's friend-row shape). */
+USTRUCT(BlueprintType)
+struct FFoundryJoinRequest
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString FoundryId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString DisplayName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry|Social")
+	FString Username;
 };
 
 // Social delegates - broadcast on the GAME THREAD.
@@ -299,6 +362,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyEvent,
 	EFoundryFsdkResult, Result, const FFoundryParty&, Party);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryPartyInvitesEvent,
 	EFoundryFsdkResult, Result, const TArray<FFoundryParty>&, Invites);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryJoinRequestsEvent,
+	EFoundryFsdkResult, Result, const TArray<FFoundryJoinRequest>&, Requests);
+/** RefreshPartyCap finished: PartyCap = the largest party the queue seats, TeamSize = its team size
+ *  (both 0 when Result is not Ok). */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FFoundryPartyCapEvent,
+	EFoundryFsdkResult, Result, const FString&, QueueKey, int32, PartyCap, int32, TeamSize);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundrySocialActionEvent,
 	EFoundryFsdkResult, Result, const FString&, Action);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundryFriendCodeEvent,
@@ -759,6 +828,30 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void InviteToParty(const FString& PartyId, const FString& Username);
 
+	/** InviteToParty held to a GAME MODE: a non-empty QueueKey makes fid cap the party at that queue's
+	 *  party cap instead of the platform cap (the launcher passes none). Re-inviting a still-INVITED
+	 *  member resets the invite clock and re-notifies. Async: OnSocialActionComplete ("party.invite"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void InviteToPartyForQueue(const FString& PartyId, const FString& Username, const FString& QueueKey);
+
+	/** The same invite by foundry id (a re-invite from a member row). Async: ("party.invite"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void InviteToPartyById(const FString& PartyId, const FString& FoundryId, const FString& QueueKey);
+
+	/** Leader-only: withdraw a pending invite / remove a JOINED member (never yourself). Async:
+	 *  OnSocialActionComplete ("party.cancel_invite" / "party.kick"), each followed by an automatic
+	 *  RefreshParty. NoMatch = not the leader, or no such row. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void CancelPartyInvite(const FString& PartyId, const FString& FoundryId);
+
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void KickFromParty(const FString& PartyId, const FString& FoundryId);
+
+	/** What a queue holds a party to (min(queue maxPartySize ?? teamSize, teamSize)). Async:
+	 *  OnPartyCapUpdated. NoMatch = no such queue. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void RefreshPartyCap(const FString& QueueKey);
+
 	/** Accept / decline a party invite; leave a joined party. Async:
 	 *  OnSocialActionComplete ("party.accept"/"party.decline"/"party.leave"),
 	 *  each followed by an automatic RefreshParty. */
@@ -776,6 +869,12 @@ public:
 	 *  remove/leader-change/disband - never cleared by this subsystem itself. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void SetPartyReady(const FString& PartyId, bool bReady);
+
+	/** Set/clear your own in-match flag on the party you're in. Async: OnSocialActionComplete
+	 *  ("party.in_match"), followed by an automatic RefreshParty. UFMMSSubsystem drives it (set on
+	 *  travel into a match, cleared at match end / leave) through UFoundrySocialSubsystem::SetInMatch. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void SetPartyInMatch(const FString& PartyId, bool bInMatch);
 
 	/** Ask to join a FRIEND's current party (parties stay invite-only - this
 	 *  stages a request the party's LEADER answers). Async:
@@ -795,6 +894,12 @@ public:
 	 *  ("party.join_accept"), followed by an automatic RefreshParty. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
 	void AcceptPartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId);
+
+	/** AcceptPartyJoinRequest held to the leader's selected mode (a non-empty QueueKey, as for the
+	 *  invites above). Async: OnSocialActionComplete ("party.join_accept"). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry|Social")
+	void AcceptPartyJoinRequestForQueue(const FString& PartyId, const FString& RequesterFoundryId,
+		const FString& QueueKey);
 
 	/** Decline a join request on the party you lead. Async:
 	 *  OnSocialActionComplete ("party.join_decline"). */
@@ -838,7 +943,11 @@ public:
 
 	/** Pending join requests on the party you lead (RefreshPartyJoinRequests). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
-	FFoundryFriendsEvent OnPartyJoinRequestsUpdated;
+	FFoundryJoinRequestsEvent OnPartyJoinRequestsUpdated;
+
+	/** RefreshPartyCap finished. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundryPartyCapEvent OnPartyCapUpdated;
 
 	/** One social mutation finished; Action names it ("friend.request", ...). */
 	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")

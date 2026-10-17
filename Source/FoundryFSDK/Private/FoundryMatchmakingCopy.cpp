@@ -44,7 +44,10 @@ namespace
 		switch (Reason)
 		{
 		case EFoundryWaitReason::CapacityStarting:
-			return FText::FromString(TEXT("Low traffic right now - we're starting a server for you. This usually takes up to 15 minutes. Keep this open or check back later."));
+			// "usually a few minutes": fid's estimate suffix ("(~N min left)") is now measured per fleet (the
+			// scaler's own boot samples; us-east-2 booted in 3m23s on 2026-10-16) - the old "up to 15 minutes"
+			// read the 612 s cold-start ceiling as a promise and sat on screen while the match was already placed.
+			return FText::FromString(TEXT("Low traffic right now - we're starting a server for you. This usually takes a few minutes. Keep this open."));
 		case EFoundryWaitReason::NoCapacity:
 			return FText::FromString(TEXT("All servers are full right now. We'll keep trying - or check back in a few minutes."));
 		case EFoundryWaitReason::NoFleet:

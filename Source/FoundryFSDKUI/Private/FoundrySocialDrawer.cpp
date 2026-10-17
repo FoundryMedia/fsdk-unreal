@@ -11,12 +11,15 @@
 #include "Engine/World.h"
 #include "Framework/Application/IMenu.h"
 #include "Framework/Application/SlateApplication.h"
+#include "FoundryConfirmDialog.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryInviteRow.h"
+#include "FoundryPartyRules.h"
 #include "FoundrySocialSubsystem.h"
 #include "FoundryUISettings.h"
 #include "FoundryUITheme.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "TimerManager.h"
 
 namespace
@@ -27,6 +30,16 @@ namespace
 	constexpr float DefaultDrawerTweenOffset = 448.0f;
 	constexpr float DefaultDrawerTweenSeconds = 0.22f;
 	constexpr float ChevronTweenSeconds = 0.15f;
+
+	// The subsystem names a social action either as an FString or an FName; the drawer's handlers
+	// take a string. Overloads (not LexToString) so both delegate shapes bind through a generic lambda.
+	FString ActionKey(const FString& Action) { return Action; }
+	FString ActionKey(const FName& Action) { return Action.ToString(); }
+
+	bool IsJoinedState(const FString& State)
+	{
+		return State.IsEmpty() || State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
+	}
 
 	/**
 	 * Reconciles RowMap/List down to exactly WantedKeys, in that order, REUSING an existing row for a
@@ -161,8 +174,13 @@ void UFoundrySocialDrawer::NativeConstruct()
 	if (UFoundrySocialSubsystem* Sdk = Subsystem())
 	{
 		Sdk->RegisterConsumer();
-		Sdk->OnChanged.AddUObject(this, &UFoundrySocialDrawer::MarkDirty);
-		Sdk->OnActionFailed.AddUObject(this, &UFoundrySocialDrawer::HandleActionFailed);
+		Sdk->OnChanged.AddUObject(this, &UFoundrySocialDrawer::HandleSocialChanged);
+		Sdk->OnActionFailed.AddWeakLambda(this, [this](const auto& Action, const FString& Message)
+		{
+			HandleActionFailed(ActionKey(Action), Message);
+		});
+		Sdk->OnActionSucceeded.AddDynamic(this, &UFoundrySocialDrawer::HandleActionSucceeded);
+		NoteInviteClocks(); // rows already in the cache when the drawer is built
 	}
 	MarkDirty();
 }
@@ -183,6 +201,7 @@ void UFoundrySocialDrawer::NativeDestruct()
 	{
 		Sdk->OnChanged.RemoveAll(this);
 		Sdk->OnActionFailed.RemoveAll(this);
+		Sdk->OnActionSucceeded.RemoveDynamic(this, &UFoundrySocialDrawer::HandleActionSucceeded);
 		Sdk->UnregisterConsumer();
 	}
 	if (UWorld* World = GetWorld())
@@ -310,6 +329,80 @@ void UFoundrySocialDrawer::MarkDirty()
 	bDirty = true;
 }
 
+void UFoundrySocialDrawer::HandleSocialChanged()
+{
+	// Stamp at RECEIPT, not at rebuild: a closed drawer rebuilds only when it next opens.
+	NoteInviteClocks();
+	MarkDirty();
+}
+
+void UFoundrySocialDrawer::NoteInviteClocks()
+{
+	const UFoundrySocialSubsystem* Sdk = Subsystem();
+	const double Now = FPlatformTime::Seconds();
+	TSet<FString> Live;
+
+	auto Note = [this, &Live, Now](const FString& Key, const FDateTime& ExpiresAt, const FDateTime& InvitedAt)
+	{
+		Live.Add(Key);
+		const FInviteAnchor* Existing = InviteAnchors.Find(Key);
+		if (Existing && Existing->ExpiresAt == ExpiresAt)
+		{
+			return; // the same invite still: keep the anchor from when it was first received
+		}
+		FInviteAnchor Anchor;
+		Anchor.ExpiresAt = ExpiresAt;
+		Anchor.Clock = FoundryPartyRules::FInviteClock::From(ExpiresAt, InvitedAt, Now);
+		InviteAnchors.Add(Key, Anchor);
+	};
+
+	if (Sdk)
+	{
+		for (const FFoundryPartyMember& M : Sdk->Party().Members)
+		{
+			if (!IsJoinedState(M.State))
+			{
+				Note(TEXT("m:") + M.FoundryId, M.ExpiresAt, M.InvitedAt);
+			}
+		}
+		for (const FFoundryParty& Inv : Sdk->Invites())
+		{
+			// A received invite row carries THIS invite's clock on the party itself (the core copies the
+			// caller's own member row up); the member row is the fallback when the core did not know the
+			// session's foundry id yet.
+			FDateTime Invited = Inv.InvitedAt;
+			FDateTime Expires = Inv.InviteExpiresAt;
+			if (Expires.GetTicks() == 0)
+			{
+				for (const FFoundryPartyMember& M : Inv.Members)
+				{
+					if (!IsJoinedState(M.State) && !Sdk->LocalFoundryId().IsEmpty() && M.FoundryId == Sdk->LocalFoundryId())
+					{
+						Invited = M.InvitedAt;
+						Expires = M.ExpiresAt;
+						break;
+					}
+				}
+			}
+			Note(TEXT("i:") + Inv.PartyId, Expires, Invited);
+		}
+	}
+
+	for (auto It = InviteAnchors.CreateIterator(); It; ++It)
+	{
+		if (!Live.Contains(It.Key()))
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+FoundryPartyRules::FInviteClock UFoundrySocialDrawer::ClockFor(const FString& Key) const
+{
+	const FInviteAnchor* Found = InviteAnchors.Find(Key);
+	return Found ? Found->Clock : FoundryPartyRules::FInviteClock();
+}
+
 void UFoundrySocialDrawer::HandleActionFailed(const FString& Action, const FString& Message)
 {
 	if (Action == TEXT("friend.request"))
@@ -319,16 +412,133 @@ void UFoundrySocialDrawer::HandleActionFailed(const FString& Action, const FStri
 		return;
 	}
 
+	ShowActionNote(Message, true, 6.0f);
+	OnActionMessage.Broadcast(Message);
+}
+
+void UFoundrySocialDrawer::HandleActionSucceeded(FName Action, const FString& Message)
+{
+	// The platform's own sentence ("Asked Sam to join") on the same line failures use, for 4 s. Not
+	// mirrored to OnActionMessage: that delegate is documented as the FAILURE feed.
+	if (!Message.IsEmpty())
+	{
+		ShowActionNote(Message, false, 4.0f);
+	}
+}
+
+void UFoundrySocialDrawer::ShowActionNote(const FString& Message, bool bError, float Seconds)
+{
 	SetText(ActionNote, Message);
+	if (ActionNote)
+	{
+		const FFoundryUIPalette& Palette = UFoundryUISettings::Get()->Palette;
+		ActionNote->SetColorAndOpacity(FSlateColor(bError ? Palette.Error : Palette.Online));
+	}
 	Show(ActionNote, true);
 	if (UWorld* World = GetWorld())
 	{
+		// SetTimer on the same handle replaces a pending hide, so a success right after a failure
+		// gets its own full 4 s rather than the failure's remainder.
 		World->GetTimerManager().SetTimer(ActionNoteTimerHandle, FTimerDelegate::CreateWeakLambda(this, [this]()
 		{
 			Show(ActionNote, false);
-		}), 6.0f, false);
+		}), Seconds, false);
 	}
-	OnActionMessage.Broadcast(Message);
+}
+
+void UFoundrySocialDrawer::HandleAcceptInvite(const FString& PartyId)
+{
+	UFoundrySocialSubsystem* Sdk = Subsystem();
+	if (!Sdk)
+	{
+		return;
+	}
+	// D3: fid's accept auto-leaves the caller's current party; a LEADER's leave transfers leadership to
+	// the longest-standing member and the party survives (the leader's own pending invites end). Only a
+	// lone leader's party ends with them - nobody to lose, so that case accepts without a prompt.
+	const int32 PartyMembers = Sdk->JoinedCount();
+	const bool bLeavesAParty = Sdk->HasParty() && Sdk->IsLocalLeader() && PartyMembers > 1;
+	if (!bLeavesAParty)
+	{
+		Sdk->AcceptInvite(PartyId);
+		return;
+	}
+	if (ActiveConfirm)
+	{
+		return; // one confirm at a time
+	}
+	UFoundryConfirmDialog* Dialog = OpenConfirmDialog(
+		FText::FromString(TEXT("Accept this invite?")),
+		FText::FromString(FString::Printf(
+			TEXT("You'll leave your current party (%d members): leadership passes to the next member and your pending invites end."),
+			PartyMembers)),
+		FText::FromString(TEXT("Accept")), FText::FromString(TEXT("Cancel")), 0.0f);
+	if (!Dialog)
+	{
+		// OpenConfirmDialog already warned (no dialog class). Refusing beats leaving a party unasked.
+		ShowActionNote(TEXT("Could not ask for confirmation - leave your party first, then accept."), true, 6.0f);
+		return;
+	}
+	ActiveConfirm = Dialog;
+	PendingAcceptPartyId = PartyId;
+	Dialog->OnConfirmed.AddDynamic(this, &UFoundrySocialDrawer::HandleAcceptConfirmed);
+	Dialog->OnCancelled.AddDynamic(this, &UFoundrySocialDrawer::HandleAcceptCancelled);
+}
+
+void UFoundrySocialDrawer::HandleAcceptConfirmed()
+{
+	const FString PartyId = PendingAcceptPartyId;
+	PendingAcceptPartyId.Reset();
+	ActiveConfirm = nullptr;
+	if (UFoundrySocialSubsystem* Sdk = Subsystem())
+	{
+		Sdk->AcceptInvite(PartyId);
+	}
+}
+
+void UFoundrySocialDrawer::HandleAcceptCancelled()
+{
+	PendingAcceptPartyId.Reset();
+	ActiveConfirm = nullptr;
+}
+
+void UFoundrySocialDrawer::AskKickMember(const FString& FoundryId, const FString& DisplayName)
+{
+	if (FoundryId.IsEmpty() || ActiveKickConfirm)
+	{
+		return; // one confirm at a time
+	}
+	UFoundryConfirmDialog* Dialog = OpenConfirmDialog(
+		FText::FromString(FString::Printf(TEXT("Remove %s from the party?"), *DisplayName)),
+		FText::FromString(TEXT("They can be invited again.")),
+		FText::FromString(TEXT("Remove")), FText::FromString(TEXT("Cancel")), 0.0f);
+	if (!Dialog)
+	{
+		// OpenConfirmDialog already warned (no dialog class). Refusing beats removing someone unasked.
+		ShowActionNote(TEXT("Could not ask for confirmation, so nobody was removed."), true, 6.0f);
+		return;
+	}
+	ActiveKickConfirm = Dialog;
+	PendingKickFoundryId = FoundryId;
+	Dialog->OnConfirmed.AddDynamic(this, &UFoundrySocialDrawer::HandleKickConfirmed);
+	Dialog->OnCancelled.AddDynamic(this, &UFoundrySocialDrawer::HandleKickCancelled);
+}
+
+void UFoundrySocialDrawer::HandleKickConfirmed()
+{
+	const FString FoundryId = PendingKickFoundryId;
+	PendingKickFoundryId.Reset();
+	ActiveKickConfirm = nullptr;
+	if (UFoundrySocialSubsystem* Sdk = Subsystem())
+	{
+		Sdk->Kick(FoundryId);
+	}
+}
+
+void UFoundrySocialDrawer::HandleKickCancelled()
+{
+	PendingKickFoundryId.Reset();
+	ActiveKickConfirm = nullptr;
 }
 
 void UFoundrySocialDrawer::Rebuild()
@@ -336,7 +546,9 @@ void UFoundrySocialDrawer::Rebuild()
 	UFoundrySocialSubsystem* Sdk = Subsystem();
 	const bool bSignedIn = Sdk && Sdk->IsSignedIn();
 	const bool bFixture = Sdk && Sdk->IsFixtureActive();
-	const int32 Cap = Sdk ? Sdk->PartyCapacity() : UFoundrySocialSubsystem::DefaultPartyCapacity;
+	// In game the cap is the SELECTED mode's party cap (the queue decides the size - D4a), else the
+	// platform cap; one number for the header, the invite gate and the match cluster.
+	const int32 Cap = Sdk ? FoundryPartyRules::CapFor(*Sdk) : UFoundrySocialSubsystem::DefaultPartyCapacity;
 	const int32 Joined = Sdk ? Sdk->JoinedCount() : 0;
 	const bool bInParty = Sdk && Sdk->HasParty();
 
@@ -351,13 +563,22 @@ void UFoundrySocialDrawer::Rebuild()
 	SetText(AccountUsernameText, Username.IsEmpty() ? FString() : TEXT("@") + Username);
 	Show(AccountUsernameText, !Username.IsEmpty());
 
-	// -- party header + cap conflict note
-	SetText(PartyHeaderText, FString::Printf(TEXT("YOUR PARTY   %d / %d"), Joined, Cap));
-	FString Conflict;
-	if (Sdk && bInParty && Sdk->Party().MaxSize > 0 && Sdk->Party().MaxSize != UFoundrySocialSubsystem::DefaultPartyCapacity)
+	// -- party header + over-size note. A party that grew past its cap is never kicked down (fid keeps
+	// everyone); it just cannot grow, and cannot queue for a mode that holds fewer.
+	const bool bTooBig = FoundryPartyRules::IsTooBig(Joined, Cap);
+	SetText(PartyHeaderText, TEXT("YOUR PARTY   ") + FoundryPartyRules::HeaderText(Joined, Cap));
+	if (PartyHeaderText)
 	{
-		Conflict = FString::Printf(TEXT("This party is capped at %d (not %d)."), Sdk->Party().MaxSize, UFoundrySocialSubsystem::DefaultPartyCapacity);
+		if (!bPartyHeaderColorCaptured)
+		{
+			PartyHeaderNormalColor = PartyHeaderText->GetColorAndOpacity();
+			bPartyHeaderColorCaptured = true;
+		}
+		PartyHeaderText->SetColorAndOpacity(bTooBig ? FSlateColor(Palette.Error) : PartyHeaderNormalColor);
 	}
+	const FString Conflict = bTooBig
+		? FString::Printf(TEXT("Your party is bigger than this mode holds (%d > %d). Pick another mode, or remove members."), Joined, Cap)
+		: FString();
 	SetText(CapConflictText, Conflict);
 	Show(CapConflictText, !Conflict.IsEmpty());
 
@@ -386,7 +607,7 @@ void UFoundrySocialDrawer::Rebuild()
 			for (const FFoundryPartyMember& M : Sdk->Party().Members)
 			{
 				WantedPartyKeys.Add(M.FoundryId);
-				if (M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase))
+				if (IsJoinedState(M.State))
 				{
 					++RawJoinedCount;
 				}
@@ -410,7 +631,7 @@ void UFoundrySocialDrawer::Rebuild()
 				const bool bLocal = !Sdk->LocalFoundryId().IsEmpty() && M.FoundryId == Sdk->LocalFoundryId();
 				// The local player is always joined from THEIR OWN perspective - never render your
 				// own row as "Invited - not joined" off a momentarily-stale/transitional party read.
-				const bool bJoinedMember = bLocal || M.State.IsEmpty() || M.State.Equals(TEXT("JOINED"), ESearchCase::IgnoreCase);
+				const bool bJoinedMember = bLocal || IsJoinedState(M.State);
 				bool bHost = !Party.LeaderFoundryId.IsEmpty() && M.FoundryId == Party.LeaderFoundryId;
 				if (Party.LeaderFoundryId.IsEmpty() && bLocal && RawJoinedCount == 1)
 				{
@@ -442,14 +663,23 @@ void UFoundrySocialDrawer::Rebuild()
 				{
 					if (UFoundryFriendRow* Row = *Found)
 					{
-						const FString Status = bJoinedMember ? FString() : TEXT("Invited - not joined");
+						// A member in a match reads "In match" (overrides the presence label, which says only
+						// "Playing <game>" for the lobby too); an invitee is still "Invited - not joined".
+						const FString Status = !bJoinedMember ? FString(TEXT("Invited - not joined"))
+							: (M.bInMatch ? FString(TEXT("In match")) : FString());
 						Row->Setup(F, EFoundryFriendRowKind::Party, bHost, bLocal, bJoinedMember,
 							GetMemberTint(F.FoundryId, i, bLocal), Status, M.bReady);
-						// The local player's own row and a pending-invited row never open a menu -
-						// cleared first since this row may be REUSED from a prior poll where the
-						// condition was different (e.g. an invited member just joined).
+						// A pending row shows how long the invite still lives ("Invited - expires in 3 min").
+						if (!bJoinedMember)
+						{
+							Row->SetInviteExpiry(ClockFor(TEXT("m:") + M.FoundryId));
+						}
+						// The local player's own row never opens a menu; a pending-invited row opens one only for
+						// the leader (Re-invite / Cancel invite - the plan's "no way to re-invite from the game").
+						// Cleared first since this row may be REUSED from a prior poll where the condition was
+						// different (e.g. an invited member just joined).
 						Row->OnContextMenuRequested.RemoveAll(this);
-						if (!bLocal && bJoinedMember)
+						if (!bLocal && (bJoinedMember || Sdk->IsLocalLeader()))
 						{
 							Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos)
 							{
@@ -503,11 +733,61 @@ void UFoundrySocialDrawer::Rebuild()
 				{
 					if (UFoundryInviteRow* Row = *Found)
 					{
-						Row->Setup(Inv.LeaderDisplayName, Inv.PartyId);
+						// "N / cap" is the INVITING party's own size against its own platform cap; the countdown is
+						// the local player's own member row in it (fid expires each invitee separately), anchored
+						// by NoteInviteClocks when the row was received.
+						int32 InvJoined = 0;
+						for (const FFoundryPartyMember& M : Inv.Members)
+						{
+							if (IsJoinedState(M.State))
+							{
+								++InvJoined;
+							}
+						}
+						const int32 InvCap = FoundryPartyRules::EffectiveCap(-1, Inv.PlatformMaxSize,
+							Inv.MaxSize > 0 ? Inv.MaxSize : Sdk->PartyCapacity());
+						Row->Setup(Inv.LeaderDisplayName, Inv.PartyId, InvJoined, InvCap, ClockFor(TEXT("i:") + Inv.PartyId));
 						Row->OnAccept.RemoveAll(this);
 						Row->OnDecline.RemoveAll(this);
-						Row->OnAccept.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->AcceptInvite(Id); } });
+						Row->OnAccept.AddWeakLambda(this, [this](const FString& Id) { HandleAcceptInvite(Id); });
 						Row->OnDecline.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->DeclineInvite(Id); } });
+					}
+				}
+			}
+		}
+	}
+
+	// -- the leader's join requests: players asking to join THIS party. Visible only while the local
+	// player leads and the list is non-empty (the subsystem fills it only for a leader anyway). The rows
+	// are invite rows in join-request mode, so the look and the Accept / Decline wiring are the kit's own.
+	const bool bShowRequests = Sdk && Sdk->IsLocalLeader() && Sdk->JoinRequests().Num() > 0;
+	Show(JoinRequestsSection, bShowRequests);
+	if (JoinRequestsList)
+	{
+		TArray<FString> WantedRequestKeys;
+		if (bShowRequests && InviteRowClass)
+		{
+			for (const FFoundryJoinRequest& Req : Sdk->JoinRequests())
+			{
+				WantedRequestKeys.Add(Req.FoundryId);
+			}
+		}
+		SyncRowList<UFoundryInviteRow>(JoinRequestRowsByFoundryId, JoinRequestsList, WantedRequestKeys,
+			[this]() { return InviteRowClass ? CreateWidget<UFoundryInviteRow>(this, InviteRowClass) : nullptr; });
+
+		if (bShowRequests)
+		{
+			for (const FFoundryJoinRequest& Req : Sdk->JoinRequests())
+			{
+				if (TObjectPtr<UFoundryInviteRow>* Found = JoinRequestRowsByFoundryId.Find(Req.FoundryId))
+				{
+					if (UFoundryInviteRow* Row = *Found)
+					{
+						Row->SetupJoinRequest(Req.FoundryId, Req.DisplayName.IsEmpty() ? Req.Username : Req.DisplayName);
+						Row->OnAccept.RemoveAll(this);
+						Row->OnDecline.RemoveAll(this);
+						Row->OnAccept.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->AcceptJoinRequest(Id); } });
+						Row->OnDecline.AddWeakLambda(this, [this](const FString& Id) { if (UFoundrySocialSubsystem* S = Subsystem()) { S->DeclineJoinRequest(Id); } });
 					}
 				}
 			}
@@ -568,7 +848,12 @@ void UFoundrySocialDrawer::Rebuild()
 					{
 						if (UFoundryFriendRow* Row = *Found)
 						{
-							const FString Status = F.PresenceGame.IsEmpty() ? FString() : FString::Printf(TEXT("Playing %s"), *F.PresenceGame);
+							// "In a party 2 / 6" when the friend is in one (the partyId itself is never on the wire).
+							FString Status = FoundryPartyRules::FriendPartyLine(F.PresenceGame, F.bInParty, F.PartySize, F.PartyMaxSize);
+							if (Status.IsEmpty() && !F.PresenceGame.IsEmpty())
+							{
+								Status = FString::Printf(TEXT("Playing %s"), *F.PresenceGame);
+							}
 							Row->Setup(F, EFoundryFriendRowKind::Online, false, false, true, GetMemberTint(F.FoundryId, OnlineTintIndex++, false), Status);
 							Row->OnContextMenuRequested.RemoveAll(this);
 							Row->OnContextMenuRequested.AddWeakLambda(this, [this](UFoundryFriendRow* R, const FVector2D& Pos) { OpenFriendMenu(R, Pos); });
@@ -774,53 +1059,39 @@ void UFoundrySocialDrawer::OpenFriendMenu(UFoundryFriendRow* Row, const FVector2
 	CloseFriendMenu(); // only one menu open at a time
 
 	UFoundrySocialSubsystem* Sdk = Subsystem();
-	const bool bSignedIn = Sdk && Sdk->IsSignedIn();
-	const bool bFull = Sdk && Sdk->JoinedCount() >= Sdk->PartyCapacity();
-	const bool bLocalLeader = !Sdk || !Sdk->HasParty() || Sdk->IsLocalLeader();
-	bool bAlreadyInParty = false;
+
+	// Everything the menu's entries depend on, gathered once; the decision itself (which entries, which
+	// enabled, why not) is FoundryPartyRules::PlanFriendMenu so the launcher-parity rules live in one
+	// tested place instead of here.
+	FoundryPartyRules::FFriendMenuContext Ctx;
+	Ctx.Kind = Row->Kind;
+	Ctx.bPendingMember = Row->Kind == EFoundryFriendRowKind::Party && !Row->bIsJoined;
+	Ctx.bSignedIn = Sdk && Sdk->IsSignedIn();
+	Ctx.bHasParty = Sdk && Sdk->HasParty();
+	Ctx.bLocalLeader = !Sdk || !Sdk->HasParty() || Sdk->IsLocalLeader();
+	Ctx.bTargetInviteExpired = Row->IsInviteExpired();
+	Ctx.bFriendPartyJoinable = Row->Friend.bPartyJoinable;
+	Ctx.PartyCount = Sdk ? Sdk->JoinedCount() + Sdk->LiveInvitedCount() : 0;
+	Ctx.Cap = Sdk ? FoundryPartyRules::CapFor(*Sdk) : 0;
 	if (Sdk && Sdk->HasParty())
 	{
 		for (const FFoundryPartyMember& M : Sdk->Party().Members)
 		{
 			if (M.FoundryId == Row->Friend.FoundryId)
 			{
-				bAlreadyInParty = true;
+				Ctx.bTargetInLocalParty = true;
 				break;
 			}
 		}
 	}
-	const bool bCanInvite = bSignedIn && !bFull && bLocalLeader && !bAlreadyInParty;
-	const bool bCanRequestJoin = bSignedIn && Sdk && !Sdk->HasParty();
-
-	// Same precedence Setup applies when it folds Row->Kind into the enabled check (!bOnline also
-	// disables Invite there) - checked here too so the reason matches why it's actually disabled.
-	FString InviteDisabledReason;
-	if (!bCanInvite || Row->Kind != EFoundryFriendRowKind::Online)
+	const FoundryPartyRules::FFriendMenuPlan Plan = FoundryPartyRules::PlanFriendMenu(Ctx);
+	if (!Plan.AnyShown())
 	{
-		if (Row->Kind == EFoundryFriendRowKind::Offline)
-		{
-			InviteDisabledReason = TEXT("They're offline.");
-		}
-		else if (!bSignedIn)
-		{
-			InviteDisabledReason = TEXT("Sign in to invite friends.");
-		}
-		else if (bAlreadyInParty)
-		{
-			InviteDisabledReason = TEXT("They're already in your party.");
-		}
-		else if (bFull)
-		{
-			InviteDisabledReason = TEXT("Party is full.");
-		}
-		else if (!bLocalLeader)
-		{
-			InviteDisabledReason = TEXT("Only the host can invite.");
-		}
+		return; // a row the local player has nothing to do with (e.g. a pending invitee on a non-leader's roster)
 	}
 
 	ActiveMenu = CreateWidget<UFoundryFriendMenu>(this, FriendMenuClass);
-	ActiveMenu->Setup(Row->Kind, Row->Friend.DisplayName, bCanInvite, InviteDisabledReason, bCanRequestJoin);
+	ActiveMenu->Setup(Row->Kind, Row->Friend.DisplayName, Plan);
 	ActiveMenu->OnItem.AddUObject(this, &UFoundrySocialDrawer::HandleMenuItem);
 	ActiveMenu->OnConfirm.AddUObject(this, &UFoundrySocialDrawer::HandleMenuConfirm);
 	ActiveMenu->OnCancel.AddUObject(this, &UFoundrySocialDrawer::HandleMenuCancel);
@@ -907,6 +1178,26 @@ void UFoundrySocialDrawer::HandleMenuItem(EFoundryFriendMenuItem Item)
 			Sdk->RequestToJoin(TargetId);
 		}
 		CloseFriendMenu();
+		break;
+	case EFoundryFriendMenuItem::ReInvite:
+		// Resets the invite's 15-minute clock and re-notifies (fid: a repeat invite bumps expires_at).
+		if (Sdk)
+		{
+			Sdk->ReInvite(TargetId);
+		}
+		CloseFriendMenu();
+		break;
+	case EFoundryFriendMenuItem::CancelInvite:
+		if (Sdk)
+		{
+			Sdk->CancelInvite(TargetId);
+		}
+		CloseFriendMenu();
+		break;
+	case EFoundryFriendMenuItem::RemoveFromParty:
+		// TargetId / TargetDisplayName were copied above: closing the menu clears ActiveMenu.
+		CloseFriendMenu();
+		AskKickMember(TargetId, TargetDisplayName);
 		break;
 	case EFoundryFriendMenuItem::RemoveFriend:
 		PendingAction = Item;

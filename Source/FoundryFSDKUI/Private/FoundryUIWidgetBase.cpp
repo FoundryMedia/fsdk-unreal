@@ -10,6 +10,7 @@
 #include "FoundryConfirmDialog.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryMenuHost.h"
+#include "FoundryPartyFollowComponent.h"
 #include "FoundryTooltip.h"
 #include "FoundryUISettings.h"
 #include "Framework/Application/IMenu.h"
@@ -396,6 +397,23 @@ UObject* UFoundryUIWidgetBase::FindMenuHost() const
 			*ClassName.ToString(), PC ? *GetNameSafe(PC->GetClass()) : TEXT("null"));
 	}
 	return nullptr;
+}
+
+void UFoundryUIWidgetBase::NotifyPartyOfLeave() const
+{
+	UFoundryPartyFollowComponent::NotifyLocalLeavingFor(GetOwningPlayer());
+}
+
+bool UFoundryUIWidgetBase::LeaveMatchViaHost() const
+{
+	UObject* Host = FindMenuHost();
+	if (Host == nullptr)
+	{
+		return false;
+	}
+	NotifyPartyOfLeave();
+	IFoundryMenuHost::Execute_RequestLeaveMatch(Host);
+	return true;
 }
 
 UFoundryConfirmDialog* UFoundryUIWidgetBase::OpenConfirmDialog(const FText& Title, const FText& Body, const FText& ConfirmLabel,

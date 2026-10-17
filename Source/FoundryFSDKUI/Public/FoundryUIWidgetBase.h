@@ -124,6 +124,22 @@ public:
 	UObject* FindMenuHost() const;
 
 	/**
+	 * Tells the party the LOCAL player is leaving a match: when they lead a party and the match is already
+	 * over, UFoundryPartyFollowComponent (on the owning controller) fans "the leader left" out so their
+	 * party leaves too - the platform default, switchable with UFoundryUISettings::
+	 * bPartyFollowsLeaderOnLeave. Call BEFORE the leave itself so the message is queued while the
+	 * connection is up. A no-op for everyone else and for a game that never added the component.
+	 */
+	void NotifyPartyOfLeave() const;
+
+	/**
+	 * The ONE kit path out of a match through the host: NotifyPartyOfLeave, then IFoundryMenuHost::
+	 * RequestLeaveMatch. False (and nothing done) when there is no host - the caller logs its own warning.
+	 * Every kit leave button goes through this so none of them can skip the party notice.
+	 */
+	bool LeaveMatchViaHost() const;
+
+	/**
 	 * Creates + pushes a UFoundryConfirmDialog (ClassOverride, else UFoundryUISettings::
 	 * DefaultConfirmDialog) through the host when one is available, else AddToViewport(30) - the
 	 * shared "confirm before a destructive action" seam the pause menu's QUIT TO DESKTOP/LEAVE MATCH

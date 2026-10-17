@@ -6,12 +6,14 @@
 #include "Engine/TimerHandle.h"
 #include "FoundryFriendRow.h" // EFoundryFriendRowKind
 #include "FoundryFriendMenu.h" // EFoundryFriendMenuItem
+#include "FoundryInviteClock.h"
 #include "FoundryUIWidgetBase.h"
 #include "FoundrySocialDrawer.generated.h"
 
 class IMenu;
 class UButton;
 class UEditableTextBox;
+class UFoundryConfirmDialog;
 class UFoundryFriendMenu;
 class UFoundryFriendRow;
 class UFoundryInviteRow;
@@ -130,18 +132,23 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> AccountNameText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> AccountUsernameText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ManageAccountButton;
-	/** "YOUR PARTY   3 / 8". */
+	/** "YOUR PARTY   3 / 4" - the cap is the selected mode's in game (else the platform cap); over it
+	 *  the text reads "8 / 4 - too big for this mode" in the Error palette colour. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> PartyHeaderText;
 	/** Toggles your own ready flag (SetReady); visible only while in a party. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ReadyToggleButton;
 	/** "READY" / "UNREADY" - mirrors UFoundrySocialSubsystem::IsSelfReady(). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> ReadyToggleText;
-	/** Shown only when the server reports a party cap that differs from the subsystem's default. */
+	/** Shown only while the party is bigger than its cap (names the cap and what to do about it). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> CapConflictText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> PartyList;
 	/** The "PARTY INVITES" label + list container; hidden when there are none. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> InvitesSection;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> InvitesList;
+	/** The leader's "JOIN REQUESTS" label + list container; shown only while the local player leads a
+	 *  party and somebody is asking to join it. Rows are InviteRowClass rows in join-request mode. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> JoinRequestsSection;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UPanelWidget> JoinRequestsList;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> RequestsNote;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> OnlineToggleButton;
 	/** "ONLINE   2". */
@@ -167,7 +174,8 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> AddFriendSendButton;
 	/** Why adding a friend is blocked, shown after ADD FRIEND is pressed. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> AddFriendNote;
-	/** Shown for 6s after a non-friend-request action fails (OnActionMessage mirrors it to the host). */
+	/** Shown for 6s after a non-friend-request action fails (OnActionMessage mirrors it to the host), and
+	 *  for 4s after one succeeds ("Asked Sam to join" - the platform's own sentence). */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> ActionNote;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> AddFriendButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> LeaveButton;
@@ -187,10 +195,33 @@ private:
 	UFUNCTION() void HandleLeaveParty();
 	UFUNCTION() void HandleReadyToggle();
 	void HandleActionFailed(const FString& Action, const FString& Message);
+	/** OnActionSucceeded is a DYNAMIC multicast delegate (FName, FString): a UFUNCTION bound with AddDynamic. */
+	UFUNCTION() void HandleActionSucceeded(FName Action, const FString& Message);
+	/** The ActionNote line: red for a failure, green for a success; hides itself after Seconds. */
+	void ShowActionNote(const FString& Message, bool bError, float Seconds);
+
+	/** Accept on an invite row. Accepting while you LEAD a party with other joined members leaves it (fid's
+	 *  accept auto-leaves; leadership transfers to the longest-standing member and your pending invites
+	 *  end), so that case confirms first. A lone leader's party just ends, so it accepts at once. */
+	void HandleAcceptInvite(const FString& PartyId);
+	UFUNCTION() void HandleAcceptConfirmed();
+	UFUNCTION() void HandleAcceptCancelled();
+
+	/** Remove from party: destructive, so it confirms first (the kit's confirm dialog, pushed through the host). */
+	void AskKickMember(const FString& FoundryId, const FString& DisplayName);
+	UFUNCTION() void HandleKickConfirmed();
+	UFUNCTION() void HandleKickCancelled();
 
 	/** Sets bDirty; the actual rebuild runs at most once per frame, from NativeTick, and only while
 	 *  the drawer is Visible (a collapsed drawer rebuilds exactly once, the frame it next opens). */
 	void MarkDirty();
+	/** OnChanged: records invite countdown anchors (below), then MarkDirty. */
+	void HandleSocialChanged();
+	/** First-sight anchor per pending invite: the countdown starts when the UI first RECEIVED the row (or
+	 *  its ExpiresAt changed - a re-invite), never from the local wall clock vs fid's ExpiresAt (a fast
+	 *  client clock would expire every live invite). Rows fid stops returning are pruned. */
+	void NoteInviteClocks();
+	FoundryPartyRules::FInviteClock ClockFor(const FString& Key) const;
 	void Rebuild();
 	void ApplyAddFriendEntry();
 	UFoundryFriendRow* AddFriendRow(UPanelWidget* List);
@@ -216,6 +247,26 @@ private:
 
 	TWeakObjectPtr<UFoundrySocialSubsystem> SubsystemWeak;
 
+	// The open "accepting disbands your party" confirm (GC-hold while open) + the invite it will accept.
+	UPROPERTY(Transient) TObjectPtr<UFoundryConfirmDialog> ActiveConfirm;
+	FString PendingAcceptPartyId;
+
+	// The open "remove <name> from the party?" confirm (GC-hold while open) + who it will remove.
+	UPROPERTY(Transient) TObjectPtr<UFoundryConfirmDialog> ActiveKickConfirm;
+	FString PendingKickFoundryId;
+
+	struct FInviteAnchor
+	{
+		FDateTime ExpiresAt;
+		FoundryPartyRules::FInviteClock Clock;
+	};
+	/** Key "m:<foundryId>" for a pending roster member, "i:<partyId>" for an incoming invite. */
+	TMap<FString, FInviteAnchor> InviteAnchors;
+
+	// PartyHeaderText's own colour, captured on the first rebuild, so the over-size Error tint can be undone.
+	FSlateColor PartyHeaderNormalColor;
+	bool bPartyHeaderColorCaptured = false;
+
 	// The open context menu widget (GC-hold - the UWidget isn't kept alive by its own Slate content
 	// alone, so a strong ref is held here while PushMenu's IMenu is open) + its dismiss handle.
 	UPROPERTY(Transient) TObjectPtr<UFoundryFriendMenu> ActiveMenu;
@@ -238,4 +289,6 @@ private:
 	TMap<FString, TObjectPtr<UFoundryFriendRow>> OfflineRowsByFoundryId;
 	TMap<FString, TObjectPtr<UFoundryFriendRow>> BlockedRowsByFoundryId;
 	TMap<FString, TObjectPtr<UFoundryInviteRow>> InviteRowsByPartyId;
+	/** Join-request rows, keyed by the requester's FoundryId. */
+	TMap<FString, TObjectPtr<UFoundryInviteRow>> JoinRequestRowsByFoundryId;
 };

@@ -691,6 +691,15 @@ typedef struct fsdk_friend {
     char username[64];        /* Unique handle.                               */
     char presence[16];        /* online|idle|away|dnd|offline                 */
     char presence_game[128];  /* Running game title (empty when none).        */
+    /* The friend's party, WITHOUT its id (fid never leaks the partyId): from the
+     * friends list's nullable `party {size, maxSize, joinable}` block. All 0 when
+     * the friend is in no party (or on pending/blocked/join-request rows, which
+     * carry none). joinable = the party has room under the platform cap and the
+     * caller is not already in it - what gates an "Ask to join" affordance. */
+    int  in_party;
+    int  party_size;
+    int  party_max_size;
+    int  party_joinable;
 } fsdk_friend;
 
 /* Fetch the player's friends. Fills up to capacity entries; *out_count gets
@@ -744,6 +753,17 @@ typedef struct fsdk_party_member {
      * Cleared SERVER-side on leave/removal, leader change, and disband -
      * never inferred client-side. */
     int  ready;
+    /* Platform IN-MATCH flag (fid party_member.in_match_at, fresh within the
+     * server stale window) - 0/1. Set by the member's OWN client when it
+     * travels into a match and cleared when the match ends or it leaves; 0
+     * when absent (older servers). Never inferred from tickets: after the
+     * horn every seat is expired while the player is still in the match. */
+    int  in_match;
+    /* An INVITED member's invite lifetime (fid invitedAt / expiresAt, ISO-8601
+     * UTC; empty on a JOINED row or from an older server). An invite is dead once
+     * expires_at is in the past - the host renders "expires in N min" / "expired". */
+    char invited_at[32];
+    char expires_at[32];
 } fsdk_party_member;
 
 /* The party header (id empty when the player is not in a party). */
@@ -752,6 +772,15 @@ typedef struct fsdk_party {
     char leader_foundry_id[64];
     char leader_display_name[128]; /* resolved from the member list */
     int  max_size;
+    /* The launcher's party cap (fid platformMaxSize); falls back to max_size from
+     * an older server. A party can sit OVER it ("8 / 6") when a game mode's cap
+     * let it grow - nobody is kicked, invites outside a mode are just blocked. */
+    int  platform_max_size;
+    /* On a fsdk_social_party_invites row only: the CALLER's own invite clock
+     * (their member row's invitedAt / expiresAt). Empty when the session's
+     * foundry id is not yet known to the client, or from an older server. */
+    char my_invited_at[32];
+    char my_expires_at[32];
 } fsdk_party;
 
 /* Full party snapshot: header + members. *out_count = members written. */
@@ -770,6 +799,35 @@ fsdk_result fsdk_social_party_invites(fsdk_client* client,
 fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, size_t out_sz);
 fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
                                      const char* username);
+
+/* Longest queue key the party calls accept (a derived "{game}/{mode}" name or a
+ * queue id; the server's names are far shorter). */
+#define FSDK_QUEUE_KEY_MAX 100
+
+/* The same invite, held to a GAME MODE: a non-NULL/non-empty queue_key makes fid
+ * cap the party at that queue's party cap instead of the platform cap (the launcher
+ * passes none). The by-id variant is for a re-invite from a member row. Re-inviting
+ * a still-INVITED member resets the invite clock and re-notifies. */
+fsdk_result fsdk_social_party_invite_for_queue(fsdk_client* client, const char* party_id,
+                                               const char* username, const char* queue_key);
+fsdk_result fsdk_social_party_invite_id_for_queue(fsdk_client* client, const char* party_id,
+                                                  const char* foundry_id,
+                                                  const char* queue_key);
+
+/* Leader-only: withdraw a pending invite / remove a JOINED member (never yourself).
+ * Uniform FSDK_ERR_NO_MATCH on an unknown party, a non-leader caller or no such row. */
+fsdk_result fsdk_social_party_cancel_invite(fsdk_client* client, const char* party_id,
+                                            const char* foundry_id);
+fsdk_result fsdk_social_party_kick(fsdk_client* client, const char* party_id,
+                                   const char* foundry_id);
+
+/* What a queue holds a party to: GET /v1/fmms/queues/party-cap?key=<key> (key = a
+ * queue id or its derived name, resolved like a ticket submit; sent percent-encoded as
+ * a query value). *out_party_cap = the
+ * largest party the mode seats (min(queue maxPartySize ?? teamSize, teamSize));
+ * out_team_size is optional. FSDK_ERR_NO_MATCH for an unknown queue. */
+fsdk_result fsdk_fmms_party_cap(fsdk_client* client, const char* queue_key,
+                                int* out_party_cap, int* out_team_size);
 fsdk_result fsdk_social_party_accept(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_decline(fsdk_client* client, const char* party_id);
 fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
@@ -779,6 +837,14 @@ fsdk_result fsdk_social_party_leave(fsdk_client* client, const char* party_id);
  * party_member.ready_at). Idempotent. FSDK_ERR_NO_MATCH on the uniform 404
  * (caller is not a JOINED member of that party / the party doesn't exist). */
 fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_id, int ready);
+
+/* Set/clear the CALLER's own IN-MATCH flag on a party they have JOINED (fid
+ * party_member.in_match_at) - what the lobby reads to show "In match" on a
+ * member's nameplate. Same contract as fsdk_social_party_set_ready: idempotent,
+ * FSDK_ERR_NO_MATCH on the uniform 404, FSDK_ERR_INVALID_ARG on a malformed
+ * party id. */
+fsdk_result fsdk_social_party_set_in_match(fsdk_client* client, const char* party_id,
+                                           int in_match);
 
 /* Ask to join the party a FRIEND is currently in (parties stay invite-only -
  * this files a request the party's LEADER answers). fid resolves the friend's
@@ -798,6 +864,10 @@ fsdk_result fsdk_social_party_join_requests(fsdk_client* client, const char* par
  * the leader's join-request notification server-side. */
 fsdk_result fsdk_social_party_join_accept(fsdk_client* client, const char* party_id,
                                          const char* requester_foundry_id);
+/* join_accept held to the leader's selected mode (queue_key as for the invites above). */
+fsdk_result fsdk_social_party_join_accept_for_queue(fsdk_client* client, const char* party_id,
+                                                    const char* requester_foundry_id,
+                                                    const char* queue_key);
 fsdk_result fsdk_social_party_join_decline(fsdk_client* client, const char* party_id,
                                           const char* requester_foundry_id);
 

@@ -8,8 +8,10 @@
 #include "Components/Slider.h"
 #include "Components/TextBlock.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/Texture2D.h" // TSoftObjectPtr<UTexture2D>::LoadSynchronous() needs the full type
+#include "Engine/World.h"
 #include "EnhancedInputSubsystems.h"
 #include "FoundryConfirmDialog.h"
 #include "FoundryGameUserSettings.h"
@@ -104,6 +106,7 @@ void UFoundrySettingsMenu::NativeOnInitialized()
 		UIScaleSlider->OnControllerCaptureEnd.AddDynamic(this, &UFoundrySettingsMenu::HandleAudioSliderCaptureEnd);
 	}
 	if (ReducedMotionCheck) { ReducedMotionCheck->OnCheckStateChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleReducedMotionChanged); }
+	if (DeveloperModeCheck) { DeveloperModeCheck->OnCheckStateChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleDeveloperModeChanged); }
 	if (ResetAllKeysButton) { ResetAllKeysButton->OnClicked.AddDynamic(this, &UFoundrySettingsMenu::HandleResetAllKeysClicked); }
 
 	SetIsFocusable(true);
@@ -463,6 +466,7 @@ void UFoundrySettingsMenu::PopulateAudioAndInterface()
 	if (UIScaleSlider) { UIScaleSlider->SetValue(Settings->GetUIScale()); }
 	SetText(UIScaleValueText, FString::Printf(TEXT("%.2fx"), Settings->GetUIScale()));
 	if (ReducedMotionCheck) { ReducedMotionCheck->SetIsChecked(Settings->IsReducedMotion()); }
+	if (DeveloperModeCheck) { DeveloperModeCheck->SetIsChecked(Settings->IsDeveloperModeEnabled()); }
 }
 
 void UFoundrySettingsMenu::HandleMasterVolumeChanged(float Value)
@@ -541,6 +545,24 @@ void UFoundrySettingsMenu::HandleReducedMotionChanged(bool bIsChecked)
 	}
 	Settings->SetReducedMotion(bIsChecked);
 	Settings->SaveSettings();
+}
+
+void UFoundrySettingsMenu::HandleDeveloperModeChanged(bool bIsChecked)
+{
+	if (bPopulating)
+	{
+		return;
+	}
+	UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get();
+	if (Settings == nullptr)
+	{
+		return;
+	}
+	Settings->SetDeveloperModeEnabled(bIsChecked);
+	Settings->SaveSettings();
+	// Live: the console subsystem answers the key press on the next frame, no restart.
+	UWorld* World = GetWorld();
+	Settings->ApplyDeveloperMode(World ? World->GetGameInstance() : nullptr);
 }
 
 void UFoundrySettingsMenu::HandleAudioSliderCaptureEnd()
@@ -857,6 +879,8 @@ void UFoundrySettingsMenu::BuildDescribedRows()
 		TEXT("Makes every menu and HUD element bigger or smaller."));
 	Add(ReducedMotionRow, TEXT("ReducedMotionRow"), TEXT("Reduced motion"),
 		TEXT("Shortens or removes animated transitions."));
+	Add(DeveloperModeRow, TEXT("DeveloperModeRow"), TEXT("Developer mode"),
+		TEXT("Press ~ to open the Foundry console (Foundry and game commands only)."));
 	Add(ControlsRow, TEXT("ControlsRow"), TEXT("Controls"),
 		TEXT("Click a key to rebind it, then press the new key. Escape cancels. Reset puts a key back to its default."));
 }

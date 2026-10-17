@@ -3,7 +3,7 @@
 #include "Components/TextBlock.h"
 #include "FoundryUISettings.h"
 
-void UFoundryPartyNameplate::Setup(const FString& Name, bool bLeader, bool bReady, bool bLocal)
+void UFoundryPartyNameplate::Setup(const FString& Name, bool bLeader, bool bReady, bool bLocal, bool bInMatch)
 {
 	SetText(NameText, Name);
 	if (NameText)
@@ -13,6 +13,7 @@ void UFoundryPartyNameplate::Setup(const FString& Name, bool bLeader, bool bRead
 	Show(CrownIcon, bLeader);
 	Show(HostBadge, bLeader);
 	Show(ReadyIcon, bReady);
+	Show(InMatchBadge, bInMatch);
 	OnPlateUpdated();
 }
 

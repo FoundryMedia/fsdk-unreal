@@ -14,6 +14,8 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/OutputDevice.h"
 #include "Misc/ScopeLock.h"
+#include "Misc/StringOutputDevice.h"
+#include "HAL/IConsoleManager.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "Misc/App.h"
@@ -363,13 +365,30 @@ public:
 									.ColorAndOpacity(FLinearColor(0.75f, 0.95f, 1.f))
 								]
 							]
+							// The completion dropdown: sits on the input box, lists what the typed text can become
+							// (Foundry commands first, then - only with -EngineConsole - the engine's). Up / Down pick a row, Tab
+							// or Enter takes it.
 							+ SVerticalBox::Slot()
 							.AutoHeight()
 							.Padding(0.f, 8.f, 0.f, 0.f)
 							[
+								SNew(SBorder)
+								.BorderImage(White)
+								.BorderBackgroundColor(FLinearColor(0.02f, 0.05f, 0.08f, 0.98f))
+								.Padding(FMargin(8.f, 4.f))
+								.Visibility_Lambda([this]() { return Suggestions.Num() > 0 ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+								[
+									SAssignNew(SuggestList, SVerticalBox)
+								]
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.Padding(0.f, 2.f, 0.f, 0.f)
+							[
 								SAssignNew(InputBox, SEditableTextBox)
 								.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
 								.HintText(FText::FromString(TEXT("Type 'help' for commands")))
+								.OnTextChanged(this, &SFoundryConsole::HandleTextChanged)
 								.OnTextCommitted(this, &SFoundryConsole::HandleCommitted)
 								.OnKeyDownHandler(this, &SFoundryConsole::HandleInputKeyDown)
 							]
@@ -656,6 +675,12 @@ private:
 		{
 			return;
 		}
+		if (Suggestions.IsValidIndex(SuggestIndex))
+		{
+			ApplySuggestion(SuggestIndex);   // Enter on a picked row takes the row; the next Enter runs the line
+			FocusInput();
+			return;
+		}
 		const FString Line = Text.ToString();
 		InputBox->SetText(FText::GetEmpty());
 		HistoryIndex = INDEX_NONE;
@@ -684,6 +709,21 @@ private:
 			}
 			return FReply::Unhandled();
 		}
+		if ((Key == EKeys::Up || Key == EKeys::Down) && Suggestions.Num() > 0)
+		{
+			// the dropdown is open: the arrows walk its rows (history is for an empty line)
+			const int32 Count = Suggestions.Num();
+			if (SuggestIndex == INDEX_NONE)
+			{
+				SuggestIndex = Key == EKeys::Down ? 0 : Count - 1;
+			}
+			else
+			{
+				SuggestIndex = (SuggestIndex + (Key == EKeys::Down ? 1 : Count - 1)) % Count;
+			}
+			RebuildSuggestRows();
+			return FReply::Handled();
+		}
 		if (Key == EKeys::Up)
 		{
 			NavigateHistory(-1);
@@ -696,10 +736,138 @@ private:
 		}
 		if (Key == EKeys::Tab)
 		{
-			TabComplete(); // also keeps Tab from walking focus out of the box
+			if (Suggestions.Num() > 0)
+			{
+				TabSuggest();
+			}
+			else
+			{
+				TabComplete(); // also keeps Tab from walking focus out of the box
+			}
 			return FReply::Handled();
 		}
 		return FReply::Unhandled();
+	}
+
+	void HandleTextChanged(const FText& Text)
+	{
+		UFoundryConsoleSubsystem* Sub = Owner.Get();
+		Suggestions.Reset();
+		SuggestIndex = INDEX_NONE;
+		if (Sub != nullptr)
+		{
+			Sub->GetSuggestions(Text.ToString(), Suggestions);
+			// a single row that is exactly what is typed says nothing new unless it carries a description
+			if (Suggestions.Num() == 1 && Suggestions[0].Line.Equals(Text.ToString().TrimStartAndEnd(), ESearchCase::IgnoreCase) && Suggestions[0].Help.IsEmpty())
+			{
+				Suggestions.Reset();
+			}
+		}
+		RebuildSuggestRows();
+	}
+
+	void RebuildSuggestRows()
+	{
+		if (!SuggestList.IsValid())
+		{
+			return;
+		}
+		SuggestList->ClearChildren();
+		const int32 Count = Suggestions.Num();
+		const int32 Visible = 10;
+		const int32 First = SuggestIndex >= Visible ? SuggestIndex - Visible + 1 : 0;
+		const int32 Last = FMath::Min(First + Visible, Count);
+		for (int32 Index = First; Index < Last; ++Index)
+		{
+			const bool bPicked = Index == SuggestIndex;
+			SuggestList->AddSlot()
+			.AutoHeight()
+			[
+				SNew(SBorder)
+				.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+				.BorderBackgroundColor(bPicked ? FLinearColor(0.10f, 0.32f, 0.40f, 0.9f) : FLinearColor::Transparent)
+				.Padding(FMargin(4.f, 1.f))
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					[
+						SNew(STextBlock)
+						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 10))
+						.ColorAndOpacity(bPicked ? FLinearColor::White : FLinearColor(0.75f, 0.95f, 1.f))
+						.Text(FText::FromString(Suggestions[Index].Line))
+					]
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.f)
+					.Padding(FMargin(16.f, 0.f, 0.f, 0.f))
+					[
+						SNew(STextBlock)
+						.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
+						.ColorAndOpacity(FLinearColor(0.45f, 0.55f, 0.65f))
+						.Text(FText::FromString(Suggestions[Index].Help))
+					]
+				]
+			];
+		}
+		if (Count > Last || First > 0)
+		{
+			SuggestList->AddSlot()
+			.AutoHeight()
+			.Padding(FMargin(4.f, 1.f))
+			[
+				SNew(STextBlock)
+				.Font(FCoreStyle::GetDefaultFontStyle("Mono", 9))
+				.ColorAndOpacity(FLinearColor(0.35f, 0.45f, 0.55f))
+				.Text(FText::FromString(FString::Printf(TEXT("%d - %d of %d   (Up / Down, Tab to take)"), First + 1, Last, Count)))
+			];
+		}
+	}
+
+	void ApplySuggestion(int32 Index)
+	{
+		if (!Suggestions.IsValidIndex(Index) || !InputBox.IsValid())
+		{
+			return;
+		}
+		const FString Line = Suggestions[Index].Line + TEXT(" ");
+		InputBox->SetText(FText::FromString(Line));   // fires HandleTextChanged: the list refreshes for the new line
+		InputBox->GoTo(ETextLocation::EndOfDocument);
+	}
+
+	/** Tab with the dropdown open: take the picked row, or the only row; otherwise extend the line to what every
+	 *  row shares, and when nothing more is shared pick the first row. */
+	void TabSuggest()
+	{
+		if (Suggestions.IsValidIndex(SuggestIndex))
+		{
+			ApplySuggestion(SuggestIndex);
+			return;
+		}
+		if (Suggestions.Num() == 1)
+		{
+			ApplySuggestion(0);
+			return;
+		}
+		FString Shared = Suggestions[0].Line;
+		for (const UFoundryConsoleSubsystem::FSuggestion& Row : Suggestions)
+		{
+			int32 Same = 0;
+			const int32 Limit = FMath::Min(Shared.Len(), Row.Line.Len());
+			while (Same < Limit && FChar::ToLower(Shared[Same]) == FChar::ToLower(Row.Line[Same]))
+			{
+				++Same;
+			}
+			Shared.LeftInline(Same);
+		}
+		const FString Current = InputBox->GetText().ToString().TrimStart();
+		if (Shared.Len() > Current.Len())
+		{
+			InputBox->SetText(FText::FromString(Shared));
+			InputBox->GoTo(ETextLocation::EndOfDocument);
+			return;
+		}
+		SuggestIndex = 0;
+		RebuildSuggestRows();
 	}
 
 	void NavigateHistory(int32 Direction)
@@ -775,6 +943,10 @@ private:
 	EDrag Drag = EDrag::None;
 	bool bWindowed = false;
 	bool bHasWindowRect = false;
+
+	TSharedPtr<SVerticalBox> SuggestList;
+	TArray<UFoundryConsoleSubsystem::FSuggestion> Suggestions;
+	int32 SuggestIndex = INDEX_NONE;
 
 	FString PendingInput;
 	int32 HistoryIndex = INDEX_NONE;
@@ -1455,6 +1627,100 @@ FString UFoundryConsoleSubsystem::SanitizeForEcho(const FString& Line) const
 
 // ── Command registry ────────────────────────────────────────────────────────────
 
+namespace
+{
+	bool IsFoundryConsoleWordChar(TCHAR C)
+	{
+		return FChar::IsAlnum(C) || C == TEXT('_') || C == TEXT('-') || C == TEXT('.');
+	}
+
+	/** A command's first-argument words, read out of its help text - so a game that registers `goo` with
+	 *  "goo debug (...) | goo reset | goo help" gets `goo debug` / `goo reset` / `goo help` in the dropdown
+	 *  with no extra call. Two spellings are understood: alternatives that repeat the command's name,
+	 *  separated by | ; and a bracketed option list, [on|off|1|0]. */
+	void DeriveFoundryConsoleArguments(const FString& Name, const FString& Help, TArray<UFoundryConsoleSubsystem::FSuggestion>& Out)
+	{
+		Out.Reset();
+		// split on | outside brackets
+		TArray<FString> Parts;
+		FString Part;
+		int32 Depth = 0;
+		for (const TCHAR C : Help)
+		{
+			if (C == TEXT('(') || C == TEXT('['))
+			{
+				++Depth;
+			}
+			else if (C == TEXT(')') || C == TEXT(']'))
+			{
+				Depth = FMath::Max(Depth - 1, 0);
+			}
+			if (C == TEXT('|') && Depth == 0)
+			{
+				Parts.Add(Part);
+				Part.Reset();
+			}
+			else
+			{
+				Part.AppendChar(C);
+			}
+		}
+		Parts.Add(Part);
+
+		const FString Lead = Name + TEXT(" ");
+		for (const FString& Raw : Parts)
+		{
+			const FString Text = Raw.TrimStartAndEnd();
+			if (!Text.StartsWith(Lead, ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+			const FString Rest = Text.Mid(Lead.Len()).TrimStart();
+			int32 End = 0;
+			while (End < Rest.Len() && IsFoundryConsoleWordChar(Rest[End]))
+			{
+				++End;
+			}
+			if (End == 0)
+			{
+				continue;
+			}
+			FString Describe = Rest.Mid(End).TrimStartAndEnd();
+			if (Describe.StartsWith(TEXT("(")) && Describe.EndsWith(TEXT(")")))
+			{
+				Describe = Describe.Mid(1, Describe.Len() - 2);
+			}
+			Out.Add({ Lead + Rest.Left(End).ToLower(), Describe });
+		}
+		if (Out.Num() > 0)
+		{
+			return;
+		}
+
+		// a bracketed option list
+		int32 Open = INDEX_NONE;
+		int32 Close = INDEX_NONE;
+		if (Help.FindChar(TEXT('['), Open) && Help.FindChar(TEXT(']'), Close) && Close > Open + 1)
+		{
+			TArray<FString> Options;
+			Help.Mid(Open + 1, Close - Open - 1).ParseIntoArray(Options, TEXT("|"));
+			for (FString& Option : Options)
+			{
+				Option.TrimStartAndEndInline();
+				bool bWord = !Option.IsEmpty();
+				for (const TCHAR C : Option)
+				{
+					bWord = bWord && IsFoundryConsoleWordChar(C);
+				}
+				if (bWord)
+				{
+					Out.Add({ Lead + Option.ToLower(), FString() });
+				}
+			}
+		}
+	}
+}
+
 void UFoundryConsoleSubsystem::RegisterCommand(const FString& Name, const FString& Help,
 	EFoundryConsoleAccess Access, FFoundryConsoleHandler Handler)
 {
@@ -1462,7 +1728,24 @@ void UFoundryConsoleSubsystem::RegisterCommand(const FString& Name, const FStrin
 	Entry.Help = Help;
 	Entry.Access = Access;
 	Entry.Handler = MoveTemp(Handler);
+	DeriveFoundryConsoleArguments(Name.ToLower(), Help, Entry.Arguments);
 	Commands.Add(Name.ToLower(), MoveTemp(Entry));
+}
+
+void UFoundryConsoleSubsystem::SetCommandArguments(const FString& Name, const TArray<FString>& Arguments)
+{
+	if (FCommandEntry* Entry = Commands.Find(Name.ToLower()))
+	{
+		Entry->Arguments.Reset();
+		for (const FString& Argument : Arguments)
+		{
+			const FString Word = Argument.TrimStartAndEnd().ToLower();
+			if (!Word.IsEmpty())
+			{
+				Entry->Arguments.Add({ Name.ToLower() + TEXT(" ") + Word, FString() });
+			}
+		}
+	}
 }
 
 void UFoundryConsoleSubsystem::RegisterConsoleCommand(const FString& Name, const FString& Help,
@@ -1537,6 +1820,25 @@ FString UFoundryConsoleSubsystem::Execute(const FString& Line)
 		return Dispatch(FoundryCommands, Tokens[1].ToLower(), Args, TEXT("foundry "));
 	}
 
+#if !UE_BUILD_SHIPPING
+	// Opt-in, non-Shipping only: with -EngineConsole a line that is not a Foundry command goes to the ENGINE's
+	// console (cvars such as "r.AntiAliasingMethod 1", "stat fps", exec commands). The developer-mode checkbox
+	// never turns this on - it exposes the Foundry and game commands only (Justin, 2026-10-16). Compiled out of
+	// Shipping, where the engine console does not exist either: a published build can run nothing but the
+	// registered commands.
+	if (bEngineExecEnabled && !Commands.Contains(Tokens[0].ToLower()) && GEngine != nullptr)
+	{
+		FStringOutputDevice EngineOutput;
+		EngineOutput.SetAutoEmitLineTerminator(true);
+		const bool bHandled = GEngine->Exec(GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr, *Line, EngineOutput);
+		FString Reply = FString(*EngineOutput).TrimStartAndEnd();
+		if (bHandled || !Reply.IsEmpty())
+		{
+			return Reply.IsEmpty() ? FString::Printf(TEXT("engine: %s"), *Line) : Reply;
+		}
+	}
+#endif
+
 	TArray<FString> Args(Tokens.GetData() + 1, Tokens.Num() - 1);
 	return Dispatch(Commands, Tokens[0].ToLower(), Args, TEXT(""));
 }
@@ -1579,6 +1881,106 @@ namespace
 			Prefix.LeftInline(j);
 		}
 		return Prefix;
+	}
+}
+
+void UFoundryConsoleSubsystem::GetSuggestions(const FString& Current, TArray<FSuggestion>& Out, int32 MaxCount) const
+{
+	Out.Reset();
+	const FString Trimmed = Current.TrimStartAndEnd();
+	if (Trimmed.IsEmpty() || IsAwaitingPassword())
+	{
+		return;
+	}
+	const bool bTrailingSpace = Current.TrimStart().EndsWith(TEXT(" "));
+	TArray<FString> Tokens;
+	Trimmed.ParseIntoArrayWS(Tokens);
+	auto ByLine = [](const FSuggestion& A, const FSuggestion& B) { return A.Line < B.Line; };
+
+	if (Tokens.Num() == 1 && !bTrailingSpace)
+	{
+		const FString Prefix = Tokens[0].ToLower();
+		for (const TPair<FString, FCommandEntry>& Pair : Commands)
+		{
+			if (IsCommandAvailable(Pair.Value) && Pair.Key.StartsWith(Prefix))
+			{
+				Out.Add({ Pair.Key, Pair.Value.Help });
+			}
+		}
+		if (FString(TEXT("foundry")).StartsWith(Prefix))
+		{
+			Out.Add({ TEXT("foundry"), TEXT("Foundry services: foundry <command>") });
+		}
+		Out.Sort(ByLine);
+#if !UE_BUILD_SHIPPING
+		// The engine's own console objects, after the Foundry commands. Only with -EngineConsole, the same gate
+		// as the pass-through in Execute(): neither developer mode nor a published build lists them.
+		if (bEngineExecEnabled)
+		{
+			TArray<FSuggestion> Engine;
+			IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(FConsoleObjectVisitor::CreateLambda(
+				[&Engine](const TCHAR* Name, IConsoleObject* Object)
+				{
+					if (Object == nullptr || Object->TestFlags(ECVF_Unregistered))
+					{
+						return;
+					}
+					FString Help = Object->GetHelp();
+					int32 Break = INDEX_NONE;
+					if (Help.FindChar(TEXT('\n'), Break))
+					{
+						Help.LeftInline(Break);
+					}
+					Help.TrimStartAndEndInline();
+					if (Help.Len() > 96)
+					{
+						Help = Help.Left(93) + TEXT("...");
+					}
+					if (IConsoleVariable* Variable = Object->AsVariable())
+					{
+						Help = FString::Printf(TEXT("= %s   %s"), *Variable->GetString(), *Help);
+					}
+					Engine.Add({ FString(Name), Help });
+				}), *Tokens[0]);
+			Engine.Sort(ByLine);
+			Out.Append(Engine);
+		}
+#endif
+	}
+	else if (Tokens[0].Equals(TEXT("foundry"), ESearchCase::IgnoreCase)
+		&& (Tokens.Num() == 1 || (Tokens.Num() == 2 && !bTrailingSpace)))
+	{
+		const FString Prefix = Tokens.Num() > 1 ? Tokens[1].ToLower() : FString();
+		for (const TPair<FString, FCommandEntry>& Pair : FoundryCommands)
+		{
+			if (IsCommandAvailable(Pair.Value) && Pair.Key.StartsWith(Prefix))
+			{
+				Out.Add({ TEXT("foundry ") + Pair.Key, Pair.Value.Help });
+			}
+		}
+		Out.Sort(ByLine);
+	}
+	else if ((Tokens.Num() == 1 && bTrailingSpace) || (Tokens.Num() == 2 && !bTrailingSpace))
+	{
+		// a registered command's first argument (`goo ` -> goo debug / goo reset / goo help), in the order its
+		// help text lists them
+		const FCommandEntry* Entry = Commands.Find(Tokens[0].ToLower());
+		if (Entry != nullptr && IsCommandAvailable(*Entry))
+		{
+			const FString Typed = (Tokens[0] + TEXT(" ") + (Tokens.Num() > 1 ? Tokens[1] : FString())).ToLower();
+			for (const FSuggestion& Argument : Entry->Arguments)
+			{
+				if (Argument.Line.StartsWith(Typed))
+				{
+					Out.Add(Argument);
+				}
+			}
+		}
+	}
+
+	if (Out.Num() > MaxCount)
+	{
+		Out.SetNum(MaxCount);
 	}
 }
 

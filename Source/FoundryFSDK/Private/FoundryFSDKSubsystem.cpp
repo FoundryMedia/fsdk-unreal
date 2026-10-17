@@ -20,6 +20,7 @@
 #include "foundry/fsdk.h"
 #include "FoundryFSDKLauncherHandoff.h"
 #include "FoundryFSDKTransport.h"
+#include "FoundrySocialConvert.h"
 
 #include "Async/Async.h"
 #include "HAL/CriticalSection.h"
@@ -792,6 +793,46 @@ static fsdk_result FoundryFSDKChatJoinCall(fsdk_chat* Chat, fsdk_chat_channel Ch
 	}
 }
 
+/** Re-read the launcher's session token and install it on the core client. The 15-min daemon token
+ *  expires mid-session; this is the ONE place it is re-minted (chat joins and every social call share
+ *  it). WORKER THREAD ONLY (the pipe read blocks), and the CALLER HOLDS the core lock - the lock is the
+ *  single flight: a second worker that also saw UNAUTHORIZED queues behind it and then runs with the
+ *  fresh token, so a burst of 401s presents ONE re-mint, never a pipe read per call. Returns true when
+ *  a fresh token is now installed. */
+static bool FoundryFSDKRemintLauncherTokenLocked(
+	const TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe>& CoreRef)
+{
+	FString Fresh;
+	if (!FoundryFSDKReadLauncherToken(Fresh) || Fresh.IsEmpty())
+	{
+		return false;
+	}
+	const FTCHARToUTF8 FreshUtf8(*Fresh);
+	if (fsdk_set_player_token(CoreRef->Client, FreshUtf8.Get()) != FSDK_OK)
+	{
+		return false;
+	}
+	UE_LOG(LogFoundryFSDK, Log, TEXT("Re-minted the launcher session token (the previous one expired)."));
+	return true;
+}
+
+/** Run one core call under the core lock the CALLER holds; on UNAUTHORIZED with a re-mintable launcher
+ *  session, re-mint ONCE and retry the call ONCE. A second UNAUTHORIZED is the real failure. Without
+ *  this every social read went silently deaf ~15 min after launch (the stale token 401s, the caches
+ *  keep their last values, and actions said "Sign in through the Foundry launcher first"). */
+template <typename FCall>
+static fsdk_result FoundryFSDKCallWithRemintLocked(
+	const TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe>& CoreRef, bool bCanReHandoff, FCall&& Call)
+{
+	fsdk_result Result = Call();
+	if (Result == FSDK_ERR_UNAUTHORIZED && bCanReHandoff
+		&& FoundryFSDKRemintLauncherTokenLocked(CoreRef))
+	{
+		Result = Call();
+	}
+	return Result;
+}
+
 /** The ONE join path every channel routes through, with the launcher re-mint
  *  retry: run the channel's join and, on UNAUTHORIZED with a re-mintable
  *  launcher session, transparently re-mint the 15-min daemon token and retry
@@ -819,14 +860,9 @@ static fsdk_result FoundryFSDKChatJoinLocked(
 		// The 15-min daemon token expired mid-session: transparently re-mint
 		// from the launcher and retry the join once. Worker thread - the pipe
 		// read is allowed to block here.
-		FString Fresh;
-		if (FoundryFSDKReadLauncherToken(Fresh) && !Fresh.IsEmpty())
+		if (FoundryFSDKRemintLauncherTokenLocked(CoreRef))
 		{
-			const FTCHARToUTF8 FreshUtf8(*Fresh);
-			if (fsdk_set_player_token(CoreRef->Client, FreshUtf8.Get()) == FSDK_OK)
-			{
-				Result = FoundryFSDKChatJoinCall(CoreRef->Chat, Channel, KeyUtf8.Get());
-			}
+			Result = FoundryFSDKChatJoinCall(CoreRef->Chat, Channel, KeyUtf8.Get());
 		}
 	}
 	return Result;
@@ -1105,8 +1141,9 @@ void UFoundryFSDKSubsystem::RefreshFriends()
 		OnFriendsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		TArray<fsdk_friend> Buf;
 		Buf.SetNum(64); // server caps friends at 50
@@ -1114,20 +1151,17 @@ void UFoundryFSDKSubsystem::RefreshFriends()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_friends(CoreRef->Client, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_friends(CoreRef->Client, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		TArray<FFoundryFriend> Friends;
 		Friends.Reserve(static_cast<int32>(Count));
 		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
 		{
-			FFoundryFriend F;
-			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
-			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
-			F.Username = UTF8_TO_TCHAR(Buf[i].username);
-			F.Presence = UTF8_TO_TCHAR(Buf[i].presence);
-			F.PresenceGame = UTF8_TO_TCHAR(Buf[i].presence_game);
-			Friends.Add(MoveTemp(F));
+			Friends.Add(FoundrySocialConvert::Friend(Buf[i]));
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Friends = MoveTemp(Friends)]()
 		{
@@ -1147,36 +1181,32 @@ void UFoundryFSDKSubsystem::RefreshParty()
 		OnPartyUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FFoundryParty());
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		fsdk_party Header;
+		// A party can hold up to 16 rows (a game mode's cap); a short buffer would silently drop members.
 		TArray<fsdk_party_member> Buf;
 		Buf.SetNum(16);
 		size_t Count = 0;
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_party_info(CoreRef->Client, &Header, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_party_info(CoreRef->Client, &Header, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		FFoundryParty Party;
 		if (Result == FSDK_OK)
 		{
-			Party.PartyId = UTF8_TO_TCHAR(Header.id);
-			Party.LeaderFoundryId = UTF8_TO_TCHAR(Header.leader_foundry_id);
-			Party.LeaderDisplayName = UTF8_TO_TCHAR(Header.leader_display_name);
-			Party.MaxSize = Header.max_size;
+			FoundrySocialConvert::PartyHeader(Header, Party);
 			Party.Members.Reserve(static_cast<int32>(Count));
 			for (size_t i = 0; i < Count; i++)
 			{
-				FFoundryPartyMember M;
-				M.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
-				M.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
-				M.Username = UTF8_TO_TCHAR(Buf[i].username);
-				M.State = UTF8_TO_TCHAR(Buf[i].state);
-				M.bReady = Buf[i].ready != 0;
-				Party.Members.Add(MoveTemp(M));
+				Party.Members.Add(FoundrySocialConvert::Member(Buf[i]));
 			}
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Party = MoveTemp(Party)]()
@@ -1207,8 +1237,9 @@ void UFoundryFSDKSubsystem::RefreshPartyInvites()
 		OnPartyInvitesUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		TArray<fsdk_party> Buf;
 		Buf.SetNum(8);
@@ -1216,18 +1247,18 @@ void UFoundryFSDKSubsystem::RefreshPartyInvites()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_party_invites(CoreRef->Client, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_party_invites(CoreRef->Client, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		TArray<FFoundryParty> Invites;
 		Invites.Reserve(static_cast<int32>(Count));
 		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
 		{
 			FFoundryParty P;
-			P.PartyId = UTF8_TO_TCHAR(Buf[i].id);
-			P.LeaderFoundryId = UTF8_TO_TCHAR(Buf[i].leader_foundry_id);
-			P.LeaderDisplayName = UTF8_TO_TCHAR(Buf[i].leader_display_name);
-			P.MaxSize = Buf[i].max_size;
+			FoundrySocialConvert::PartyHeader(Buf[i], P);
 			Invites.Add(MoveTemp(P));
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Invites = MoveTemp(Invites)]()
@@ -1248,8 +1279,9 @@ void UFoundryFSDKSubsystem::RefreshPendingRequests()
 		OnPendingUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		TArray<fsdk_friend> Buf;
 		Buf.SetNum(64);
@@ -1257,19 +1289,17 @@ void UFoundryFSDKSubsystem::RefreshPendingRequests()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_pending(CoreRef->Client, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_pending(CoreRef->Client, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		TArray<FFoundryFriend> Pending;
 		Pending.Reserve(static_cast<int32>(Count));
 		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
 		{
-			FFoundryFriend F;
-			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
-			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
-			F.Username = UTF8_TO_TCHAR(Buf[i].username);
-			F.Presence = UTF8_TO_TCHAR(Buf[i].presence);
-			Pending.Add(MoveTemp(F));
+			Pending.Add(FoundrySocialConvert::Friend(Buf[i]));
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Pending = MoveTemp(Pending)]()
 		{
@@ -1290,15 +1320,21 @@ void UFoundryFSDKSubsystem::RunSocialAction(const FString& Action, bool bRefresh
 		OnSocialActionComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated, Action);
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis, Action, bRefreshPartyOnOk,
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis, Action, bRefreshPartyOnOk,
 		Call = MoveTemp(Call)]()
 	{
 		fsdk_result Result;
 		FString ServerMessage;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = static_cast<fsdk_result>(Call(*CoreRef));
+			// Re-mint + retry once on UNAUTHORIZED (every action here is a single idempotent-or-refused
+			// request, so the retry cannot double an effect: a 401 means fid never ran it).
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return static_cast<fsdk_result>(Call(*CoreRef));
+			});
 			if (Result != FSDK_OK)
 			{
 				// The core keeps fid's sentence for the failed call; read it under the same lock.
@@ -1370,8 +1406,9 @@ void UFoundryFSDKSubsystem::RefreshBlocked()
 		OnBlockedUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		TArray<fsdk_friend> Buf;
 		Buf.SetNum(64);
@@ -1379,20 +1416,19 @@ void UFoundryFSDKSubsystem::RefreshBlocked()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_blocked(CoreRef->Client, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_blocked(CoreRef->Client, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		// Presence is never reported for a block (fid sends empty strings) -
-		// leave F.Presence/F.PresenceGame at their default-empty value.
+		// the converted row carries them default-empty.
 		TArray<FFoundryFriend> Blocked;
 		Blocked.Reserve(static_cast<int32>(Count));
 		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
 		{
-			FFoundryFriend F;
-			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
-			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
-			F.Username = UTF8_TO_TCHAR(Buf[i].username);
-			Blocked.Add(MoveTemp(F));
+			Blocked.Add(FoundrySocialConvert::Friend(Buf[i]));
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Blocked = MoveTemp(Blocked)]()
 		{
@@ -1451,10 +1487,80 @@ void UFoundryFSDKSubsystem::CreateParty()
 
 void UFoundryFSDKSubsystem::InviteToParty(const FString& PartyId, const FString& Username)
 {
-	RunSocialAction(TEXT("party.invite"), false, [PartyId, Username](FFsdkCoreState& State)
+	InviteToPartyForQueue(PartyId, Username, FString());
+}
+
+void UFoundryFSDKSubsystem::InviteToPartyForQueue(const FString& PartyId, const FString& Username,
+	const FString& QueueKey)
+{
+	// A refresh follows: the pending row (and its expiry clock) is part of the roster.
+	RunSocialAction(TEXT("party.invite"), true, [PartyId, Username, QueueKey](FFsdkCoreState& State)
 	{
-		return (int32)fsdk_social_party_invite(State.Client,
-			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*Username));
+		return (int32)fsdk_social_party_invite_for_queue(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*Username),
+			QueueKey.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*QueueKey));
+	});
+}
+
+void UFoundryFSDKSubsystem::InviteToPartyById(const FString& PartyId, const FString& FoundryId,
+	const FString& QueueKey)
+{
+	RunSocialAction(TEXT("party.invite"), true, [PartyId, FoundryId, QueueKey](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_invite_id_for_queue(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*FoundryId),
+			QueueKey.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*QueueKey));
+	});
+}
+
+void UFoundryFSDKSubsystem::CancelPartyInvite(const FString& PartyId, const FString& FoundryId)
+{
+	RunSocialAction(TEXT("party.cancel_invite"), true, [PartyId, FoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_cancel_invite(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*FoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::KickFromParty(const FString& PartyId, const FString& FoundryId)
+{
+	RunSocialAction(TEXT("party.kick"), true, [PartyId, FoundryId](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_kick(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*FoundryId));
+	});
+}
+
+void UFoundryFSDKSubsystem::RefreshPartyCap(const FString& QueueKey)
+{
+	TSharedPtr<FFsdkCoreState, ESPMode::ThreadSafe> CoreRef = EnsureClient();
+	if (!CoreRef.IsValid() || CoreRef->Client == nullptr)
+	{
+		OnPartyCapUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, QueueKey, 0, 0);
+		return;
+	}
+	const bool bCanReHandoff = bLauncherSession;
+	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, QueueKey, WeakThis]()
+	{
+		int Cap = 0;
+		int Team = 0;
+		fsdk_result Result;
+		{
+			FScopeLock Lock(&CoreRef->CS);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_fmms_party_cap(CoreRef->Client, TCHAR_TO_UTF8(*QueueKey), &Cap, &Team);
+			});
+		}
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, QueueKey, Cap, Team]()
+		{
+			if (UFoundryFSDKSubsystem* Self = WeakThis.Get())
+			{
+				Self->OnPartyCapUpdated.Broadcast(ToBlueprintResult(Result), QueueKey,
+					Result == FSDK_OK ? Cap : 0, Result == FSDK_OK ? Team : 0);
+			}
+		});
 	});
 }
 
@@ -1490,6 +1596,14 @@ void UFoundryFSDKSubsystem::SetPartyReady(const FString& PartyId, bool bReady)
 	});
 }
 
+void UFoundryFSDKSubsystem::SetPartyInMatch(const FString& PartyId, bool bInMatch)
+{
+	RunSocialAction(TEXT("party.in_match"), true, [PartyId, bInMatch](FFsdkCoreState& State)
+	{
+		return (int32)fsdk_social_party_set_in_match(State.Client, TCHAR_TO_UTF8(*PartyId), bInMatch ? 1 : 0);
+	});
+}
+
 void UFoundryFSDKSubsystem::RequestToJoinParty(const FString& FriendFoundryId)
 {
 	// No RefreshParty chain: a request only stages a row on the FRIEND's party -
@@ -1508,8 +1622,9 @@ void UFoundryFSDKSubsystem::RefreshPartyJoinRequests(const FString& PartyId)
 		OnPartyJoinRequestsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, PartyId, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, PartyId, WeakThis]()
 	{
 		TArray<fsdk_friend> Buf;
 		Buf.SetNum(64);
@@ -1517,18 +1632,17 @@ void UFoundryFSDKSubsystem::RefreshPartyJoinRequests(const FString& PartyId)
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_social_party_join_requests(CoreRef->Client, TCHAR_TO_UTF8(*PartyId),
-				Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_social_party_join_requests(CoreRef->Client, TCHAR_TO_UTF8(*PartyId),
+					Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
-		TArray<FFoundryFriend> Requests;
+		TArray<FFoundryJoinRequest> Requests;
 		Requests.Reserve(static_cast<int32>(Count));
 		for (size_t i = 0; Result == FSDK_OK && i < Count; i++)
 		{
-			FFoundryFriend F;
-			F.FoundryId = UTF8_TO_TCHAR(Buf[i].foundry_id);
-			F.DisplayName = UTF8_TO_TCHAR(Buf[i].display_name);
-			F.Username = UTF8_TO_TCHAR(Buf[i].username);
-			Requests.Add(MoveTemp(F));
+			Requests.Add(FoundrySocialConvert::JoinRequest(Buf[i]));
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result, Requests = MoveTemp(Requests)]()
 		{
@@ -1542,11 +1656,18 @@ void UFoundryFSDKSubsystem::RefreshPartyJoinRequests(const FString& PartyId)
 
 void UFoundryFSDKSubsystem::AcceptPartyJoinRequest(const FString& PartyId, const FString& RequesterFoundryId)
 {
+	AcceptPartyJoinRequestForQueue(PartyId, RequesterFoundryId, FString());
+}
+
+void UFoundryFSDKSubsystem::AcceptPartyJoinRequestForQueue(const FString& PartyId,
+	const FString& RequesterFoundryId, const FString& QueueKey)
+{
 	// Adds the member to the party I lead - same shape as AcceptPartyInvite.
-	RunSocialAction(TEXT("party.join_accept"), true, [PartyId, RequesterFoundryId](FFsdkCoreState& State)
+	RunSocialAction(TEXT("party.join_accept"), true, [PartyId, RequesterFoundryId, QueueKey](FFsdkCoreState& State)
 	{
-		return (int32)fsdk_social_party_join_accept(State.Client,
-			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*RequesterFoundryId));
+		return (int32)fsdk_social_party_join_accept_for_queue(State.Client,
+			TCHAR_TO_UTF8(*PartyId), TCHAR_TO_UTF8(*RequesterFoundryId),
+			QueueKey.IsEmpty() ? nullptr : TCHAR_TO_UTF8(*QueueKey));
 	});
 }
 
@@ -1568,8 +1689,9 @@ void UFoundryFSDKSubsystem::RefreshConversations()
 		OnConversationsUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, WeakThis]()
 	{
 		TArray<fsdk_dm_conversation> Buf;
 		Buf.SetNum(64);
@@ -1577,8 +1699,11 @@ void UFoundryFSDKSubsystem::RefreshConversations()
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_dm_conversations(CoreRef->Client, Buf.GetData(),
-				static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_dm_conversations(CoreRef->Client, Buf.GetData(),
+					static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		TArray<FFoundryDmConversation> Conversations;
 		Conversations.Reserve(static_cast<int32>(Count));
@@ -1612,8 +1737,9 @@ void UFoundryFSDKSubsystem::RefreshWhisperHistory(const FString& FriendFoundryId
 		OnWhisperHistoryUpdated.Broadcast(EFoundryFsdkResult::NotAuthenticated, FriendFoundryId, {});
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, FriendFoundryId, WeakThis]()
 	{
 		// fsdk_dm_message carries a 2KB body buffer - heap, never the stack.
 		TArray<fsdk_dm_message> Buf;
@@ -1622,8 +1748,11 @@ void UFoundryFSDKSubsystem::RefreshWhisperHistory(const FString& FriendFoundryId
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_dm_history(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId),
-				Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_dm_history(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId),
+					Buf.GetData(), static_cast<size_t>(Buf.Num()), &Count);
+			});
 		}
 		TArray<FFoundryDmMessage> Messages;
 		Messages.Reserve(static_cast<int32>(Count));
@@ -1657,14 +1786,19 @@ void UFoundryFSDKSubsystem::SendWhisper(const FString& FriendFoundryId, const FS
 		OnWhisperSendComplete.Broadcast(EFoundryFsdkResult::NotAuthenticated);
 		return;
 	}
+	const bool bCanReHandoff = bLauncherSession;
 	TWeakObjectPtr<UFoundryFSDKSubsystem> WeakThis(this);
-	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId, Body, WeakThis]()
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, FriendFoundryId, Body, WeakThis]()
 	{
 		fsdk_result Result;
 		{
 			FScopeLock Lock(&CoreRef->CS);
-			Result = fsdk_dm_send(CoreRef->Client,
-				TCHAR_TO_UTF8(*FriendFoundryId), TCHAR_TO_UTF8(*Body));
+			// A 401 means fid never ran the send, so the one retry cannot double a whisper.
+			Result = FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+			{
+				return fsdk_dm_send(CoreRef->Client,
+					TCHAR_TO_UTF8(*FriendFoundryId), TCHAR_TO_UTF8(*Body));
+			});
 		}
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, Result]()
 		{
@@ -1683,10 +1817,14 @@ void UFoundryFSDKSubsystem::MarkWhisperRead(const FString& FriendFoundryId)
 	{
 		return;
 	}
-	Async(EAsyncExecution::Thread, [CoreRef, FriendFoundryId]()
+	const bool bCanReHandoff = bLauncherSession;
+	Async(EAsyncExecution::Thread, [CoreRef, bCanReHandoff, FriendFoundryId]()
 	{
 		FScopeLock Lock(&CoreRef->CS);
-		(void)fsdk_dm_mark_read(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId));
+		(void)FoundryFSDKCallWithRemintLocked(CoreRef, bCanReHandoff, [&]()
+		{
+			return fsdk_dm_mark_read(CoreRef->Client, TCHAR_TO_UTF8(*FriendFoundryId));
+		});
 	});
 }
 

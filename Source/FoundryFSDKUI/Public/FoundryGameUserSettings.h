@@ -39,6 +39,21 @@ public:
 	UPROPERTY(Config)
 	bool bReducedMotion = false;
 
+	/** Developer mode: lets the console key open the Foundry console (Foundry + game commands only, never
+	 *  the engine's) and the overlay key toggle the stats overlay. Also forced on by -DevMode. Lives in the
+	 *  kit base, not a game subclass, so every kit game gets the same checkbox (Justin, 2026-10-16:
+	 *  "a developer mode toggle on the settings to enable the tilde to open the foundry console"). */
+	UPROPERTY(Config)
+	bool bDeveloperModeEnabled = false;
+
+	/** Key that opens the Foundry console (an EKeys name, e.g. "Tilde"). */
+	UPROPERTY(Config)
+	FString ConsoleKey = TEXT("Tilde");
+
+	/** Key that toggles the read-only stats overlay (an EKeys name, e.g. "F9"). */
+	UPROPERTY(Config)
+	FString DebugOverlayKey = TEXT("F9");
+
 	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
 	float GetMasterVolume() const { return MasterVolume; }
 
@@ -53,6 +68,15 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
 	bool IsReducedMotion() const { return bReducedMotion; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	bool IsDeveloperModeEnabled() const { return bDeveloperModeEnabled; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	FString GetConsoleKeyName() const { return ConsoleKey; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	FString GetDebugOverlayKeyName() const { return DebugOverlayKey; }
 
 	/** Clamps 0..1. Does not save or re-apply audio on its own - the settings menu/subsystem batches
 	 *  that (a slider mid-drag calling SetMasterVolume on every tick must not hit disk every tick). */
@@ -72,6 +96,28 @@ public:
 	/** Broadcasts OnInterfaceSettingsChanged. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
 	void SetReducedMotion(bool bReduced);
+
+	/** Only stores the flag - ApplyDeveloperMode pushes it into the console, SaveSettings persists it
+	 *  (the settings menu does all three, in that order's spirit: set, save, apply). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetDeveloperModeEnabled(bool bEnabled);
+
+	/** An EKeys name; an unknown name is ignored (the previous key stays). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetConsoleKeyName(const FString& KeyName);
+
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetDebugOverlayKeyName(const FString& KeyName);
+
+	/**
+	 * Pushes developer mode LIVE into GameInstance's UFoundryConsoleSubsystem: the master switch
+	 * (bDeveloperModeEnabled, or -DevMode / -DebugOverlay on the command line), both keys, and the
+	 * engine pass-through (ONLY -EngineConsole in a non-Shipping build, never the saved switch). No
+	 * restart: the key processor reads the subsystem on every key press. A null instance or a missing
+	 * console subsystem (a dedicated server) is a silent no-op.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void ApplyDeveloperMode(UGameInstance* GameInstance) const;
 
 	/** Fired whenever UIScale or bReducedMotion changes - the two settings a screen's LAYOUT
 	 *  depends on (volumes never trigger this; nothing visual depends on them). */

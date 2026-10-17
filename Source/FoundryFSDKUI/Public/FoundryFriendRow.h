@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "FoundryFSDKSubsystem.h" // FFoundryFriend
+#include "FoundryInviteClock.h"
 #include "FoundryUIWidgetBase.h"
 #include "FoundryFriendRow.generated.h"
 
@@ -42,6 +43,17 @@ public:
 	void Setup(const FFoundryFriend& InFriend, EFoundryFriendRowKind InKind, bool bInHost, bool bInLocal,
 		bool bInJoined, const FLinearColor& InTint, const FString& InStatusOverride, bool bInReady = false);
 
+	/**
+	 * A pending (INVITED, not joined) party-member row: the invite's countdown (anchored on when the UI
+	 * received the row, not on the local wall clock). Call AFTER Setup (Setup clears it). The status line then reads "Invited - expires in 3 min" / "Invite expired" and
+	 * re-renders once a second - the leader sees how long the invite they sent still lives. An unset
+	 * clock (an older fid) leaves Setup's plain "Invited - not joined" alone.
+	 */
+	void SetInviteExpiry(const FoundryPartyRules::FInviteClock& InClock);
+
+	/** True while a pending row's invite has expired (the leader's menu offers Re-invite, not Cancel-only). */
+	bool IsInviteExpired() const;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI")
 	FFoundryFriend Friend;
 
@@ -76,6 +88,7 @@ public:
 	void OnRowUpdated();
 
 protected:
+	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 	virtual FReply NativeOnMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent) override;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UImage> Avatar;
@@ -91,4 +104,10 @@ protected:
 	 *  inline action by overriding NativeOnInitialized and wiring it itself. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> ActionButton;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> ActionText;
+
+private:
+	void RefreshInviteStatus();
+
+	FoundryPartyRules::FInviteClock InviteClock;
+	float InviteExpiryAccumulator = 0.0f;
 };

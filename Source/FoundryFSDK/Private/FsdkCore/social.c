@@ -29,8 +29,10 @@
 #define SOCIAL_DM_PATH "/v1/social/dm"
 
 /* Per-object scratch: the largest row is a DM message (2000-char body + JSON
- * overhead); friends/conversations are far smaller. */
-#define SOCIAL_OBJ_BUF (FSDK_DM_BODY_MAX + 1024)
+ * overhead); friends/conversations are far smaller. The +4096 headroom is for a
+ * PARTY row: a party of 16 members carries invitedAt/expiresAt on every pending
+ * row, and a row that overflows the scratch ends the walk with no party at all. */
+#define SOCIAL_OBJ_BUF (FSDK_DM_BODY_MAX + 4096)
 
 /* ---- shared plumbing ------------------------------------------------------ */
 
@@ -94,6 +96,43 @@ static int valid_foundry_id(const char* id) {
 
 /* ---- friends --------------------------------------------------------------- */
 
+/* The friend row's nullable `party {size, maxSize, joinable}` block - what the
+ * friend's party looks like WITHOUT its id (fid never leaks the partyId: FMMS
+ * groups tickets by attributes.partyId unvalidated). Absent/null = not in a
+ * party = every field 0. The block is copied out first so a later key of the
+ * row can never be mistaken for one of its fields. */
+static void parse_friend_party(const char* obj, fsdk_friend* f) {
+    const char* v = json_value_after(obj, "party");
+    const char* end;
+    char blk[160];
+    size_t len;
+    long long n = 0;
+    int b = 0;
+    if (v == NULL || *v != '{') {
+        return;
+    }
+    end = strchr(v, '}');
+    if (end == NULL) {
+        return;
+    }
+    len = (size_t)(end - v) + 1;
+    if (len >= sizeof(blk)) {
+        len = sizeof(blk) - 1;
+    }
+    memcpy(blk, v, len);
+    blk[len] = '\0';
+    f->in_party = 1;
+    if (fsdk_json_extract_ll(blk, "size", &n)) {
+        f->party_size = (int)n;
+    }
+    if (fsdk_json_extract_ll(blk, "maxSize", &n)) {
+        f->party_max_size = (int)n;
+    }
+    if (fsdk_json_extract_bool(blk, "joinable", &b)) {
+        f->party_joinable = b;
+    }
+}
+
 fsdk_result fsdk_social_friends(fsdk_client* client,
                                 fsdk_friend* out, size_t capacity, size_t* out_count) {
     char* body = NULL;
@@ -124,6 +163,7 @@ fsdk_result fsdk_social_friends(fsdk_client* client,
         (void)json_extract_string(obj, "username", f->username, sizeof(f->username));
         (void)json_extract_string(obj, "presence", f->presence, sizeof(f->presence));
         (void)json_extract_string(obj, "presenceGame", f->presence_game, sizeof(f->presence_game));
+        parse_friend_party(obj, f);
         if (f->foundry_id[0] != '\0') {
             n++;
         }
@@ -563,11 +603,15 @@ fsdk_result fsdk_social_redeem_code(fsdk_client* client, const char* code) {
 /* ---- parties ------------------------------------------------------------------ */
 
 /* Parse one PartyResponse object into a header; resolve the leader's display
- * name by scanning the nested members array for the leader's foundryId. */
-static void parse_party_header(const char* obj, fsdk_party* out) {
+ * name by scanning the nested members array for the leader's foundryId. When
+ * self_id is non-empty, the caller's OWN member row also gives the invite's
+ * lifetime (my_invited_at / my_expires_at) - the /invites list carries every
+ * invitee of the party, so only the caller's row is THIS invite's clock. */
+static void parse_party_header(const char* obj, const char* self_id, fsdk_party* out) {
     long long max_size = 0;
+    long long platform_max = 0;
     const char* mcursor;
-    char mobj[512];
+    char mobj[768];
     memset(out, 0, sizeof(*out));
     (void)json_extract_string(obj, "id", out->id, sizeof(out->id));
     (void)json_extract_string(obj, "leaderFoundryId", out->leader_foundry_id,
@@ -575,16 +619,29 @@ static void parse_party_header(const char* obj, fsdk_party* out) {
     if (fsdk_json_extract_ll(obj, "maxSize", &max_size)) {
         out->max_size = (int)max_size;
     }
+    /* platformMaxSize is the launcher's cap (the number invites are held to
+     * outside a game mode); an older fid sends none, so it falls back to maxSize. */
+    if (fsdk_json_extract_ll(obj, "platformMaxSize", &platform_max) && platform_max > 0) {
+        out->platform_max_size = (int)platform_max;
+    } else {
+        out->platform_max_size = out->max_size;
+    }
     mcursor = json_value_after(obj, "members");
     mcursor = mcursor != NULL ? strchr(mcursor, '[') : NULL;
     mcursor = mcursor != NULL ? mcursor + 1 : NULL;
     while ((mcursor = fsdk_json_next_object(mcursor, mobj, sizeof(mobj))) != NULL) {
         char member_id[64];
         (void)json_extract_string(mobj, "foundryId", member_id, sizeof(member_id));
-        if (strcmp(member_id, out->leader_foundry_id) == 0) {
+        if (out->leader_display_name[0] == '\0'
+                && strcmp(member_id, out->leader_foundry_id) == 0) {
             (void)json_extract_string(mobj, "displayName", out->leader_display_name,
                                       sizeof(out->leader_display_name));
-            return;
+        }
+        if (self_id != NULL && self_id[0] != '\0' && strcmp(member_id, self_id) == 0) {
+            (void)json_extract_string(mobj, "invitedAt", out->my_invited_at,
+                                      sizeof(out->my_invited_at));
+            (void)json_extract_string(mobj, "expiresAt", out->my_expires_at,
+                                      sizeof(out->my_expires_at));
         }
     }
 }
@@ -612,7 +669,7 @@ fsdk_result fsdk_social_party_invites(fsdk_client* client,
     }
     cursor = fsdk_json_array_start(body);
     while (n < capacity && (cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
-        parse_party_header(obj, &out[n]);
+        parse_party_header(obj, client->foundry_id, &out[n]);
         if (out[n].id[0] != '\0') {
             n++;
         }
@@ -649,8 +706,8 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
     cursor = fsdk_json_array_start(body);
     if ((cursor = fsdk_json_next_object(cursor, obj, SOCIAL_OBJ_BUF)) != NULL) {
         const char* mcursor;
-        char mobj[512];
-        parse_party_header(obj, out_party);
+        char mobj[768];
+        parse_party_header(obj, NULL, out_party);
         /* walk the nested members array inside the copied party object */
         mcursor = json_value_after(obj, "members");
         mcursor = mcursor != NULL ? strchr(mcursor, '[') : NULL;
@@ -665,6 +722,10 @@ fsdk_result fsdk_social_party_info(fsdk_client* client, fsdk_party* out_party,
             (void)json_extract_string(mobj, "username", m->username, sizeof(m->username));
             (void)json_extract_string(mobj, "state", m->state, sizeof(m->state));
             (void)fsdk_json_extract_bool(mobj, "ready", &m->ready);
+            (void)fsdk_json_extract_bool(mobj, "inMatch", &m->in_match);
+            /* The invite's lifetime (INVITED rows only; null on JOINED = empty). */
+            (void)json_extract_string(mobj, "invitedAt", m->invited_at, sizeof(m->invited_at));
+            (void)json_extract_string(mobj, "expiresAt", m->expires_at, sizeof(m->expires_at));
             if (m->foundry_id[0] != '\0') {
                 n++;
             }
@@ -693,6 +754,9 @@ fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, si
     if (rc != FSDK_OK) {
         return rc;
     }
+    /* Keep fid's sentence for a failed create ("You're already in a party.") -
+     * without it a stale-cache 409 showed the generic fallback. */
+    fsdk_client_note_error(client, status, resp);
     rc = social_status_to_result(status);
     if (rc == FSDK_OK) {
         (void)json_extract_string(json_value_after(resp, "data"), "id", out_party_id, out_sz);
@@ -704,16 +768,74 @@ fsdk_result fsdk_social_party_create(fsdk_client* client, char* out_party_id, si
     return rc;
 }
 
-fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
-                                     const char* username) {
+/* One invite body: {"<field>":"<value>"} plus "queueKey" when the host names the
+ * mode the party is being built for (the server then holds the party to THAT
+ * queue's party cap instead of the platform cap). value is already validated. */
+static fsdk_result party_invite_common(fsdk_client* client, const char* party_id,
+                                       const char* field, const char* value,
+                                       const char* queue_key) {
     char path[160];
-    char payload[96];
+    char payload[320];
+    char qesc[192];
+    (void)snprintf(path, sizeof(path), "%s/%s/invites", SOCIAL_PARTIES_PATH, party_id);
+    if (queue_key != NULL && queue_key[0] != '\0') {
+        if (strlen(queue_key) > FSDK_QUEUE_KEY_MAX
+                || !fsdk_json_escape(queue_key, qesc, sizeof(qesc))) {
+            return FSDK_ERR_INVALID_ARG;
+        }
+        (void)snprintf(payload, sizeof(payload), "{\"%s\":\"%s\",\"queueKey\":\"%s\"}",
+                       field, value, qesc);
+    } else {
+        (void)snprintf(payload, sizeof(payload), "{\"%s\":\"%s\"}", field, value);
+    }
+    return social_post(client, path, payload);
+}
+
+fsdk_result fsdk_social_party_invite_for_queue(fsdk_client* client, const char* party_id,
+                                               const char* username, const char* queue_key) {
     if (!valid_party_id(party_id) || !valid_username(username)) {
         return FSDK_ERR_INVALID_ARG;
     }
-    (void)snprintf(path, sizeof(path), "%s/%s/invites", SOCIAL_PARTIES_PATH, party_id);
-    (void)snprintf(payload, sizeof(payload), "{\"username\":\"%s\"}", username);
-    return social_post(client, path, payload);
+    return party_invite_common(client, party_id, "username", username, queue_key);
+}
+
+fsdk_result fsdk_social_party_invite_id_for_queue(fsdk_client* client, const char* party_id,
+                                                  const char* foundry_id,
+                                                  const char* queue_key) {
+    if (!valid_party_id(party_id) || !valid_foundry_id(foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    return party_invite_common(client, party_id, "foundryId", foundry_id, queue_key);
+}
+
+fsdk_result fsdk_social_party_invite(fsdk_client* client, const char* party_id,
+                                     const char* username) {
+    return fsdk_social_party_invite_for_queue(client, party_id, username, NULL);
+}
+
+/* Leader-only: withdraw a pending invite (retires the invitee's notification
+ * server-side). A uniform 404 for an unknown party / non-leader / no such invite. */
+fsdk_result fsdk_social_party_cancel_invite(fsdk_client* client, const char* party_id,
+                                            const char* foundry_id) {
+    char path[192];
+    if (!valid_party_id(party_id) || !valid_foundry_id(foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/invites/%s",
+                   SOCIAL_PARTIES_PATH, party_id, foundry_id);
+    return social_delete(client, path);
+}
+
+/* Leader-only: remove a JOINED member (never yourself - that is leave). */
+fsdk_result fsdk_social_party_kick(fsdk_client* client, const char* party_id,
+                                   const char* foundry_id) {
+    char path[192];
+    if (!valid_party_id(party_id) || !valid_foundry_id(foundry_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/members/%s",
+                   SOCIAL_PARTIES_PATH, party_id, foundry_id);
+    return social_delete(client, path);
 }
 
 static fsdk_result party_verb(fsdk_client* client, const char* party_id, const char* verb) {
@@ -744,6 +866,17 @@ fsdk_result fsdk_social_party_set_ready(fsdk_client* client, const char* party_i
     }
     (void)snprintf(path, sizeof(path), "%s/%s/members/me/ready", SOCIAL_PARTIES_PATH, party_id);
     return social_put(client, path, ready ? "{\"ready\":true}" : "{\"ready\":false}");
+}
+
+fsdk_result fsdk_social_party_set_in_match(fsdk_client* client, const char* party_id,
+                                           int in_match) {
+    char path[160];
+    if (!valid_party_id(party_id)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s/in-match", SOCIAL_PARTIES_PATH, party_id);
+    return social_put(client, path,
+                      in_match ? "{\"inMatch\":true}" : "{\"inMatch\":false}");
 }
 
 /* ---- party join requests (leader-gated; parties stay invite-only) ----------- */
@@ -785,6 +918,10 @@ fsdk_result fsdk_social_party_join_requests(fsdk_client* client, const char* par
         fsdk_friend* f = &out[n];
         memset(f, 0, sizeof(*f));
         (void)json_extract_string(obj, "requesterFoundryId", f->foundry_id, sizeof(f->foundry_id));
+        if (f->foundry_id[0] == '\0') {
+            /* fid may send the friend-row shape (foundryId) for this list. */
+            (void)json_extract_string(obj, "foundryId", f->foundry_id, sizeof(f->foundry_id));
+        }
         (void)json_extract_string(obj, "displayName", f->display_name, sizeof(f->display_name));
         (void)json_extract_string(obj, "username", f->username, sizeof(f->username));
         if (f->foundry_id[0] != '\0') {
@@ -797,15 +934,32 @@ fsdk_result fsdk_social_party_join_requests(fsdk_client* client, const char* par
     return FSDK_OK;
 }
 
-fsdk_result fsdk_social_party_join_accept(fsdk_client* client, const char* party_id,
-                                         const char* requester_foundry_id) {
+fsdk_result fsdk_social_party_join_accept_for_queue(fsdk_client* client, const char* party_id,
+                                                    const char* requester_foundry_id,
+                                                    const char* queue_key) {
     char path[192];
+    char payload[256];
+    char qesc[192];
     if (!valid_party_id(party_id) || !valid_foundry_id(requester_foundry_id)) {
         return FSDK_ERR_INVALID_ARG;
     }
     (void)snprintf(path, sizeof(path), "%s/%s/join-requests/%s/accept",
                    SOCIAL_PARTIES_PATH, party_id, requester_foundry_id);
+    if (queue_key != NULL && queue_key[0] != '\0') {
+        /* The leader's selected mode: the seat is refused over THAT queue's cap. */
+        if (strlen(queue_key) > FSDK_QUEUE_KEY_MAX
+                || !fsdk_json_escape(queue_key, qesc, sizeof(qesc))) {
+            return FSDK_ERR_INVALID_ARG;
+        }
+        (void)snprintf(payload, sizeof(payload), "{\"queueKey\":\"%s\"}", qesc);
+        return social_post(client, path, payload);
+    }
     return social_post(client, path, "{}");
+}
+
+fsdk_result fsdk_social_party_join_accept(fsdk_client* client, const char* party_id,
+                                         const char* requester_foundry_id) {
+    return fsdk_social_party_join_accept_for_queue(client, party_id, requester_foundry_id, NULL);
 }
 
 fsdk_result fsdk_social_party_join_decline(fsdk_client* client, const char* party_id,
@@ -817,4 +971,99 @@ fsdk_result fsdk_social_party_join_decline(fsdk_client* client, const char* part
     (void)snprintf(path, sizeof(path), "%s/%s/join-requests/%s/decline",
                    SOCIAL_PARTIES_PATH, party_id, requester_foundry_id);
     return social_post(client, path, "{}");
+}
+
+/* ---- the party cap a queue enforces --------------------------------------------- */
+
+/* A queue key rides in a QUERY value (GET /v1/fmms/queues/party-cap?key=...): a derived
+ * name is "{gameSlug}/{modeSlug}" and a slash is legal in a query value, whereas an
+ * encoded %2F in a PATH segment is refused by Tomcat/Spring's firewall by default.
+ * Only slug/uuid characters pass this check, so the encoder below is defense in depth. */
+static int valid_queue_key(const char* key) {
+    size_t i;
+    if (key == NULL || key[0] == '\0' || key[0] == '/' || strlen(key) > FSDK_QUEUE_KEY_MAX
+            || strstr(key, "..") != NULL) {
+        return 0;
+    }
+    for (i = 0; key[i] != '\0'; i++) {
+        const char c = key[i];
+        const int ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+                       || (c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.'
+                       || c == '/';
+        if (!ok) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Percent-encode a query value: unreserved characters and '/' pass, every other
+ * byte becomes %XX (so a space, '&', '#', '%' or '=' can never end or split the
+ * value). Returns 0 when out would overflow. */
+static int encode_query_value(const char* in, char* out, size_t out_sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    size_t i;
+    for (i = 0; in[i] != '\0'; i++) {
+        const unsigned char c = (unsigned char)in[i];
+        const int plain = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+                          || (c >= 'A' && c <= 'Z') || c == '-' || c == '_' || c == '.'
+                          || c == '~' || c == '/';
+        if (plain) {
+            if (o + 1 >= out_sz) {
+                return 0;
+            }
+            out[o++] = (char)c;
+        } else {
+            if (o + 3 >= out_sz) {
+                return 0;
+            }
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        }
+    }
+    out[o] = '\0';
+    return 1;
+}
+
+fsdk_result fsdk_fmms_party_cap(fsdk_client* client, const char* queue_key,
+                                int* out_party_cap, int* out_team_size) {
+    char path[384];
+    char enc[FSDK_QUEUE_KEY_MAX * 3 + 1];
+    char* body = NULL;
+    const char* data;
+    long long cap = 0;
+    long long team = 0;
+    fsdk_result rc;
+    if (out_party_cap == NULL || !valid_queue_key(queue_key)) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    *out_party_cap = 0;
+    if (out_team_size != NULL) {
+        *out_team_size = 0;
+    }
+    if (!encode_query_value(queue_key, enc, sizeof(enc))) {
+        return FSDK_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "/v1/fmms/queues/party-cap?key=%s", enc);
+    rc = social_get(client, path, &body);
+    if (rc != FSDK_OK) {
+        return rc;
+    }
+    data = json_value_after(body, "data");
+    if (data == NULL) {
+        data = body;
+    }
+    if (!fsdk_json_extract_ll(data, "partyCap", &cap)) {
+        fsdk_string_free(body);
+        return FSDK_ERR_PROTOCOL;
+    }
+    (void)fsdk_json_extract_ll(data, "teamSize", &team);
+    fsdk_string_free(body);
+    *out_party_cap = (int)cap;
+    if (out_team_size != NULL) {
+        *out_team_size = (int)team;
+    }
+    return FSDK_OK;
 }

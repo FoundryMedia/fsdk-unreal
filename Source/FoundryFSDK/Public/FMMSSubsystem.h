@@ -129,6 +129,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry|FMMS")
 	void NotifyMatchEnded();
 
+	/** True once NotifyMatchEnded ran and no search has been accepted since - the "the match I was in is over"
+	 *  fact UFoundryPartyFollowComponent gates on (a leader's leave only takes the party AFTER the horn). */
+	UFUNCTION(BlueprintPure, Category = "Foundry|FMMS")
+	bool WasMatchEnded() const { return bMatchEndedNotified; }
+
 	/** The ticket id NotifyMatchEnded / a seat-releasing Cancel released (empty if none was known). */
 	const FString& GetEndedTicketId() const { return EndedTicketId; }
 

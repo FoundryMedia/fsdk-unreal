@@ -214,11 +214,13 @@ bool FFMMSNotifyMatchEndedTest::RunTest(const FString& Parameters)
 		UFMMSSubsystem* Fmms = NewObject<UFMMSSubsystem>(GI);
 		Fmms->ApplyMatchmakingPhase(Start, TEXT("in match"));
 		TestTrue(TEXT("precondition: not Idle"), Fmms->GetMatchmakingState() != EFoundryMatchmakingState::Idle);
+		TestFalse(TEXT("precondition: the match is not over yet"), Fmms->WasMatchEnded());
 
 		TArray<EFoundryMatchmakingState> Seen;
 		const FDelegateHandle Handle = Fmms->OnMatchmakingStateChanged.AddLambda(
 			[&Seen](EFoundryMatchmakingState State, const FString&) { Seen.Add(State); });
 		Fmms->NotifyMatchEnded();
+		TestTrue(TEXT("WasMatchEnded answers true after the horn (the party-follow gate)"), Fmms->WasMatchEnded());
 		TestEqual(TEXT("exactly one state broadcast"), Seen.Num(), 1);
 		if (Seen.Num() == 1)
 		{

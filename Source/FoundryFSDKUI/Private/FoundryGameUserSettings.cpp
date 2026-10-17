@@ -1,7 +1,9 @@
 #include "FoundryGameUserSettings.h"
 
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "FoundryConsoleSubsystem.h"
 #include "FoundryFSDKUILog.h"
 #include "FoundryUISettings.h"
 #include "Kismet/GameplayStatics.h"
@@ -33,6 +35,51 @@ void UFoundryGameUserSettings::SetReducedMotion(bool bReduced)
 {
 	bReducedMotion = bReduced;
 	OnInterfaceSettingsChanged.Broadcast();
+}
+
+void UFoundryGameUserSettings::SetDeveloperModeEnabled(bool bEnabled)
+{
+	bDeveloperModeEnabled = bEnabled;
+}
+
+void UFoundryGameUserSettings::SetConsoleKeyName(const FString& KeyName)
+{
+	if (FKey(*KeyName).IsValid())
+	{
+		ConsoleKey = KeyName;
+	}
+}
+
+void UFoundryGameUserSettings::SetDebugOverlayKeyName(const FString& KeyName)
+{
+	if (FKey(*KeyName).IsValid())
+	{
+		DebugOverlayKey = KeyName;
+	}
+}
+
+void UFoundryGameUserSettings::ApplyDeveloperMode(UGameInstance* GameInstance) const
+{
+	UFoundryConsoleSubsystem* Console = GameInstance ? GameInstance->GetSubsystem<UFoundryConsoleSubsystem>() : nullptr;
+	if (Console == nullptr)
+	{
+		return;
+	}
+
+	// One switch in every configuration: the checkbox (or -DevMode / -DebugOverlay). A Development build no
+	// longer gets the console for free, so what a tester sees is what a player with the box ticked sees.
+	const bool bCommandLine = FParse::Param(FCommandLine::Get(), TEXT("DevMode"))
+		|| FParse::Param(FCommandLine::Get(), TEXT("DebugOverlay"));
+	Console->SetEnabled(bDeveloperModeEnabled || bCommandLine);
+
+	// Invalid key names are ignored by the console (the previous key stays).
+	Console->SetConsoleKey(FKey(*ConsoleKey));
+	Console->SetOverlayKey(FKey(*DebugOverlayKey));
+
+	// Engine commands are NOT part of developer mode: only -EngineConsole, only outside Shipping.
+#if !UE_BUILD_SHIPPING
+	Console->SetEngineExecEnabled(FParse::Param(FCommandLine::Get(), TEXT("EngineConsole")));
+#endif
 }
 
 void UFoundryGameUserSettings::ApplyAudio(UObject* WorldContextObject)
@@ -107,6 +154,9 @@ void UFoundryGameUserSettings::SetToDefaults()
 	SFXVolume = 1.0f;
 	UIScale = 1.0f;
 	bReducedMotion = false;
+	bDeveloperModeEnabled = false;
+	ConsoleKey = TEXT("Tilde");
+	DebugOverlayKey = TEXT("F9");
 }
 
 UFoundryGameUserSettings* UFoundryGameUserSettings::Get()

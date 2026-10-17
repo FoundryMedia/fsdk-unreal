@@ -10,10 +10,12 @@
 
 /**
  * A development fixture: while bActive, Friends() / Blocked() / Invites() / PendingRequests() /
- * HasParty() / Party() / IsLocalLeader() / PartyCapacity() / JoinedCount() answer from here instead
- * of the cached platform reads, and every action below (SendFriendRequest, InviteByUsername, ...) is
- * a logged no-op - a simulated state can never reach the platform. bHasParty / Party default to no
- * party (false / empty); a consumer that wants a simulated party sets them explicitly.
+ * HasParty() / Party() / IsLocalLeader() / PartyCapacity() / JoinedCount() / JoinRequests() /
+ * PartyCapForQueue() answer from here instead of the cached platform reads, and every action below
+ * (SendFriendRequest, InviteByUsername, ...) is refused with an OnActionFailed sentence ("Dev fixture
+ * active") - a simulated state can never reach the platform, and the player is never left clicking a
+ * silent no-op. bHasParty / Party default to no party (false / empty); a consumer that wants a
+ * simulated party sets them explicitly.
  */
 USTRUCT(BlueprintType)
 struct FOUNDRYFSDK_API FFoundrySocialFixture
@@ -40,7 +42,22 @@ struct FOUNDRYFSDK_API FFoundrySocialFixture
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
 	FFoundryParty Party;
+
+	/** Simulated pending join requests on the party the fixture's local player leads. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
+	TArray<FFoundryJoinRequest> JoinRequests;
+
+	/** Simulated per-queue party caps (queue key -> cap) for PartyCapForQueue. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foundry|Social")
+	TMap<FString, int32> PartyCaps;
 };
+
+/** A social action succeeded. Action is the same name OnActionFailed / OnSocialActionComplete use
+ *  ("party.invite", "party.cancel_invite", "party.kick", "party.join_request", ...); Message is a short
+ *  player-facing sentence a UI can toast verbatim ("Invite sent to Ada", "Invite cancelled"). Only
+ *  actions a player asked for announce themselves - background bookkeeping (ready, in-match) stays quiet. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFoundrySocialActionSucceeded,
+	FName, Action, const FString&, Message);
 
 /**
  * The ONE social-state poller every UI surface (the default drawer, a game's chat panel, a future
@@ -80,6 +97,9 @@ public:
 	const TArray<FFoundryFriend>& Blocked() const { return Fixture.bActive ? Fixture.Blocked : CachedBlocked; }
 	const TArray<FFoundryParty>& Invites() const { return Fixture.bActive ? Fixture.Invites : CachedInvites; }
 	int32 PendingRequests() const { return Fixture.bActive ? Fixture.PendingRequests : CachedPendingRequests; }
+	/** Pending requests to join the party YOU lead (empty unless you lead one). Polled on the same
+	 *  cadence as everything else, and ONLY while IsLocalLeader() in a party. */
+	const TArray<FFoundryJoinRequest>& JoinRequests() const { return Fixture.bActive ? Fixture.JoinRequests : CachedJoinRequests; }
 
 	bool IsSignedIn() const { return bSignedIn; }
 	FString LocalFoundryId() const { return LocalId; }
@@ -98,6 +118,23 @@ public:
 	/** 1 when not in a party (you are your own one-person "party"); otherwise the number of JOINED
 	 *  (not merely invited/pending) members. */
 	int32 JoinedCount() const;
+	/** INVITED rows whose invite is still alive (ExpiresAt zero = never expires, or in the future). The
+	 *  server counts JOINED + these against the cap, so an expired invite frees its seat. 0 when not in a
+	 *  party. */
+	int32 LiveInvitedCount() const;
+
+	/** The largest party the queue seats (min(queue maxPartySize ?? teamSize, teamSize), fid's
+	 *  /party-cap). -1 while unknown - and the first unknown (or >5-min-old) read of a key kicks
+	 *  RefreshPartyCap(QueueKey) once, so a consumer can simply call this every refresh and listen for
+	 *  OnChanged. Empty key = -1, no request. */
+	int32 PartyCapForQueue(const FString& QueueKey) const;
+
+	/** The mode the match cluster currently has selected, as a queue key. The GAME sets it (the mode
+	 *  picker does, on every change); the subsystem then passes it as queue_key on invite / re-invite /
+	 *  join-accept so fid holds the party to THAT mode's cap. The launcher never sets it and so gets the
+	 *  platform cap. Empty = no mode selected. Changing it broadcasts OnChanged and warms the mode's cap. */
+	FString SelectedQueueKey() const { return SelectedQueue; }
+	void SetSelectedQueueKey(const FString& Key);
 
 	/** True while a dev fixture replaces the social lists and every action below is a no-op. */
 	bool IsFixtureActive() const { return Fixture.bActive; }
@@ -122,17 +159,37 @@ public:
 
 	void SendFriendRequest(const FString& Username);
 	/** Creates a party first when not already in one (the invite is queued and sent once the new
-	 *  party arrives via HandleParty). */
+	 *  party arrives via HandleParty). Passes SelectedQueueKey(). A name that is already an INVITED
+	 *  member is a RE-invite (resets the clock, re-notifies); one that is JOINED is refused. */
 	void InviteByUsername(const FString& Username);
+	/** Leader: invite an INVITED member again (their invite expired, or they missed it). A JOINED member
+	 *  is refused locally ("already in your party"). Passes SelectedQueueKey(). ("party.invite") */
+	void ReInvite(const FString& FoundryId);
+	/** Leader: withdraw a pending invite ("party.cancel_invite"); remove a JOINED member, never yourself
+	 *  ("party.kick"). */
+	void CancelInvite(const FString& FoundryId);
+	void Kick(const FString& FoundryId);
+	/** Leader: answer a request from JoinRequests() ("party.join_accept" / "party.join_decline").
+	 *  Accept passes SelectedQueueKey() so the seat is refused over the mode's cap. */
+	void AcceptJoinRequest(const FString& FoundryId);
+	void DeclineJoinRequest(const FString& FoundryId);
+	/** Refresh the cached cap for a queue now (also what PartyCapForQueue kicks). No-op in a fixture. */
+	void RefreshPartyCap(const FString& QueueKey);
 	void AcceptInvite(const FString& PartyId);
 	void DeclineInvite(const FString& PartyId);
 	/** Leaves the CACHED party (Party().PartyId); a no-op when not in one. */
 	void LeaveParty();
 	/** Sets your own ready flag on the CACHED party (Party().PartyId); a no-op when not in one. */
 	void SetReady(bool bReady);
+	/** Sets your own in-match flag on the CACHED party (Party().PartyId); a no-op when not in one.
+	 *  UFMMSSubsystem calls it: true when the client travels into a match, false at match end / leave, so
+	 *  the lobby can show "In match" on a member's row and nameplate. A failure is logged, never shown:
+	 *  it is background bookkeeping the player did not ask for (an older fid answers 404). */
+	void SetInMatch(bool bInMatch);
 	void RemoveFriend(const FString& FoundryId);
 	void BlockPlayer(const FString& FoundryId);
 	void UnblockPlayer(const FString& FoundryId);
+	/** Ask to join a friend's party (they approve). Succeeds with "Asked to join <name>'s party". */
 	void RequestToJoin(const FString& FriendFoundryId);
 
 	/** Dev fixture: replaces the cached lists for display and makes every action above a no-op. */
@@ -152,6 +209,9 @@ public:
 	 *  in, party full, ...): Action names it ("party.invite", "friend.request", ...), Message is a
 	 *  human-readable reason a UI can show directly. */
 	FFoundrySocialActionFailed OnActionFailed;
+	/** A social action the player asked for succeeded - see FFoundrySocialActionSucceeded. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry|Social")
+	FFoundrySocialActionSucceeded OnActionSucceeded;
 
 private:
 	UFoundryFSDKSubsystem* Fsdk() const;
@@ -164,6 +224,8 @@ private:
 	UFUNCTION() void HandleFriends(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& InFriends);
 	UFUNCTION() void HandlePending(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& Pending);
 	UFUNCTION() void HandleBlocked(EFoundryFsdkResult Result, const TArray<FFoundryFriend>& InBlocked);
+	UFUNCTION() void HandleJoinRequests(EFoundryFsdkResult Result, const TArray<FFoundryJoinRequest>& Requests);
+	UFUNCTION() void HandlePartyCap(EFoundryFsdkResult Result, const FString& QueueKey, int32 PartyCap, int32 TeamSize);
 	UFUNCTION() void HandleSocialAction(EFoundryFsdkResult Result, const FString& Action);
 
 	/** Called from the tail of every one of the five poll handlers (party/invites/friends/pending/
@@ -171,6 +233,23 @@ private:
 	 *  every outstanding read of the current poll has answered, or 1.5s after the first one has. */
 	void NotePollAnswered();
 	void MaybeFlushPollNotify();
+
+	/** Fixture guard for a user action: when a dev fixture is active, say so through OnActionFailed and
+	 *  return true (the caller returns) - a simulated state must never reach the platform, and a silent
+	 *  no-op reads as a broken button. */
+	bool RefuseInFixture(const TCHAR* Action);
+	/** The member row for FoundryId in the (fixture-aware) party, or null. */
+	const FFoundryPartyMember* FindMember(const FString& FoundryId) const;
+	/** The cap an invite is held to right now: the selected mode's party cap when known, else the
+	 *  party's platform cap. */
+	int32 EffectiveInviteCap() const;
+	/** JOINED + live INVITED against EffectiveInviteCap(); on a full party sets OutMessage and returns true. */
+	bool PartyIsFull(FString& OutMessage) const;
+	/** Queue the success sentence for the next completion of Action (FIFO per action; the platform call
+	 *  answers with only the action name). Call right before handing the action to the bridge. */
+	void ExpectSuccess(const TCHAR* Action, const FString& Message);
+	/** Hand one invite to the bridge (by username, with the selected queue key) and queue its toast. */
+	void SendInvite(const FString& Username);
 
 	bool bBound = false;
 	bool bTriedBindOnFirstTick = false; // Initialize() can race UFoundryFSDKSubsystem's own creation
@@ -192,9 +271,23 @@ private:
 	int32 CachedPendingRequests = 0;
 	TSet<FString> SentFriendRequests;      // usernames (lowercase) this session already asked - a repeat says so
 	FString InFlightFriendRequestUsername; // the one SendFriendRequest just fired; joins the set on Ok
+	TArray<FFoundryJoinRequest> CachedJoinRequests;
+	FString SelectedQueue; // SetSelectedQueueKey - passed as queue_key on invite / re-invite / join-accept
 	FString PendingInviteUsername; // queued behind a CreateParty, sent once the new party arrives
 	bool bCreatePartyPending = false; // a CreateParty this subsystem fired is in flight - a second
 	                                   // InviteByUsername queues its name instead of firing another
+
+	/** One queue's cached party cap. LastRequestTime throttles the refresh PartyCapForQueue kicks. */
+	struct FPartyCapEntry
+	{
+		int32 Cap = -1;      // -1 = unknown
+		int32 TeamSize = 0;
+		double LastRequestTime = -1.0e9;
+	};
+	mutable TMap<FString, FPartyCapEntry> PartyCaps; // mutable: PartyCapForQueue is a read that warms its cache
+
+	/** Success sentences waiting for their action's completion (see ExpectSuccess). */
+	TMap<FString, TArray<FString>> ExpectedSuccess;
 
 	// dev fixture
 	FFoundrySocialFixture Fixture;
