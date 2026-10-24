@@ -132,8 +132,20 @@ bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate
 	}
 
 	const float FadeIn = Settings->BootSplashFadeInSeconds;
-	const float Hold = HoldOverrideSeconds >= 0.0f ? HoldOverrideSeconds : Settings->BootSplashHoldSeconds;
 	const float FadeOut = Settings->BootSplashFadeOutSeconds;
+	float Hold = Settings->BootSplashHoldSeconds;
+	// The splash lasts as long as the stinger: hold = sound - fades (a looping sound reports "indefinite";
+	// Duration is the clip length either way).
+	if (Settings->bBootSplashMatchesStinger && Stinger && Stinger->Duration > 0.0f)
+	{
+		Hold = FMath::Max(0.0f, Stinger->Duration - FMath::Max(0.0f, FadeIn) - FMath::Max(0.0f, FadeOut));
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] matching stinger %s: %.2f s (hold %.2f s)"),
+			*GetNameSafe(Stinger), Stinger->Duration, Hold);
+	}
+	if (HoldOverrideSeconds >= 0.0f)
+	{
+		Hold = HoldOverrideSeconds; // dev fixtures (photographing the splash) still win
+	}
 	NewSplash->Setup(StudioTexture, PlatformTexture, Stinger, FadeIn, Hold, FadeOut);
 
 	Splash = NewSplash;

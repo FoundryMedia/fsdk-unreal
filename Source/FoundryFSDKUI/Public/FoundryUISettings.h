@@ -299,7 +299,12 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	float BootSplashFadeInSeconds = 0.4f;
 
-	/** Seconds the logos stay fully visible. */
+	/** When a stinger is set, the splash lasts exactly as long as the sound: the hold becomes the sound's
+	 *  duration minus the fades, so the logos fade out as the stinger tails off. Off = the hold below. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	bool bBootSplashMatchesStinger = true;
+
+	/** Seconds the logos stay fully visible (ignored while the splash matches a stinger). */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	float BootSplashHoldSeconds = 2.6f;
 
