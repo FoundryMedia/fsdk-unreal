@@ -24,8 +24,10 @@ public:
 	UPROPERTY(Config)
 	float MasterVolume = 1.0f;
 
+	/** 0.6 by default: background music sits under UI sounds, chat and the match; a player who wants it
+	 *  louder turns it up (the common game default is 50-70 %). A saved value always wins. */
 	UPROPERTY(Config)
-	float MusicVolume = 1.0f;
+	float MusicVolume = 0.6f;
 
 	UPROPERTY(Config)
 	float SFXVolume = 1.0f;
