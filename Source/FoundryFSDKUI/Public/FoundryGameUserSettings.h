@@ -25,7 +25,7 @@ public:
 	float MasterVolume = 1.0f;
 
 	/** Slider position, 0.5 by default. Volumes are slider POSITIONS: ApplyAudio maps them through a
-	 *  perceptual curve (50 % = -20 dB), so half way sounds like half. A saved value always wins. */
+	 *  perceptual curve (linear in dB, 50 % = -18 dB, 0 = silent). A saved value always wins. */
 	UPROPERTY(Config)
 	float MusicVolume = 0.5f;
 

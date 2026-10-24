@@ -13,17 +13,24 @@
 namespace
 {
 	/**
-	 * Loudness is perceived roughly logarithmically, so a slider that sets raw amplitude crowds every
-	 * useful level into its bottom 20 %. The kit maps slider -> gain as slider^k with k chosen so 50 % on
-	 * the slider = 0.1 amplitude (-20 dB) - where a player actually expects "half" (Justin, Goo Crew
-	 * lobby theme, 2026-10-24: 10 % linear sounded like the 50 % position). k = ln(0.1) / ln(0.5).
-	 * Saved values stay SLIDER positions; only the applied gain follows the curve.
+	 * Loudness is perceived roughly logarithmically, so the slider maps LINEARLY IN DECIBELS: 100 % = 0 dB,
+	 * every step down the same audible amount, VolumeRangeDb below full at the bottom (50 % = -18 dB). The
+	 * last TaperBelow of travel ramps linearly to true silence at 0, so 0 is off with no jump. (Goo Crew,
+	 * 2026-10-24: raw amplitude crowded every useful level into the bottom 20 %; slider^3.32 then made
+	 * 10 % inaudible. dB-linear keeps 10 % quiet but present.) Saved values stay SLIDER positions.
 	 */
-	constexpr float VolumeCurveExponent = 3.321928f;
+	constexpr float VolumeRangeDb = 36.0f;
+	constexpr float TaperBelow = 0.05f;
 
 	float SliderToGain(float Slider)
 	{
-		return FMath::Pow(FMath::Clamp(Slider, 0.0f, 1.0f), VolumeCurveExponent);
+		const float S = FMath::Clamp(Slider, 0.0f, 1.0f);
+		if (S <= 0.0f)
+		{
+			return 0.0f;
+		}
+		const float Gain = FMath::Pow(10.0f, -VolumeRangeDb * (1.0f - S) / 20.0f);
+		return S < TaperBelow ? Gain * (S / TaperBelow) : Gain;
 	}
 }
 
