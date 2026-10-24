@@ -10,6 +10,23 @@
 #include "Sound/SoundClass.h"
 #include "Sound/SoundMix.h"
 
+namespace
+{
+	/**
+	 * Loudness is perceived roughly logarithmically, so a slider that sets raw amplitude crowds every
+	 * useful level into its bottom 20 %. The kit maps slider -> gain as slider^k with k chosen so 50 % on
+	 * the slider = 0.1 amplitude (-20 dB) - where a player actually expects "half" (Justin, Goo Crew
+	 * lobby theme, 2026-10-24: 10 % linear sounded like the 50 % position). k = ln(0.1) / ln(0.5).
+	 * Saved values stay SLIDER positions; only the applied gain follows the curve.
+	 */
+	constexpr float VolumeCurveExponent = 3.321928f;
+
+	float SliderToGain(float Slider)
+	{
+		return FMath::Pow(FMath::Clamp(Slider, 0.0f, 1.0f), VolumeCurveExponent);
+	}
+}
+
 void UFoundryGameUserSettings::SetMasterVolume(float Volume)
 {
 	MasterVolume = FMath::Clamp(Volume, 0.0f, 1.0f);
@@ -115,15 +132,15 @@ void UFoundryGameUserSettings::ApplyAudio(UObject* WorldContextObject)
 	}
 	if (USoundClass* MasterClass = Settings->MasterSoundClass.LoadSynchronous())
 	{
-		UGameplayStatics::SetSoundMixClassOverride(World, Mix, MasterClass, MasterVolume, 1.0f, 0.1f, true);
+		UGameplayStatics::SetSoundMixClassOverride(World, Mix, MasterClass, SliderToGain(MasterVolume), 1.0f, 0.1f, true);
 	}
 	if (USoundClass* MusicClass = Settings->MusicSoundClass.LoadSynchronous())
 	{
-		UGameplayStatics::SetSoundMixClassOverride(World, Mix, MusicClass, MusicVolume, 1.0f, 0.1f, false);
+		UGameplayStatics::SetSoundMixClassOverride(World, Mix, MusicClass, SliderToGain(MusicVolume), 1.0f, 0.1f, false);
 	}
 	if (USoundClass* SFXClass = Settings->SFXSoundClass.LoadSynchronous())
 	{
-		UGameplayStatics::SetSoundMixClassOverride(World, Mix, SFXClass, SFXVolume, 1.0f, 0.1f, false);
+		UGameplayStatics::SetSoundMixClassOverride(World, Mix, SFXClass, SliderToGain(SFXVolume), 1.0f, 0.1f, false);
 	}
 }
 
