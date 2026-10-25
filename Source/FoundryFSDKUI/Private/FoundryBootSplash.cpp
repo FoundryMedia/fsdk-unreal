@@ -21,6 +21,7 @@ void UFoundryBootSplash::Setup(UTexture2D* StudioTexture, UTexture2D* PlatformTe
 	HoldDuration = FMath::Max(0.0f, HoldSeconds);
 	FadeOutDuration = FMath::Max(0.0f, FadeOutSeconds);
 	StingerSound = Stinger;
+	bRealTimeHold = Stinger != nullptr;
 	ApplyLogo(StudioLogo, StudioTexture);
 	ApplyLogo(PlatformLogo, PlatformTexture);
 
@@ -118,6 +119,10 @@ void UFoundryBootSplash::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		SetKeyboardFocus();
 	}
 
+	if (Phase != EPhase::NotStarted)
+	{
+		SinceStart += InDeltaTime; // real time since the stinger started - never capped
+	}
 	if (Phase == EPhase::NotStarted)
 	{
 		// First tick, not Construct: the world is up and the audio device is ready.
@@ -134,12 +139,24 @@ void UFoundryBootSplash::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 	if (Phase == EPhase::Hold)
 	{
 		HoldElapsed += FMath::Min(InDeltaTime, MaxHoldTickSeconds);
-		if (HoldElapsed >= HoldDuration)
+		// With a stinger the fade-out is scheduled from the SOUND's start (fade-in + hold), so a slow first frame
+		// that stretched the fade-in never pushes the logos past the end of the sound.
+		const bool bFadeOutDue = bRealTimeHold ? SinceStart >= FadeInDuration + HoldDuration : HoldElapsed >= HoldDuration;
+		if (bFadeOutDue)
 		{
 			Phase = EPhase::FadeOut;
+			FadeOutElapsed = 0.0f;
 			UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] out"));
 			PlayOrTween(FadeAnim, false, FadeOutDuration, LogoRow);
+			OnFadeOutStarted.Broadcast();
 		}
+		return;
+	}
+	if (Phase == EPhase::FadeOut && bRevealSceneOnFadeOut && Backdrop)
+	{
+		FadeOutElapsed += InDeltaTime;
+		const float T = FadeOutDuration > 0.0f ? FMath::Clamp(FadeOutElapsed / FadeOutDuration, 0.0f, 1.0f) : 1.0f;
+		Backdrop->SetRenderOpacity(1.0f - T);
 	}
 }
 

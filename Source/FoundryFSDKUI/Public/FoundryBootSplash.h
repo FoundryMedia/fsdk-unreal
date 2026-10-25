@@ -35,6 +35,15 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Foundry UI")
 	FFoundryBootSplashFinished OnFinished;
 
+	/** Fires once, the moment the fade-out begins: the host brings its scene / music in UNDER the splash
+	 *  so the hand-over is a crossfade, not black then a cut. */
+	UPROPERTY(BlueprintAssignable, Category = "Foundry UI")
+	FFoundryBootSplashFinished OnFadeOutStarted;
+
+	/** During the fade-out the Backdrop fades with the logos, revealing whatever is behind the splash. */
+	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
+	bool bRevealSceneOnFadeOut = true;
+
 	/** Logos (either may be null -> that Image collapses), optional stinger (null = silent), durations
 	 *  in seconds. Call before AddToViewport. */
 	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
@@ -106,6 +115,12 @@ private:
 	float HoldDuration = 2.6f;
 	float FadeOutDuration = 0.6f;
 	float HoldElapsed = 0.0f;
+	float FadeOutElapsed = 0.0f;
+	/** Real seconds since the stinger started (the clock the fade-out is scheduled on when bRealTimeHold). */
+	float SinceStart = 0.0f;
+	/** With a stinger the hold runs on the REAL clock (uncapped deltas) so the logos never drift from the
+	 *  sound; without one the 0.1 s first-frame hitch guard applies. */
+	bool bRealTimeHold = false;
 
 	UPROPERTY(Transient)
 	TObjectPtr<USoundBase> StingerSound;

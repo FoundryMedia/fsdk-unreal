@@ -52,6 +52,18 @@ void UFoundryBootSplashSubsystem::Deinitialize()
 
 bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate OnDone)
 {
+	return TryPlay(PC, MoveTemp(OnDone), FSimpleDelegate());
+}
+
+void UFoundryBootSplashSubsystem::HandleSplashFadeOutStarted()
+{
+	FSimpleDelegate FadeOut = MoveTemp(PendingFadeOut);
+	PendingFadeOut.Unbind();
+	FadeOut.ExecuteIfBound();
+}
+
+bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate OnDone, FSimpleDelegate OnFadeOut)
+{
 	const UFoundryUISettings* Settings = UFoundryUISettings::Get();
 	if (Settings == nullptr || !Settings->bShowBootSplash)
 	{
@@ -150,6 +162,8 @@ bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate
 
 	Splash = NewSplash;
 	PendingDone = MoveTemp(OnDone);
+	PendingFadeOut = MoveTemp(OnFadeOut);
+	Splash->OnFadeOutStarted.AddDynamic(this, &UFoundryBootSplashSubsystem::HandleSplashFadeOutStarted);
 	Splash->OnFinished.AddDynamic(this, &UFoundryBootSplashSubsystem::HandleSplashFinished);
 	Splash->AddToViewport(1000);
 
@@ -193,6 +207,7 @@ void UFoundryBootSplashSubsystem::HandleSplashFinished()
 		Splash->RemoveFromParent();
 		Splash = nullptr;
 	}
+	HandleSplashFadeOutStarted(); // a force-finish that never faded still hands over (no-op if it already ran)
 	FSimpleDelegate Done = MoveTemp(PendingDone);
 	PendingDone.Unbind();
 	Done.ExecuteIfBound();

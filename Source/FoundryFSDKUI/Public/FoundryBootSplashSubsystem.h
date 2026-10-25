@@ -32,6 +32,10 @@ public:
 	 *  has finished and been removed; it is NOT run when TryPlay returns false. */
 	bool TryPlay(APlayerController* PC, FSimpleDelegate OnDone);
 
+	/** As above, plus OnFadeOut: runs once when the splash starts fading out (bring the scene and music in
+	 *  under it - the crossfade). Also run before OnDone if the splash is force-finished without fading. */
+	bool TryPlay(APlayerController* PC, FSimpleDelegate OnDone, FSimpleDelegate OnFadeOut);
+
 	/** True once a splash has been shown (or is showing) on this GameInstance. */
 	bool HasPlayed() const;
 
@@ -54,6 +58,10 @@ private:
 	bool bPlayed = false;
 	float HoldOverrideSeconds = -1.0f;
 	FSimpleDelegate PendingDone;
+	FSimpleDelegate PendingFadeOut;
+
+	UFUNCTION()
+	void HandleSplashFadeOutStarted();
 	FTimerHandle FailsafeTimer;
 
 	UPROPERTY(Transient)
