@@ -1,18 +1,37 @@
 #include "FoundryBootSplash.h"
 
 #include "Animation/WidgetAnimation.h"
+#include "Blueprint/WidgetTree.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Image.h"
+#include "Components/OverlaySlot.h"
+#include "Components/PanelWidget.h"
+#include "Components/ScaleBox.h"
+#include "ContentStreaming.h"
 #include "Engine/Texture2D.h"
+#include "Engine/World.h"
 #include "FoundryFSDKUILog.h"
+#include "GameFramework/Actor.h"
 #include "Kismet/GameplayStatics.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "MediaPlayer.h"
+#include "MediaSoundComponent.h"
+#include "MediaSource.h"
+#include "MediaTexture.h"
 #include "Sound/SoundBase.h"
+#include "Sound/SoundClass.h"
 #include "Styling/SlateBrush.h"
 
 namespace
 {
 	/** A hitch on the first frame(s) must not eat the hold. */
 	constexpr float MaxHoldTickSeconds = 0.1f;
+
+	/** Movie mode: no open (or no advancing clock) within this long falls back to the logos + stinger. */
+	constexpr float MovieOpenTimeoutSeconds = 3.0f;
+
+	/** The cover image's native size: the 16:9 frame the movie is authored at (the ScaleBox only needs the aspect). */
+	const FVector2D MovieNativeSize(1920.0, 1080.0);
 }
 
 void UFoundryBootSplash::Setup(UTexture2D* StudioTexture, UTexture2D* PlatformTexture, USoundBase* Stinger, float FadeInSeconds, float HoldSeconds, float FadeOutSeconds)
@@ -84,8 +103,297 @@ void UFoundryBootSplash::Finish()
 		return;
 	}
 	Phase = EPhase::Finished;
+	CleanupMovie();
 	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] finished"));
 	OnFinished.Broadcast();
+}
+
+void UFoundryBootSplash::SetupMovie(UMediaSource* Movie, UMaterialInterface* Material, USoundClass* SoundClass, float RevealSeconds)
+{
+	if (Movie == nullptr || bMovieMode)
+	{
+		return;
+	}
+	MovieSource = Movie;
+	MovieMaterial = Material;
+	MovieSoundClass = SoundClass;
+	MovieRevealSeconds = FMath::Max(0.0f, RevealSeconds);
+	if (!BuildMovie())
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] movie mode could not be built for %s - the logo sequence plays instead"), *GetNameSafe(Movie));
+		CleanupMovie();
+		MovieSource = nullptr;
+		return;
+	}
+	bMovieMode = true;
+}
+
+bool UFoundryBootSplash::IsMovieMode() const
+{
+	return bMovieMode;
+}
+
+bool UFoundryBootSplash::BuildMovie()
+{
+	UPanelWidget* Root = WidgetTree ? Cast<UPanelWidget>(WidgetTree->RootWidget) : nullptr;
+	UWorld* World = GetWorld();
+	if (Root == nullptr || World == nullptr || MovieSource == nullptr)
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] movie mode needs a panel root and a world (root %s, world %s)"), *GetNameSafe(Root), *GetNameSafe(World));
+		return false;
+	}
+
+	MoviePlayer = NewObject<UMediaPlayer>(this);
+	MoviePlayer->PlayOnOpen = false; // played by the tick, once the world behind has drawn a couple of frames
+	MoviePlayer->SetLooping(false);
+	MoviePlayer->OnMediaOpened.AddDynamic(this, &UFoundryBootSplash::HandleMovieOpened);
+	MoviePlayer->OnMediaOpenFailed.AddDynamic(this, &UFoundryBootSplash::HandleMovieOpenFailed);
+	MoviePlayer->OnEndReached.AddDynamic(this, &UFoundryBootSplash::HandleMovieEnded);
+
+	MovieTexture = NewObject<UMediaTexture>(this);
+	MovieTexture->AutoClear = true;
+	MovieTexture->ClearColor = FLinearColor::Black;
+	MovieTexture->SetMediaPlayer(MoviePlayer);
+	MovieTexture->UpdateResource();
+
+	MovieImage = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
+	if (MovieMaterial)
+	{
+		MovieMID = UMaterialInstanceDynamic::Create(MovieMaterial, this);
+		MovieMID->SetTextureParameterValue(TEXT("Movie"), MovieTexture);
+		MovieMID->SetScalarParameterValue(TEXT("MovieTime"), 0.0f);
+		MovieImage->SetBrushFromMaterial(MovieMID);
+	}
+	else
+	{
+		MovieImage->SetBrushResourceObject(MovieTexture);
+	}
+	MovieImage->SetDesiredSizeOverride(MovieNativeSize);
+	MovieImage->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+	// A cover fit: the image keeps the video's aspect and fills the screen (a 16:9 mask in the material stays aligned with the video).
+	MovieScaleBox = WidgetTree->ConstructWidget<UScaleBox>(UScaleBox::StaticClass());
+	MovieScaleBox->SetStretch(EStretch::ScaleToFill);
+	MovieScaleBox->SetVisibility(ESlateVisibility::HitTestInvisible);
+	MovieScaleBox->AddChild(MovieImage);
+	UPanelSlot* BoxSlot = Root->AddChild(MovieScaleBox); // last child of the Overlay = above everything
+	if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(BoxSlot))
+	{
+		OverlaySlot->SetHorizontalAlignment(HAlign_Fill);
+		OverlaySlot->SetVerticalAlignment(VAlign_Fill);
+	}
+
+	// Audio: the movie's own track, through a transient actor's media sound component (2D, UI sound).
+	FActorSpawnParameters Params;
+	Params.ObjectFlags |= RF_Transient;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	MovieSoundActor = World->SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity, Params);
+	if (MovieSoundActor)
+	{
+		MovieSound = NewObject<UMediaSoundComponent>(MovieSoundActor, TEXT("BootSplashMovieSound"));
+		MovieSound->bIsUISound = true;
+		MovieSound->bAllowSpatialization = false;
+		MovieSound->SoundClass = MovieSoundClass;
+		MovieSound->SetMediaPlayer(MoviePlayer);
+		MovieSoundActor->SetRootComponent(MovieSound);
+		MovieSound->RegisterComponent();
+		if (!MovieSound->IsActive())
+		{
+			MovieSound->Activate(true);
+		}
+	}
+	else
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] could not spawn the movie's sound actor - the movie plays silent"));
+	}
+
+	// The live world shows through wherever the material is transparent (and the video is opaque black until then).
+	if (Backdrop)
+	{
+		Backdrop->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	if (LogoRow)
+	{
+		LogoRow->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (!MoviePlayer->OpenSource(MovieSource))
+	{
+		bMovieOpenFailed = true; // an immediate refusal: the first tick falls back to the logos
+	}
+	return true;
+}
+
+void UFoundryBootSplash::HandleMovieOpened(FString OpenedUrl)
+{
+	bMovieOpened = true;
+	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie opened: %s (duration %.2f s, player %s)"), *OpenedUrl,
+		MoviePlayer ? MoviePlayer->GetDuration().GetTotalSeconds() : -1.0, MoviePlayer ? *MoviePlayer->GetPlayerName().ToString() : TEXT("?"));
+}
+
+void UFoundryBootSplash::HandleMovieOpenFailed(FString FailedUrl)
+{
+	bMovieOpenFailed = true;
+	UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] movie failed to open: %s"), *FailedUrl);
+}
+
+void UFoundryBootSplash::HandleMovieEnded()
+{
+	bMovieEnded = true;
+}
+
+void UFoundryBootSplash::FireReveal(float MovieSeconds)
+{
+	if (bRevealFired)
+	{
+		return;
+	}
+	bRevealFired = true;
+	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie reveal at %.2f s of movie time (hand-over to the host)"), MovieSeconds);
+	const int32 Wanting = IStreamingManager::Get().GetNumWantingResources();
+	if (Wanting > 0)
+	{
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] reveal: %d streaming resources still wanted behind the splash"), Wanting);
+	}
+	OnFadeOutStarted.Broadcast();
+}
+
+void UFoundryBootSplash::CleanupMovie()
+{
+	if (MoviePlayer)
+	{
+		MoviePlayer->OnMediaOpened.RemoveDynamic(this, &UFoundryBootSplash::HandleMovieOpened);
+		MoviePlayer->OnMediaOpenFailed.RemoveDynamic(this, &UFoundryBootSplash::HandleMovieOpenFailed);
+		MoviePlayer->OnEndReached.RemoveDynamic(this, &UFoundryBootSplash::HandleMovieEnded);
+	}
+	if (MovieSound)
+	{
+		MovieSound->SetMediaPlayer(nullptr);
+		MovieSound = nullptr;
+	}
+	if (MovieSoundActor)
+	{
+		MovieSoundActor->Destroy();
+		MovieSoundActor = nullptr;
+	}
+	if (MovieTexture)
+	{
+		MovieTexture->SetMediaPlayer(nullptr);
+		MovieTexture = nullptr;
+	}
+	if (MoviePlayer)
+	{
+		MoviePlayer->Close();
+		MoviePlayer = nullptr;
+	}
+	if (MovieScaleBox)
+	{
+		MovieScaleBox->RemoveFromParent();
+		MovieScaleBox = nullptr;
+	}
+	MovieImage = nullptr;
+	MovieMID = nullptr;
+}
+
+void UFoundryBootSplash::FallBackToLogos(const TCHAR* Reason)
+{
+	UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] movie mode failed (%s) - falling back to the logos + stinger"), Reason);
+	CleanupMovie();
+	bMovieMode = false;
+	if (bRevealFired)
+	{
+		Finish(); // the host already took over: nothing left to play
+		return;
+	}
+	if (Backdrop)
+	{
+		Backdrop->SetVisibility(ESlateVisibility::Visible);
+	}
+	if (LogoRow)
+	{
+		LogoRow->SetVisibility(ESlateVisibility::Visible);
+		if (!FadeAnim)
+		{
+			LogoRow->SetRenderOpacity(0.0f);
+		}
+	}
+	Phase = EPhase::NotStarted;
+	SinceStart = 0.0f;
+}
+
+void UFoundryBootSplash::TickMovie(float InDeltaTime)
+{
+	if (Phase == EPhase::NotStarted)
+	{
+		// First tick, not Construct: the world is up and the audio device is ready.
+		Phase = EPhase::MovieOpening;
+		MoviePhaseSeconds = 0.0f;
+		MovieFrames = 0;
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie opening %s"), *GetNameSafe(MovieSource));
+		return;
+	}
+
+	MoviePhaseSeconds += InDeltaTime; // real time, never capped
+	++MovieFrames;
+
+	if (Phase == EPhase::MovieOpening)
+	{
+		if (bMovieOpenFailed)
+		{
+			FallBackToLogos(TEXT("the movie failed to open"));
+		}
+		else if (bMovieOpened)
+		{
+			// Play only once the world behind has drawn a couple of frames, so the reveal never lands on a cold scene.
+			if (MovieFrames >= 2 && MoviePlayer)
+			{
+				MoviePlayer->Play();
+				Phase = EPhase::MoviePlaying;
+				MoviePhaseSeconds = 0.0f;
+				UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie playing (duration %.2f s, reveal at %.2f s)"),
+					MoviePlayer->GetDuration().GetTotalSeconds(), MovieRevealSeconds);
+			}
+		}
+		else if (MoviePhaseSeconds > MovieOpenTimeoutSeconds)
+		{
+			FallBackToLogos(TEXT("the movie did not open within 3 s"));
+		}
+		return;
+	}
+
+	// MoviePlaying
+	if (MoviePlayer == nullptr)
+	{
+		Finish();
+		return;
+	}
+	const float Duration = static_cast<float>(MoviePlayer->GetDuration().GetTotalSeconds());
+	const float T = static_cast<float>(MoviePlayer->GetTime().GetTotalSeconds());
+	if (MovieMID)
+	{
+		MovieMID->SetScalarParameterValue(TEXT("MovieTime"), T);
+	}
+	if (!bRevealFired && MovieRevealSeconds > 0.0f && T >= MovieRevealSeconds)
+	{
+		FireReveal(T);
+	}
+	if (bMovieEnded || (Duration > 0.0f && T >= Duration))
+	{
+		FireReveal(FMath::Max(T, Duration)); // reveal at 0 = at the end (no-op when it already ran)
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie ended at %.2f s"), T);
+		Finish();
+		return;
+	}
+	if (T <= 0.0f && MoviePhaseSeconds > MovieOpenTimeoutSeconds)
+	{
+		FallBackToLogos(TEXT("the movie clock never advanced"));
+	}
+}
+
+void UFoundryBootSplash::NativeDestruct()
+{
+	CleanupMovie();
+	Super::NativeDestruct();
 }
 
 void UFoundryBootSplash::NativeOnInitialized()
@@ -117,6 +425,12 @@ void UFoundryBootSplash::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 	if (!HasKeyboardFocus())
 	{
 		SetKeyboardFocus();
+	}
+
+	if (bMovieMode)
+	{
+		TickMovie(InDeltaTime); // a failed movie drops bMovieMode and the logo sequence below takes over on the next tick
+		return;
 	}
 
 	if (Phase != EPhase::NotStarted)

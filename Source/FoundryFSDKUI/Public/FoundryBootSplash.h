@@ -6,8 +6,17 @@
 #include "FoundryUIWidgetBase.h"
 #include "FoundryBootSplash.generated.h"
 
+class AActor;
 class UImage;
+class UMaterialInstanceDynamic;
+class UMaterialInterface;
+class UMediaPlayer;
+class UMediaSoundComponent;
+class UMediaSource;
+class UMediaTexture;
+class UScaleBox;
 class USoundBase;
+class USoundClass;
 class UTexture2D;
 class UWidget;
 class UWidgetAnimation;
@@ -21,6 +30,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FFoundryBootSplashFinished);
  * preview and the bubble pass (Tab and the arrow keys navigate in the bubble pass), so no input
  * reaches the menu behind it. The only ways out are the sequence ending or ForceFinish (the
  * subsystem's failsafe timer).
+ *
+ * MOVIE MODE (SetupMovie): the same widget plays a video with its own audio instead of the logos + stinger. The
+ * Backdrop and LogoRow collapse, a full-screen cover image shows the media texture (through an optional UI material
+ * with `Movie` + `MovieTime` parameters, which can cut a transparent exit into the video so the live scene shows
+ * through), and OnFadeOutStarted fires at the configured movie time. A movie that does not open (or stalls) falls
+ * back to the logo sequence - the player is never stranded.
  *
  * Drive it through UFoundryBootSplashSubsystem::TryPlay; a game that builds its own splash calls
  * Setup before AddToViewport and binds OnFinished.
@@ -56,6 +71,16 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry UI")
 	bool IsFinished() const;
 
+	/** Switches to MOVIE MODE (call after Setup, before AddToViewport; the logo / stinger args of Setup stay as the
+	 *  fallback). Movie null = no-op. Material null = a plain opaque image. RevealSeconds = movie time at which
+	 *  OnFadeOutStarted fires (0 = at the end). SoundClass null = the engine's media default class. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
+	void SetupMovie(UMediaSource* Movie, UMaterialInterface* Material, USoundClass* SoundClass, float RevealSeconds);
+
+	/** True while the splash plays (or is still opening) its movie. */
+	UFUNCTION(BlueprintPure, Category = "Foundry UI")
+	bool IsMovieMode() const;
+
 	/** Max logo box; each logo is aspect-fit inside it. */
 	UPROPERTY(EditDefaultsOnly, Category = "Foundry UI")
 	FVector2D LogoMaxSize = FVector2D(520.f, 200.f);
@@ -63,6 +88,7 @@ public:
 protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeConstruct() override;
+	virtual void NativeDestruct() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 	virtual void NativeOnTransitionFinished(bool bForward) override;
 
@@ -102,7 +128,26 @@ private:
 		Hold,
 		FadeOut,
 		Finished,
+		MovieOpening,
+		MoviePlaying,
 	};
+
+	/** Builds the player / texture / material / image / sound for movie mode and opens the source. False = nothing usable was built. */
+	bool BuildMovie();
+	void TickMovie(float InDeltaTime);
+	/** Stops + closes the player, destroys the sound actor, removes the cover image. Safe to call twice. */
+	void CleanupMovie();
+	/** Movie mode failed (open failure, timeout, stall): WARN, clean up, and run the logo + stinger sequence instead. */
+	void FallBackToLogos(const TCHAR* Reason);
+	/** Fires OnFadeOutStarted once (the hand-over to the host). */
+	void FireReveal(float MovieSeconds);
+
+	UFUNCTION()
+	void HandleMovieOpened(FString OpenedUrl);
+	UFUNCTION()
+	void HandleMovieOpenFailed(FString FailedUrl);
+	UFUNCTION()
+	void HandleMovieEnded();
 
 	/** A FRESH brush per call (never the WBP's default brush - the engine-texture-name trap); a null Texture collapses the Image. */
 	void ApplyLogo(UImage* Image, UTexture2D* Texture) const;
@@ -124,4 +169,36 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<USoundBase> StingerSound;
+
+	// ---- movie mode (every object below is held here: a code-built UObject handed to Slate has no other owner) ----
+	bool bMovieMode = false;
+	bool bMovieOpened = false;
+	bool bMovieOpenFailed = false;
+	bool bMovieEnded = false;
+	bool bRevealFired = false;
+	float MovieRevealSeconds = 0.0f;
+	/** Real seconds in the current movie phase (opening: since the first tick; playing: since Play()). */
+	float MoviePhaseSeconds = 0.0f;
+	int32 MovieFrames = 0;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaSource> MovieSource;
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> MovieMaterial;
+	UPROPERTY(Transient)
+	TObjectPtr<USoundClass> MovieSoundClass;
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaPlayer> MoviePlayer;
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaTexture> MovieTexture;
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> MovieMID;
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> MovieImage;
+	UPROPERTY(Transient)
+	TObjectPtr<UScaleBox> MovieScaleBox;
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> MovieSoundActor;
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaSoundComponent> MovieSound;
 };

@@ -43,6 +43,7 @@ public class FoundryFSDKUI : ModuleRules
 			"Json", // UFoundryMatchCluster merges the party id into the mode's ticket-attributes JSON
 			"EnhancedInput",
 			"GameplayTags",
+			"MediaAssets", // UFoundryBootSplash's movie mode: UMediaPlayer / UMediaTexture / UMediaSoundComponent
 		});
 	}
 }

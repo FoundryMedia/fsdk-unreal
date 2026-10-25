@@ -8,14 +8,20 @@
 #include "FoundryFSDKUILog.h"
 #include "FoundryUISettings.h"
 #include "GameFramework/PlayerController.h"
+#include "Materials/MaterialInterface.h"
+#include "MediaSource.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "Sound/SoundBase.h"
+#include "Sound/SoundClass.h"
 
 namespace
 {
 	/** Slack past the configured sequence before the failsafe forces the finish. */
 	constexpr float FailsafeSlackSeconds = 2.0f;
+
+	/** Movie mode's failsafe before the movie's length is known (the widget falls back to the logos after 3 s without an open). */
+	constexpr float MovieFailsafeSeconds = 15.0f;
 
 	/** One WARN naming the consequence, shared by every refusal that is not "played already" / "switched off". */
 	void WarnSkipped(const TCHAR* Reason)
@@ -160,6 +166,32 @@ bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate
 	}
 	NewSplash->Setup(StudioTexture, PlatformTexture, Stinger, FadeIn, Hold, FadeOut);
 
+	// MOVIE MODE: the movie replaces the logos + stinger (which stay as the widget's fallback). A failed load only warns.
+	bool bMovie = false;
+	if (!Settings->BootSplashMovie.IsNull())
+	{
+		UMediaSource* Movie = Settings->BootSplashMovie.LoadSynchronous();
+		if (Movie == nullptr)
+		{
+			UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] BootSplashMovie %s did not load - the logo sequence plays instead"), *Settings->BootSplashMovie.ToString());
+		}
+		else
+		{
+			UMaterialInterface* MovieMaterial = Settings->BootSplashMovieMaterial.LoadSynchronous();
+			if (MovieMaterial == nullptr && !Settings->BootSplashMovieMaterial.IsNull())
+			{
+				UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] BootSplashMovieMaterial %s did not load - the movie shows as a plain image (no exit reveal)"), *Settings->BootSplashMovieMaterial.ToString());
+			}
+			USoundClass* MovieSoundClass = Settings->BootSplashMovieSoundClass.LoadSynchronous();
+			if (MovieSoundClass == nullptr && !Settings->BootSplashMovieSoundClass.IsNull())
+			{
+				UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] BootSplashMovieSoundClass %s did not load - the movie audio uses the engine's media default class"), *Settings->BootSplashMovieSoundClass.ToString());
+			}
+			NewSplash->SetupMovie(Movie, MovieMaterial, MovieSoundClass, Settings->BootSplashMovieRevealSeconds);
+			bMovie = NewSplash->IsMovieMode();
+		}
+	}
+
 	Splash = NewSplash;
 	PendingDone = MoveTemp(OnDone);
 	PendingFadeOut = MoveTemp(OnFadeOut);
@@ -180,7 +212,11 @@ bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate
 		// runs on the world's DeltaSeconds (up to ~0.4 s on a hitch frame): a slow first launch would trip a 1:1
 		// failsafe mid-hold with no fade-out. Size it for the worst-case clock ratio (4x) plus the slack.
 		const float Sequence = FMath::Max(0.0f, FadeIn) + FMath::Max(0.0f, Hold) + FMath::Max(0.0f, FadeOut);
-		const float Total = Sequence * 4.0f + FailsafeSlackSeconds;
+		// Movie mode: the movie is real-time (media clock), so the failsafe is its (unknown-yet) length plus slack - but never less
+		// than the logo fallback it can drop into (3 s open timeout + that sequence at the worst-case clock ratio).
+		const float Total = bMovie
+			? FMath::Max(MovieFailsafeSeconds + FailsafeSlackSeconds, 3.0f + Sequence * 4.0f + FailsafeSlackSeconds)
+			: Sequence * 4.0f + FailsafeSlackSeconds;
 		GI->GetTimerManager().SetTimer(FailsafeTimer, this, &UFoundryBootSplashSubsystem::HandleFailsafe, Total, false);
 	}
 	return true;

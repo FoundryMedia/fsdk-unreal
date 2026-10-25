@@ -10,6 +10,8 @@
 #include "FoundryUISettings.generated.h"
 
 class UInputMappingContext;
+class UMaterialInterface;
+class UMediaSource;
 class USoundClass;
 class USoundBase;
 class USoundMix;
@@ -294,6 +296,26 @@ public:
 	/** Sound played as the splash starts. Unset = silent. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	TSoftObjectPtr<USoundBase> StingerSound;
+
+	/** MOVIE MODE: a video (UMediaSource, H.264 + AAC through ElectraPlayer / WmfMedia) the splash plays INSTEAD of the
+	 *  logos + stinger - its own audio is the sound. Unset = the logo sequence. A movie that fails to open falls back to
+	 *  the logos + stinger (WARN). Ship the file with +DirectoriesToAlwaysStageAsNonUFS (the media source names a file). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	TSoftObjectPtr<UMediaSource> BootSplashMovie;
+
+	/** A UI-domain material for the movie: texture parameter `Movie` (the media texture) and scalar `MovieTime` (seconds of
+	 *  movie time, pushed every tick), so the material can cut a transparent exit into the video and reveal the scene
+	 *  behind the splash. Unset = a plain opaque fit-to-screen image. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	TSoftObjectPtr<UMaterialInterface> BootSplashMovieMaterial;
+
+	/** Movie time (seconds) at which the host takes over (OnFadeOutStarted: scene / music in UNDER the movie's exit). 0 = at the end. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	float BootSplashMovieRevealSeconds = 0.0f;
+
+	/** The sound class of the movie's audio (a game's SFX class, so the player's volume sliders apply). Unset = the engine's media default. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	TSoftObjectPtr<USoundClass> BootSplashMovieSoundClass;
 
 	/** Seconds the logos take to fade in. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
