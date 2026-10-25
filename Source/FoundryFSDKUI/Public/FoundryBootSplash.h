@@ -177,6 +177,11 @@ private:
 	bool bMovieEnded = false;
 	bool bRevealFired = false;
 	float MovieRevealSeconds = 0.0f;
+	/** Seconds before the reveal the world renders again (negative = never paused). */
+	float MovieWorldWarmUpSeconds = 1.5f;
+	/** This splash switched world rendering off and owes it back. */
+	bool bWorldRenderingPaused = false;
+	void SetWorldRenderingPaused(bool bPaused);
 	/** Real seconds in the current movie phase (opening: since the first tick; playing: since Play()). */
 	float MoviePhaseSeconds = 0.0f;
 	int32 MovieFrames = 0;

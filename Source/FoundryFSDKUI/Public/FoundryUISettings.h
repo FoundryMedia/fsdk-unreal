@@ -303,6 +303,12 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	TSoftObjectPtr<UMediaSource> BootSplashMovie;
 
+	/** While the movie is fully opaque the world behind it is not rendered (it is covered anyway - full
+	 *  Lumen/RT cost for nothing made the movie stutter). Rendering resumes this many seconds BEFORE the
+	 *  reveal so textures stream and shaders warm up behind the still-opaque frame. Negative = always render. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	float BootSplashMovieWorldWarmUpSeconds = 1.5f;
+
 	/** A UI-domain material for the movie: texture parameter `Movie` (the media texture) and scalar `MovieTime` (seconds of
 	 *  movie time, pushed every tick), so the material can cut a transparent exit into the video and reveal the scene
 	 *  behind the splash. Unset = a plain opaque fit-to-screen image. */

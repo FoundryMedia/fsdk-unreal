@@ -18,6 +18,8 @@
 #include "MediaSoundComponent.h"
 #include "MediaSource.h"
 #include "MediaTexture.h"
+#include "Engine/GameViewportClient.h"
+#include "FoundryUISettings.h"
 #include "Sound/SoundBase.h"
 #include "Sound/SoundClass.h"
 #include "Styling/SlateBrush.h"
@@ -168,6 +170,14 @@ bool UFoundryBootSplash::BuildMovie()
 	{
 		MovieImage->SetBrushResourceObject(MovieTexture);
 	}
+	// The brush's own size is the movie's 16:9 frame: a material brush defaults to 32 x 32, which the cover fit
+	// scaled as a SQUARE - the video was stretched 16/9 vertically (2026-10-25).
+	{
+		FSlateBrush Brush = MovieImage->GetBrush();
+		Brush.ImageSize = MovieNativeSize;
+		Brush.DrawAs = ESlateBrushDrawType::Image;
+		MovieImage->SetBrush(Brush);
+	}
 	MovieImage->SetDesiredSizeOverride(MovieNativeSize);
 	MovieImage->SetVisibility(ESlateVisibility::HitTestInvisible);
 
@@ -258,8 +268,26 @@ void UFoundryBootSplash::FireReveal(float MovieSeconds)
 	OnFadeOutStarted.Broadcast();
 }
 
+void UFoundryBootSplash::SetWorldRenderingPaused(bool bPaused)
+{
+	if (bPaused == bWorldRenderingPaused)
+	{
+		return;
+	}
+	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
+	if (Viewport == nullptr)
+	{
+		return;
+	}
+	Viewport->bDisableWorldRendering = bPaused;
+	bWorldRenderingPaused = bPaused;
+	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] world rendering %s"), bPaused ? TEXT("paused under the opaque movie") : TEXT("resumed"));
+}
+
 void UFoundryBootSplash::CleanupMovie()
 {
+	SetWorldRenderingPaused(false); // never leave the world unrendered, whatever ended the movie
 	if (MoviePlayer)
 	{
 		MoviePlayer->OnMediaOpened.RemoveDynamic(this, &UFoundryBootSplash::HandleMovieOpened);
@@ -349,6 +377,14 @@ void UFoundryBootSplash::TickMovie(float InDeltaTime)
 			{
 				MoviePlayer->Play();
 				Phase = EPhase::MoviePlaying;
+				if (const UFoundryUISettings* Settings = UFoundryUISettings::Get())
+				{
+					MovieWorldWarmUpSeconds = Settings->BootSplashMovieWorldWarmUpSeconds;
+				}
+				if (MovieWorldWarmUpSeconds >= 0.0f)
+				{
+					SetWorldRenderingPaused(true);
+				}
 				MoviePhaseSeconds = 0.0f;
 				UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie playing (duration %.2f s, reveal at %.2f s)"),
 					MoviePlayer->GetDuration().GetTotalSeconds(), MovieRevealSeconds);
@@ -372,6 +408,15 @@ void UFoundryBootSplash::TickMovie(float InDeltaTime)
 	if (MovieMID)
 	{
 		MovieMID->SetScalarParameterValue(TEXT("MovieTime"), T);
+	}
+	// The world renders again a little before the reveal (warm-up behind the still-opaque frame).
+	if (bWorldRenderingPaused)
+	{
+		const float RevealAt = MovieRevealSeconds > 0.0f ? MovieRevealSeconds : Duration;
+		if (RevealAt <= 0.0f || T >= RevealAt - MovieWorldWarmUpSeconds)
+		{
+			SetWorldRenderingPaused(false);
+		}
 	}
 	if (!bRevealFired && MovieRevealSeconds > 0.0f && T >= MovieRevealSeconds)
 	{
