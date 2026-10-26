@@ -25,6 +25,7 @@
 #include "Styling/SlateBrush.h"
 #include "Brushes/SlateDynamicImageBrush.h"
 #include "IImageWrapperModule.h"
+#include "ImageUtils.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 
@@ -238,6 +239,17 @@ bool UFoundryBootSplash::BuildMovie()
 
 	BuildKeyArt(Root); // above the movie: the key art shows from the first frame, then fades to black
 
+	// Pause the world NOW, before the first frame: that frame is otherwise a full Lumen/RT render of the lobby
+	// behind an opaque splash (0.39 s on Justin's box, 2026-10-25), long enough to show as a black flash.
+	if (const UFoundryUISettings* Settings = UFoundryUISettings::Get())
+	{
+		MovieWorldWarmUpSeconds = Settings->BootSplashMovieWorldWarmUpSeconds;
+	}
+	if (MovieWorldWarmUpSeconds >= 0.0f)
+	{
+		SetWorldRenderingPaused(true);
+	}
+
 	if (!MoviePlayer->OpenSource(MovieSource))
 	{
 		bMovieOpenFailed = true; // an immediate refusal: the first tick falls back to the logos
@@ -272,15 +284,24 @@ bool UFoundryBootSplash::BuildKeyArt(UPanelWidget* Root)
 		return false;
 	}
 
-	// The SAME file the startup screen drew (a brush by file name, no texture asset), so the hand-over from the
-	// engine's loading screen to the first game frame is pixel-identical.
+	// The SAME file the startup screen drew, decoded NOW into a texture: the very first game frame must already
+	// hold the picture (the engine drops its loading screen the moment the map has loaded, so any frame without it
+	// is a black flash between the two). A by-name Slate brush decodes lazily at first paint.
 	const FVector2D Size{ double(W), double(H) };
-	// A DYNAMIC brush held for the layer's life: a plain FSlateImageBrush on a file path draws a white quad, and a
-	// temporary dynamic brush would release the texture in its destructor. The UImage's copy keeps the dynamic flag.
-	FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-	KeyArtBrush = MakeShared<FSlateDynamicImageBrush>(FName(*Path), Size);
+	KeyArtTexture = FImageUtils::ImportFileAsTexture2D(Path);
+	if (KeyArtTexture == nullptr)
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] key art %s could not be decoded - the splash starts on the movie"), *Path);
+		return false;
+	}
 	UImage* KeyArt = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
-	KeyArt->SetBrush(*KeyArtBrush);
+	{
+		FSlateBrush Brush;
+		Brush.DrawAs = ESlateBrushDrawType::Image;
+		Brush.SetResourceObject(KeyArtTexture);
+		Brush.SetImageSize(Size);
+		KeyArt->SetBrush(Brush);
+	}
 	KeyArt->SetDesiredSizeOverride(Size);
 	KeyArt->SetVisibility(ESlateVisibility::HitTestInvisible);
 	KeyArtScaleBox = WidgetTree->ConstructWidget<UScaleBox>(UScaleBox::StaticClass());
@@ -324,7 +345,7 @@ void UFoundryBootSplash::ReleaseKeyArt()
 		KeyArtScaleBox->RemoveFromParent();
 		KeyArtScaleBox = nullptr;
 	}
-	KeyArtBrush.Reset(); // the dynamic brush's destructor releases the decoded texture
+	KeyArtTexture = nullptr;
 }
 
 void UFoundryBootSplash::HandleMovieOpened(FString OpenedUrl)

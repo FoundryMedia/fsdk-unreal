@@ -205,8 +205,9 @@ private:
 	/** Movie mode: the game's key art over the movie until it fades to black (UFoundryUISettings::StartupScreenImage). */
 	UPROPERTY(Transient)
 	TObjectPtr<UScaleBox> KeyArtScaleBox;
-	/** The key art's dynamic brush (decoded by file name); released with the layer. */
-	TSharedPtr<struct FSlateBrush> KeyArtBrush;
+	/** The key art decoded into a transient texture BEFORE the first frame (a by-name brush can draw late). */
+	UPROPERTY(Transient)
+	TObjectPtr<class UTexture2D> KeyArtTexture;
 	void ReleaseKeyArt();
 	float KeyArtHoldSeconds = 0.0f;
 	float KeyArtFadeSeconds = 0.0f;
