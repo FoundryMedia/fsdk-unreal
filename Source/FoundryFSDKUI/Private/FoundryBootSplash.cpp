@@ -23,6 +23,10 @@
 #include "Sound/SoundBase.h"
 #include "Sound/SoundClass.h"
 #include "Styling/SlateBrush.h"
+#include "Brushes/SlateDynamicImageBrush.h"
+#include "IImageWrapperModule.h"
+#include "HAL/FileManager.h"
+#include "Misc/Paths.h"
 
 namespace
 {
@@ -207,6 +211,11 @@ bool UFoundryBootSplash::BuildMovie()
 		MovieSound->SetMediaPlayer(MoviePlayer);
 		MovieSoundActor->SetRootComponent(MovieSound);
 		MovieSound->RegisterComponent();
+		// After RegisterComponent: the synth forwards the multiplier to its audio component, created in OnRegister.
+		if (const UFoundryUISettings* Settings = UFoundryUISettings::Get())
+		{
+			MovieSound->SetVolumeMultiplier(FMath::Clamp(Settings->BootSplashMovieVolume, 0.0f, 1.0f));
+		}
 		if (!MovieSound->IsActive())
 		{
 			MovieSound->Activate(true);
@@ -227,11 +236,95 @@ bool UFoundryBootSplash::BuildMovie()
 		LogoRow->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
+	BuildKeyArt(Root); // above the movie: the key art shows from the first frame, then fades to black
+
 	if (!MoviePlayer->OpenSource(MovieSource))
 	{
 		bMovieOpenFailed = true; // an immediate refusal: the first tick falls back to the logos
 	}
 	return true;
+}
+
+bool UFoundryBootSplash::BuildKeyArt(UPanelWidget* Root)
+{
+	const UFoundryUISettings* Settings = UFoundryUISettings::Get();
+	FString Relative = Settings ? Settings->StartupScreenImage : FString();
+	Relative.TrimStartAndEndInline();
+	if (Relative.IsEmpty() || Root == nullptr)
+	{
+		return false;
+	}
+	const FString Path = FPaths::IsRelative(Relative) ? FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir() / Relative) : Relative;
+	TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Path));
+	uint8 Header[24] = {};
+	if (!Reader || Reader->TotalSize() < 24)
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] key art %s is missing - the splash starts on the movie"), *Path);
+		return false;
+	}
+	Reader->Serialize(Header, sizeof(Header));
+	Reader.Reset();
+	const uint32 W = (uint32(Header[16]) << 24) | (uint32(Header[17]) << 16) | (uint32(Header[18]) << 8) | uint32(Header[19]);
+	const uint32 H = (uint32(Header[20]) << 24) | (uint32(Header[21]) << 16) | (uint32(Header[22]) << 8) | uint32(Header[23]);
+	if (Header[1] != 'P' || Header[2] != 'N' || Header[3] != 'G' || W == 0 || H == 0)
+	{
+		UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[BootSplash] key art %s is not a PNG - the splash starts on the movie"), *Path);
+		return false;
+	}
+
+	// The SAME file the startup screen drew (a brush by file name, no texture asset), so the hand-over from the
+	// engine's loading screen to the first game frame is pixel-identical.
+	const FVector2D Size{ double(W), double(H) };
+	// A DYNAMIC brush held for the layer's life: a plain FSlateImageBrush on a file path draws a white quad, and a
+	// temporary dynamic brush would release the texture in its destructor. The UImage's copy keeps the dynamic flag.
+	FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	KeyArtBrush = MakeShared<FSlateDynamicImageBrush>(FName(*Path), Size);
+	UImage* KeyArt = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
+	KeyArt->SetBrush(*KeyArtBrush);
+	KeyArt->SetDesiredSizeOverride(Size);
+	KeyArt->SetVisibility(ESlateVisibility::HitTestInvisible);
+	KeyArtScaleBox = WidgetTree->ConstructWidget<UScaleBox>(UScaleBox::StaticClass());
+	KeyArtScaleBox->SetStretch(EStretch::ScaleToFill);
+	KeyArtScaleBox->SetVisibility(ESlateVisibility::HitTestInvisible);
+	KeyArtScaleBox->AddChild(KeyArt);
+	if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(Root->AddChild(KeyArtScaleBox)))
+	{
+		OverlaySlot->SetHorizontalAlignment(HAlign_Fill);
+		OverlaySlot->SetVerticalAlignment(VAlign_Fill);
+	}
+	KeyArtHoldSeconds = Settings ? FMath::Max(0.0f, Settings->StartupScreenHoldSeconds) : 1.0f;
+	KeyArtFadeSeconds = Settings ? FMath::Max(0.0f, Settings->StartupScreenFadeSeconds) : 0.8f;
+	KeyArtElapsed = 0.0f;
+	return true;
+}
+
+bool UFoundryBootSplash::TickKeyArt(float InDeltaTime)
+{
+	if (KeyArtScaleBox == nullptr)
+	{
+		return true;
+	}
+	KeyArtElapsed += FMath::Min(InDeltaTime, MaxHoldTickSeconds); // a first-frame hitch must not eat the hold
+	const float IntoFade = KeyArtElapsed - KeyArtHoldSeconds;
+	const float Alpha = IntoFade <= 0.0f ? 1.0f : (KeyArtFadeSeconds > 0.0f ? 1.0f - FMath::Clamp(IntoFade / KeyArtFadeSeconds, 0.0f, 1.0f) : 0.0f);
+	KeyArtScaleBox->SetRenderOpacity(FMath::InterpEaseInOut(0.0f, 1.0f, Alpha, 2.0f));
+	if (Alpha > 0.0f)
+	{
+		return false;
+	}
+	ReleaseKeyArt();
+	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] key art faded to black"));
+	return true;
+}
+
+void UFoundryBootSplash::ReleaseKeyArt()
+{
+	if (KeyArtScaleBox)
+	{
+		KeyArtScaleBox->RemoveFromParent();
+		KeyArtScaleBox = nullptr;
+	}
+	KeyArtBrush.Reset(); // the dynamic brush's destructor releases the decoded texture
 }
 
 void UFoundryBootSplash::HandleMovieOpened(FString OpenedUrl)
@@ -319,6 +412,7 @@ void UFoundryBootSplash::CleanupMovie()
 		MovieScaleBox->RemoveFromParent();
 		MovieScaleBox = nullptr;
 	}
+	ReleaseKeyArt();
 	MovieImage = nullptr;
 	MovieMID = nullptr;
 }
@@ -357,7 +451,15 @@ void UFoundryBootSplash::TickMovie(float InDeltaTime)
 		Phase = EPhase::MovieOpening;
 		MoviePhaseSeconds = 0.0f;
 		MovieFrames = 0;
-		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie opening %s"), *GetNameSafe(MovieSource));
+		UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie opening %s%s"), *GetNameSafe(MovieSource), KeyArtScaleBox ? TEXT(" behind the key art") : TEXT(""));
+		if (const UFoundryUISettings* Settings = UFoundryUISettings::Get())
+		{
+			MovieWorldWarmUpSeconds = Settings->BootSplashMovieWorldWarmUpSeconds;
+		}
+		if (MovieWorldWarmUpSeconds >= 0.0f)
+		{
+			SetWorldRenderingPaused(true); // covered by the key art / the opaque movie from here
+		}
 		return;
 	}
 
@@ -366,6 +468,7 @@ void UFoundryBootSplash::TickMovie(float InDeltaTime)
 
 	if (Phase == EPhase::MovieOpening)
 	{
+		const bool bKeyArtDone = TickKeyArt(InDeltaTime);
 		if (bMovieOpenFailed)
 		{
 			FallBackToLogos(TEXT("the movie failed to open"));
@@ -373,26 +476,18 @@ void UFoundryBootSplash::TickMovie(float InDeltaTime)
 		else if (bMovieOpened)
 		{
 			// Play only once the world behind has drawn a couple of frames, so the reveal never lands on a cold scene.
-			if (MovieFrames >= 2 && MoviePlayer)
+			if (MovieFrames >= 2 && bKeyArtDone && MoviePlayer)
 			{
 				MoviePlayer->Play();
 				Phase = EPhase::MoviePlaying;
-				if (const UFoundryUISettings* Settings = UFoundryUISettings::Get())
-				{
-					MovieWorldWarmUpSeconds = Settings->BootSplashMovieWorldWarmUpSeconds;
-				}
-				if (MovieWorldWarmUpSeconds >= 0.0f)
-				{
-					SetWorldRenderingPaused(true);
-				}
 				MoviePhaseSeconds = 0.0f;
 				UE_LOG(LogFoundryFSDKUI, Log, TEXT("[BootSplash] movie playing (duration %.2f s, reveal at %.2f s)"),
 					MoviePlayer->GetDuration().GetTotalSeconds(), MovieRevealSeconds);
 			}
 		}
-		else if (MoviePhaseSeconds > MovieOpenTimeoutSeconds)
+		else if (MoviePhaseSeconds > MovieOpenTimeoutSeconds + KeyArtHoldSeconds + KeyArtFadeSeconds)
 		{
-			FallBackToLogos(TEXT("the movie did not open within 3 s"));
+			FallBackToLogos(TEXT("the movie did not open in time"));
 		}
 		return;
 	}
@@ -451,6 +546,7 @@ void UFoundryBootSplash::NativeConstruct()
 {
 	Super::NativeConstruct();
 	SetKeyboardFocus();
+	SetCursor(EMouseCursor::None); // a short unskippable cutscene: no pointer over it
 	if (LogoRow && !FadeAnim)
 	{
 		LogoRow->SetRenderOpacity(0.0f); // the first value of the fade, so the logos never flash before the first tick

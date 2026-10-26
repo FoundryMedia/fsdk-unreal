@@ -26,6 +26,11 @@
 			"LoadingPhase": "Default"
 		},
 		{
+			"Name": "FoundryFSDKStartupScreen",
+			"Type": "ClientOnly",
+			"LoadingPhase": "PreLoadingScreen"
+		},
+		{
 			"Name": "FoundryFSDKUIEditor",
 			"Type": "Editor",
 			"LoadingPhase": "Default"

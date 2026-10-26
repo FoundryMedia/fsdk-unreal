@@ -202,6 +202,19 @@ private:
 	TObjectPtr<UImage> MovieImage;
 	UPROPERTY(Transient)
 	TObjectPtr<UScaleBox> MovieScaleBox;
+	/** Movie mode: the game's key art over the movie until it fades to black (UFoundryUISettings::StartupScreenImage). */
+	UPROPERTY(Transient)
+	TObjectPtr<UScaleBox> KeyArtScaleBox;
+	/** The key art's dynamic brush (decoded by file name); released with the layer. */
+	TSharedPtr<struct FSlateBrush> KeyArtBrush;
+	void ReleaseKeyArt();
+	float KeyArtHoldSeconds = 0.0f;
+	float KeyArtFadeSeconds = 0.0f;
+	float KeyArtElapsed = 0.0f;
+	/** Builds the key-art layer above the movie; false when no image is configured or the file is missing. */
+	bool BuildKeyArt(class UPanelWidget* Root);
+	/** Advances the key art; true once it has faded out (or there is none). */
+	bool TickKeyArt(float InDeltaTime);
 	UPROPERTY(Transient)
 	TObjectPtr<AActor> MovieSoundActor;
 	UPROPERTY(Transient)

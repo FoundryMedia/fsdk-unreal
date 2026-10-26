@@ -7,6 +7,9 @@
 #include "FoundryCreditRow.generated.h"
 
 class UTextBlock;
+class UButton;
+class UHorizontalBox;
+struct FFoundryCreditLink;
 
 /**
  * One row of the credits view: either a SECTION HEADER (SectionText shown, Name/Role collapsed) or
@@ -27,8 +30,21 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
 	void SetEntry(const FText& Name, const FText& Role);
 
+	/** Icon buttons after the role, one per link (opens the URL in the browser). Built into LinksBox when the WBP has
+	 *  one, else into a box appended to RoleText's parent row. Replaces any previous links. */
+	void SetLinks(const TArray<FFoundryCreditLink>& Links);
+
 protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> SectionText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> NameText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> RoleText;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UHorizontalBox> LinksBox;
+
+private:
+	UFUNCTION()
+	void HandleLinkClicked();
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UButton>> LinkButtons;
+	TArray<FString> LinkUrls;
 };

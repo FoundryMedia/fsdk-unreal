@@ -44,6 +44,8 @@ public class FoundryFSDKUI : ModuleRules
 			"EnhancedInput",
 			"GameplayTags",
 			"MediaAssets", // UFoundryBootSplash's movie mode: UMediaPlayer / UMediaTexture / UMediaSoundComponent
+			"AudioMixer", // USynthComponent::SetVolumeMultiplier (the movie sound component's base)
+			"ImageWrapper", // the boot splash's key art is a PNG decoded by file name (a dynamic Slate brush)
 		});
 	}
 }

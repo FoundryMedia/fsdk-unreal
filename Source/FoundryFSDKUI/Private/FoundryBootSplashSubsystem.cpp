@@ -214,8 +214,12 @@ bool UFoundryBootSplashSubsystem::TryPlay(APlayerController* PC, FSimpleDelegate
 		const float Sequence = FMath::Max(0.0f, FadeIn) + FMath::Max(0.0f, Hold) + FMath::Max(0.0f, FadeOut);
 		// Movie mode: the movie is real-time (media clock), so the failsafe is its (unknown-yet) length plus slack - but never less
 		// than the logo fallback it can drop into (3 s open timeout + that sequence at the worst-case clock ratio).
+		// The key art (if any) holds and fades BEFORE the movie starts, on the widget's capped clock (worst case 4x).
+		const float KeyArt = Settings->StartupScreenImage.TrimStartAndEnd().IsEmpty()
+			? 0.0f
+			: (FMath::Max(0.0f, Settings->StartupScreenHoldSeconds) + FMath::Max(0.0f, Settings->StartupScreenFadeSeconds)) * 4.0f;
 		const float Total = bMovie
-			? FMath::Max(MovieFailsafeSeconds + FailsafeSlackSeconds, 3.0f + Sequence * 4.0f + FailsafeSlackSeconds)
+			? FMath::Max(MovieFailsafeSeconds + FailsafeSlackSeconds, 3.0f + Sequence * 4.0f + FailsafeSlackSeconds) + KeyArt
 			: Sequence * 4.0f + FailsafeSlackSeconds;
 		GI->GetTimerManager().SetTimer(FailsafeTimer, this, &UFoundryBootSplashSubsystem::HandleFailsafe, Total, false);
 	}

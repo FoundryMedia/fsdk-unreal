@@ -130,6 +130,25 @@ struct FOUNDRYFSDKUI_API FFoundryMatchmakingMode
 	FString AttributesJson;
 };
 
+/** A link beside a credit (a social profile): a small icon button that opens Url in the player's browser. */
+USTRUCT(BlueprintType)
+struct FOUNDRYFSDKUI_API FFoundryCreditLink
+{
+	GENERATED_BODY()
+
+	/** The icon (white, tinted by the row) - the kit ships /FoundryFSDK/UI/Icons/icon_soundcloud and icon_instagram. */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	TSoftObjectPtr<UTexture2D> Icon;
+
+	/** https:// only - anything else is dropped with a WARN. */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Url;
+
+	/** Tooltip, e.g. "SoundCloud". */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Label;
+};
+
 /** One line of the credits view: a person (or company) and what they did, grouped under a Section heading. */
 USTRUCT(BlueprintType)
 struct FOUNDRYFSDKUI_API FFoundryCreditEntry
@@ -145,6 +164,10 @@ struct FOUNDRYFSDKUI_API FFoundryCreditEntry
 
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
 	FString Role;
+
+	/** Optional profile links, shown as icon buttons after the role. */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	TArray<FFoundryCreditLink> Links;
 };
 
 /**
@@ -319,9 +342,28 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	float BootSplashMovieRevealSeconds = 0.0f;
 
-	/** The sound class of the movie's audio (a game's SFX class, so the player's volume sliders apply). Unset = the engine's media default. */
+	/** The sound class of the movie's audio (normally the game's MASTER class: a producer tag follows the master slider only). Unset = the engine's media default. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
 	TSoftObjectPtr<USoundClass> BootSplashMovieSoundClass;
+
+	/** Volume of the movie's own audio (0..1, multiplies the sound class). A producer tag usually sits under the menu music. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float BootSplashMovieVolume = 1.0f;
+
+	/** The game's key art, as a PNG path RELATIVE to the project's Content directory (e.g. Splash/KeyArt.png) - a loose
+	 *  file, staged with +DirectoriesToAlwaysStageAsNonUFS, because the startup screen shows it before any asset can load.
+	 *  Shown cover-fit from the window's first frame while the engine boots (module FoundryFSDKStartupScreen), then by
+	 *  the movie-mode boot splash on its first frame, held, and faded to black before the movie plays. Empty = off. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
+	FString StartupScreenImage;
+
+	/** Seconds the key art stays up in the boot splash before it fades (the startup screen has shown it during the load already). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash", meta = (ClampMin = "0.0"))
+	float StartupScreenHoldSeconds = 1.0f;
+
+	/** Seconds the key art takes to fade to black before the movie starts. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash", meta = (ClampMin = "0.0"))
+	float StartupScreenFadeSeconds = 0.8f;
 
 	/** Seconds the logos take to fade in. */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Boot Splash")
