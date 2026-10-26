@@ -1,6 +1,8 @@
 #include "Modules/ModuleManager.h"
 
 #include "Brushes/SlateColorBrush.h"
+#include "Engine/Engine.h"
+#include "Engine/GameEngine.h"
 #include "Brushes/SlateDynamicImageBrush.h"
 #include "IImageWrapperModule.h"
 #include "Misc/CoreMisc.h"
@@ -68,7 +70,22 @@ public:
 				]
 			];
 		GetMoviePlayer()->SetupLoadingScreen(Screen);
+		// The hand-over: when the startup screen ends (end of engine init) the window is left showing the movie
+		// player's own content - an empty, BLACK viewport - and the engine only switches it back to the game viewport
+		// AFTER the first game frame has drawn (FEngineLoop::Tick -> WaitForMovieToFinish's else branch). That first
+		// frame is slow (0.31 s on a real launch), so it showed as a black flash between the startup screen and the
+		// boot splash, which is already in the viewport by then. Switch at once (the engine call is idempotent).
+		FinishedHandle = GetMoviePlayer()->OnMoviePlaybackFinished().AddRaw(this, &FFoundryFSDKStartupScreenModule::HandleStartupScreenFinished);
 		UE_LOG(LogFoundryStartupScreen, Log, TEXT("startup screen: %s (%.0f x %.0f)"), *Relative, Size.X, Size.Y);
+	}
+
+	virtual void ShutdownModule() override
+	{
+		if (FinishedHandle.IsValid() && IsMoviePlayerEnabled() && GetMoviePlayer())
+		{
+			GetMoviePlayer()->OnMoviePlaybackFinished().Remove(FinishedHandle);
+		}
+		FinishedHandle.Reset();
 	}
 
 	virtual bool IsGameModule() const override
@@ -77,6 +94,22 @@ public:
 	}
 
 private:
+	void HandleStartupScreenFinished()
+	{
+		if (UGameEngine* GameEngine = Cast<UGameEngine>(GEngine))
+		{
+			GameEngine->SwitchGameWindowToUseGameViewport();
+			UE_LOG(LogFoundryStartupScreen, Log, TEXT("startup screen finished - window handed to the game viewport"));
+		}
+		// Once only: later loading screens are not ours.
+		if (FinishedHandle.IsValid())
+		{
+			GetMoviePlayer()->OnMoviePlaybackFinished().Remove(FinishedHandle);
+			FinishedHandle.Reset();
+		}
+	}
+
+	FDelegateHandle FinishedHandle;
 	/** Width and height from a PNG's IHDR chunk (bytes 16..23, big-endian). */
 	static bool ReadPngSize(const FString& Path, FVector2D& OutSize)
 	{

@@ -16,6 +16,7 @@ public class FoundryFSDKStartupScreen : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
+			"Engine", // UGameEngine::SwitchGameWindowToUseGameViewport at the hand-over
 			"MoviePlayer",
 			"Slate",
 			"SlateCore",
