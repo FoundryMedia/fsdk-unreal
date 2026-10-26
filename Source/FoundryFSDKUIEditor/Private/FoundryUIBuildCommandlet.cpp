@@ -1860,7 +1860,8 @@ namespace
 		VideoSection.C(SettingsRow(TEXT("WindowModeRow"), TEXT("Window mode"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("WindowModeCombo"), true }));
 		VideoSection.C(SettingsRow(TEXT("ResolutionRow"), TEXT("Resolution"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("ResolutionCombo"), true }));
 		VideoSection.C(SettingsRow(TEXT("QualityRow"), TEXT("Quality"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("QualityCombo"), true }));
-		VideoSection.C(SettingsRow(TEXT("FpsCapRow"), TEXT("Frame rate cap"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("FpsCapCombo"), true }));
+		VideoSection.C(SettingsRow(TEXT("LobbyFpsCapRow"), TEXT("Lobby frame rate"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("LobbyFpsCapCombo"), true }));
+		VideoSection.C(SettingsRow(TEXT("FpsCapRow"), TEXT("Match frame rate"), FFoundryWidgetSpec{ TEXT("ComboBoxString"), TEXT("FpsCapCombo"), true }));
 		VideoSection.C(SettingsRow(TEXT("VSyncRow"), TEXT("V-Sync"), FFoundryWidgetSpec{ TEXT("CheckBox"), TEXT("VSyncCheck"), true }));
 
 		// AUDIO.
@@ -1868,6 +1869,7 @@ namespace
 		AudioSection.C(SettingsRow(TEXT("MasterRow"), TEXT("Master volume"), SliderControl(TEXT("MasterSlider"), TEXT("MasterValueText"), 0.0f, 1.0f)));
 		AudioSection.C(SettingsRow(TEXT("MusicRow"), TEXT("Music volume"), SliderControl(TEXT("MusicSlider"), TEXT("MusicValueText"), 0.0f, 1.0f)));
 		AudioSection.C(SettingsRow(TEXT("SFXRow"), TEXT("SFX volume"), SliderControl(TEXT("SFXSlider"), TEXT("SFXValueText"), 0.0f, 1.0f)));
+		AudioSection.C(SettingsRow(TEXT("BackgroundAudioRow"), TEXT("Play audio in background"), FFoundryWidgetSpec{ TEXT("CheckBox"), TEXT("BackgroundAudioCheck"), true }));
 
 		// INTERFACE.
 		FFoundryWidgetSpec InterfaceSection = SettingsSection(TEXT("InterfaceSection"), TEXT("INTERFACE"));
@@ -2036,8 +2038,12 @@ namespace
 		Root.P(TEXT("ChildVAlign"), TEXT("Center")).P(TEXT("SlotPad"), TEXT("0,8,0,0"));
 		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("SectionText"), true }
 			.P(TEXT("FontSize"), 17.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("Text")).P(TEXT("FontRole"), TEXT("Heading")));
-		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("NameText"), true }
-			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("Text")).P(TEXT("SlotPad"), TEXT("0,0,16,0")));
+		// Name with its (optional, cosmetic) handle underneath, e.g. "@LevTheDev".
+		Root.C(FFoundryWidgetSpec{ TEXT("VerticalBox") }.P(TEXT("SlotPad"), TEXT("0,0,16,0"))
+			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("NameText"), true }
+				.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("Text")))
+			.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("HandleText"), true }
+				.P(TEXT("FontSize"), 11.0f).P(TEXT("Color"), TEXT("TextSecondary"))));
 		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("RoleText"), true }
 			.P(TEXT("FontSize"), 14.0f).P(TEXT("Color"), TEXT("TextSecondary")).P(TEXT("HAlign"), TEXT("Right")).P(TEXT("Size"), TEXT("Fill")));
 		Shell.C(MoveTemp(Root));

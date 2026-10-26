@@ -33,6 +33,11 @@ void UFoundryAppBar::NativeOnInitialized()
 			: TEXT("Settings menu is not configured (Project Settings -> Game -> Foundry UI).")));
 		SettingsButton->OnClicked.AddDynamic(this, &UFoundryAppBar::HandleSettings);
 	}
+	if (PowerButton)
+	{
+		SetKitToolTip(PowerButton, FText::FromString(TEXT("Menu")));
+		PowerButton->OnClicked.AddDynamic(this, &UFoundryAppBar::HandlePower);
+	}
 	// The base already ran its tooltip pass BEFORE the tooltip above existed - wrap it in the kit pill now.
 	ApplyKitTooltips(this);
 }
@@ -81,6 +86,16 @@ void UFoundryAppBar::Refresh()
 			: FString(TEXT("Social"))));
 	}
 	OnIdentityUpdated(bIn);
+}
+
+void UFoundryAppBar::HandlePower()
+{
+	if (UObject* Host = FindMenuHost())
+	{
+		IFoundryMenuHost::Execute_RequestOpenPauseMenu(Host);
+		return;
+	}
+	UE_LOG(LogFoundryFSDKUI, Warning, TEXT("[UI] %s: PowerButton needs a menu host (IFoundryMenuHost on the player controller) to open the pause menu"), *GetClass()->GetName());
 }
 
 void UFoundryAppBar::SetSocialOpen(bool bOpen)

@@ -9,6 +9,15 @@
 #include "Kismet/GameplayStatics.h"
 #include "Sound/SoundClass.h"
 #include "Sound/SoundMix.h"
+#include "Engine/GameViewportClient.h"
+#include "GenericPlatform/GenericWindow.h"
+#include "Misc/App.h"
+#include "Widgets/SWindow.h"
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <windows.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
 
 namespace
 {
@@ -108,6 +117,10 @@ void UFoundryGameUserSettings::ApplyDeveloperMode(UGameInstance* GameInstance) c
 
 void UFoundryGameUserSettings::ApplyAudio(UObject* WorldContextObject)
 {
+	// Process-wide, before any early return: the engine scales every sound by this while the window is unfocused
+	// (BaseEngine.ini [Audio] UnfocusedVolumeMultiplier is 0 = silent when alt-tabbed).
+	FApp::SetUnfocusedVolumeMultiplier(bPlayAudioInBackground ? 1.0f : 0.0f);
+
 	UWorld* World = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
 	if (World == nullptr)
 	{
@@ -179,8 +192,67 @@ void UFoundryGameUserSettings::SetToDefaults()
 	UIScale = 1.0f;
 	bReducedMotion = false;
 	bDeveloperModeEnabled = false;
+	bPlayAudioInBackground = true;
+	LobbyFrameRateLimit = 60.0f;
+	MatchFrameRateLimit = -1.0f;
 	ConsoleKey = TEXT("Tilde");
 	DebugOverlayKey = TEXT("F9");
+}
+
+int32 UFoundryGameUserSettings::GetMonitorRefreshRate()
+{
+#if PLATFORM_WINDOWS
+	HWND Hwnd = nullptr;
+	if (GEngine && GEngine->GameViewport)
+	{
+		const TSharedPtr<SWindow> Window = GEngine->GameViewport->GetWindow();
+		if (Window.IsValid() && Window->GetNativeWindow().IsValid())
+		{
+			Hwnd = static_cast<HWND>(Window->GetNativeWindow()->GetOSWindowHandle());
+		}
+	}
+	HMONITOR Monitor = Hwnd ? MonitorFromWindow(Hwnd, MONITOR_DEFAULTTOPRIMARY) : MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+	MONITORINFOEXW Info;
+	Info.cbSize = sizeof(Info);
+	if (Monitor && GetMonitorInfoW(Monitor, &Info))
+	{
+		DEVMODEW Mode = {};
+		Mode.dmSize = sizeof(Mode);
+		// 0 and 1 mean "the hardware default" - unknown.
+		if (EnumDisplaySettingsW(Info.szDevice, ENUM_CURRENT_SETTINGS, &Mode) && Mode.dmDisplayFrequency > 1)
+		{
+			return static_cast<int32>(Mode.dmDisplayFrequency);
+		}
+	}
+#endif
+	return 0;
+}
+
+float UFoundryGameUserSettings::ResolveFrameRateLimit(EFoundryPauseContext Context) const
+{
+	if (Context == EFoundryPauseContext::Lobby)
+	{
+		return FMath::Max(0.0f, LobbyFrameRateLimit);
+	}
+	if (MatchFrameRateLimit >= 0.0f)
+	{
+		return MatchFrameRateLimit;
+	}
+	const int32 Hz = GetMonitorRefreshRate();
+	return Hz > 0 ? static_cast<float>(Hz) : 144.0f;
+}
+
+void UFoundryGameUserSettings::ApplyFrameRateForContext(EFoundryPauseContext Context)
+{
+	const float Limit = ResolveFrameRateLimit(Context);
+	SetFrameRateLimit(Limit); // the engine's own field, so its ApplySettings path keeps this cap
+	if (GEngine)
+	{
+		GEngine->SetMaxFPS(Limit);
+	}
+	UE_LOG(LogFoundryFSDKUI, Log, TEXT("[Settings] frame rate cap %s for the %s"),
+		Limit > 0.0f ? *FString::Printf(TEXT("%.0f"), Limit) : TEXT("unlimited"),
+		Context == EFoundryPauseContext::Lobby ? TEXT("lobby") : TEXT("match"));
 }
 
 UFoundryGameUserSettings* UFoundryGameUserSettings::Get()

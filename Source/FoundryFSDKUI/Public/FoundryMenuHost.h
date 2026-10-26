@@ -56,6 +56,10 @@ public:
 	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
 	void RequestLeaveMatch();
 
+	/** Open the pause ("ESC") menu, the same as pressing Escape with nothing open. */
+	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
+	void RequestOpenPauseMenu();
+
 	/** Which pause-menu wording/behavior the host wants right now. */
 	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
 	EFoundryPauseContext GetPauseContext() const;

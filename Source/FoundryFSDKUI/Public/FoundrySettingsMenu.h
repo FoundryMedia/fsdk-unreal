@@ -100,7 +100,10 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UComboBoxString> WindowModeCombo;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UComboBoxString> ResolutionCombo;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UComboBoxString> QualityCombo;
+	/** The MATCH frame-rate cap (UFoundryGameUserSettings::MatchFrameRateLimit) - applied live, not staged. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UComboBoxString> FpsCapCombo;
+	/** The LOBBY frame-rate cap (UFoundryGameUserSettings::LobbyFrameRateLimit) - applied live. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UComboBoxString> LobbyFpsCapCombo;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UCheckBox> VSyncCheck;
 
 	// -- rows, for the hover/focus-to-describe pass (NativeTick) - each is the row's own
@@ -109,6 +112,8 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> ResolutionRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> QualityRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> FpsCapRow;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> LobbyFpsCapRow;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> BackgroundAudioRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> VSyncRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> MasterRow;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> MusicRow;
@@ -128,6 +133,7 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> MusicValueText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<USlider> SFXSlider;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> SFXValueText;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UCheckBox> BackgroundAudioCheck;
 
 	// -- Interface (UFoundryGameUserSettings) --
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UWidget> InterfaceSection;
@@ -172,6 +178,12 @@ private:
 	UFUNCTION() void HandleResolutionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
 	UFUNCTION() void HandleQualityChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
 	UFUNCTION() void HandleFpsCapChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+	UFUNCTION() void HandleLobbyFpsCapChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+	UFUNCTION() void HandleBackgroundAudioChanged(bool bIsChecked);
+	/** Fills both frame-rate combos from UFoundryGameUserSettings (hidden rows when it is not the project's class). */
+	void PopulateFrameRates();
+	/** Re-applies the cap for the host's current context (lobby when there is no host). */
+	void ApplyFrameRateNow();
 	UFUNCTION() void HandleVSyncChanged(bool bIsChecked);
 	UFUNCTION() void HandleApplyClicked();
 	/** Sets bPendingVideoDirty, (en/dis)ables ApplyButton and fires OnVideoPendingChanged - but only

@@ -34,10 +34,15 @@ public:
 	 *  one, else into a box appended to RoleText's parent row. Replaces any previous links. */
 	void SetLinks(const TArray<FFoundryCreditLink>& Links);
 
+	/** HandleText under the name (collapsed when empty). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
+	void SetHandle(const FText& Handle);
+
 protected:
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> SectionText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> NameText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> RoleText;
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> HandleText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UHorizontalBox> LinksBox;
 
 private:

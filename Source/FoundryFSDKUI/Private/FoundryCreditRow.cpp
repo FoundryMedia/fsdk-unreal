@@ -18,6 +18,7 @@ void UFoundryCreditRow::SetSectionHeader(const FText& Section)
 	Show(SectionText, true);
 	Show(NameText, false);
 	Show(RoleText, false);
+	Show(HandleText, false);
 }
 
 void UFoundryCreditRow::SetEntry(const FText& Name, const FText& Role)
@@ -26,7 +27,14 @@ void UFoundryCreditRow::SetEntry(const FText& Name, const FText& Role)
 	SetText(NameText, Name.ToString());
 	Show(NameText, true);
 	SetText(RoleText, Role.ToString());
-	Show(RoleText, !Role.IsEmpty());
+	// Kept visible even when empty: RoleText fills the row, so every row's links line up at the right edge.
+	Show(RoleText, true);
+}
+
+void UFoundryCreditRow::SetHandle(const FText& Handle)
+{
+	SetText(HandleText, Handle.ToString());
+	Show(HandleText, !Handle.IsEmpty());
 }
 
 void UFoundryCreditRow::SetLinks(const TArray<FFoundryCreditLink>& Links)

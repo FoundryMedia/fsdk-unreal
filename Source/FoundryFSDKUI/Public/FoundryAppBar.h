@@ -80,10 +80,13 @@ protected:
 	/** The badge count; "9+" above nine. */
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UTextBlock> SocialBadgeText;
 	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> SettingsButton;
+	/** Optional: opens the pause ("ESC") menu through the host - the mouse-only way to quit. */
+	UPROPERTY(BlueprintReadOnly, Category = "Foundry UI", meta = (BindWidgetOptional)) TObjectPtr<UButton> PowerButton;
 
 private:
 	UFUNCTION() void HandleSocial();
 	UFUNCTION() void HandleSettings();
+	UFUNCTION() void HandlePower();
 
 	void Refresh();
 	/** The ONE social poller (UFoundrySocialSubsystem) - identity and the badge count read it. */

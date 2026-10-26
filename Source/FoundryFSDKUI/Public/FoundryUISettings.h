@@ -165,6 +165,10 @@ struct FOUNDRYFSDKUI_API FFoundryCreditEntry
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
 	FString Role;
 
+	/** Optional handle shown small under the name (e.g. "@LevTheDev") - cosmetic, the links carry the profile. */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
+	FString Handle;
+
 	/** Optional profile links, shown as icon buttons after the role. */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Foundry UI")
 	TArray<FFoundryCreditLink> Links;

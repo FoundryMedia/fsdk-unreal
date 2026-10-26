@@ -326,19 +326,21 @@ void UFoundryUIWidgetBase::SetKitToolTip(UWidget* Target, const FText& Text)
 		return;
 	}
 
+	if (UFoundryTooltip* Existing = Cast<UFoundryTooltip>(Target->GetToolTip()))
+	{
+		// Relabel IN PLACE, and touch nothing else. Calling SetToolTip(Existing) again would SNew a fresh
+		// SToolTip around a re-taken widget (DESTRUCT/CONSTRUCT pairs each poll, 2026-10-13), and calling
+		// SetToolTipText here REPLACES the live Slate tooltip with the engine's default text tooltip while the
+		// pill is only relabelled - every refreshing tooltip (the app bar's Social, re-set each social poll)
+		// fell back to Unreal's style after its first refresh (2026-10-26).
+		Existing->SetLabel(Text);
+		return;
+	}
+
 	// SetToolTipText first (keeps GetToolTipText() - and therefore ApplyKitTooltips' "already has
 	// text" check - in step), then SetToolTip LAST so the custom widget wins: both ultimately write
 	// the same Slate tooltip metadata slot, and whichever is set last is what actually shows.
 	Target->SetToolTipText(Text);
-
-	if (UFoundryTooltip* Existing = Cast<UFoundryTooltip>(Target->GetToolTip()))
-	{
-		// Relabel IN PLACE. Calling SetToolTip(Existing) again would SNew a fresh SToolTip around a
-		// re-taken widget - the pill is destructed and constructed on every refresh (seen as
-		// DESTRUCT/CONSTRUCT pairs on the app bar's social badge each poll, 2026-10-13).
-		Existing->SetLabel(Text);
-		return;
-	}
 
 	const TSubclassOf<UUserWidget> Loaded = UFoundryUISettings::LoadWidgetClass(UFoundryUISettings::Get()->DefaultTooltip, TEXT("DefaultTooltip"));
 	const TSubclassOf<UFoundryTooltip> TooltipClass = Loaded.Get();

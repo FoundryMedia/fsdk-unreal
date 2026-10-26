@@ -44,9 +44,48 @@ namespace
 		return EWindowMode::Windowed;
 	}
 
-	// Key table for both the combo's options and FpsCapCombo's parse-back.
-	constexpr float FpsCaps[] = { 0.0f, 30.0f, 60.0f, 120.0f, 144.0f, 240.0f };
-	const TCHAR* const FpsCapLabels[] = { TEXT("Off"), TEXT("30"), TEXT("60"), TEXT("120"), TEXT("144"), TEXT("240") };
+	// The frame-rate caps both combos offer (0 = Unlimited, last). The match combo adds "Monitor (N Hz)" first.
+	constexpr float FpsCaps[] = { 30.0f, 60.0f, 90.0f, 120.0f, 144.0f, 165.0f, 240.0f, 0.0f };
+	const TCHAR* const UnlimitedLabel = TEXT("Unlimited");
+
+	FString FpsLabel(float Cap)
+	{
+		return Cap > 0.0f ? FString::Printf(TEXT("%.0f"), Cap) : FString(UnlimitedLabel);
+	}
+
+	/** "Monitor (144 Hz)" - the match combo's default entry (MatchFrameRateLimit -1). */
+	FString MonitorLabel()
+	{
+		const int32 Hz = UFoundryGameUserSettings::GetMonitorRefreshRate();
+		return Hz > 0 ? FString::Printf(TEXT("Monitor (%d Hz)"), Hz) : FString(TEXT("Monitor (144 Hz)"));
+	}
+
+	/** Parses a combo label back: Unlimited -> 0, "Monitor ..." -> -1, else the number. */
+	float ParseFpsLabel(const FString& Label)
+	{
+		if (Label == UnlimitedLabel) { return 0.0f; }
+		if (Label.StartsWith(TEXT("Monitor"))) { return -1.0f; }
+		return FCString::Atof(*Label);
+	}
+
+	void FillFpsCombo(UComboBoxString* Combo, float Current, bool bWithMonitor)
+	{
+		if (Combo == nullptr) { return; }
+		Combo->ClearOptions();
+		if (bWithMonitor) { Combo->AddOption(MonitorLabel()); }
+		for (const float Cap : FpsCaps) { Combo->AddOption(FpsLabel(Cap)); }
+		FString Selected;
+		if (bWithMonitor && Current < 0.0f)
+		{
+			Selected = MonitorLabel();
+		}
+		else
+		{
+			Selected = FpsLabel(FMath::Max(0.0f, Current));
+			if (Combo->FindOptionIndex(Selected) == INDEX_NONE) { Combo->AddOption(Selected); } // a hand-edited ini value
+		}
+		Combo->SetSelectedOption(Selected);
+	}
 
 	const TCHAR* const QualityLevelLabels[] = { TEXT("Low"), TEXT("Medium"), TEXT("High"), TEXT("Epic"), TEXT("Cinematic") };
 
@@ -79,6 +118,8 @@ void UFoundrySettingsMenu::NativeOnInitialized()
 	if (ResolutionCombo) { ResolutionCombo->OnSelectionChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleResolutionChanged); }
 	if (QualityCombo) { QualityCombo->OnSelectionChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleQualityChanged); }
 	if (FpsCapCombo) { FpsCapCombo->OnSelectionChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleFpsCapChanged); }
+	if (LobbyFpsCapCombo) { LobbyFpsCapCombo->OnSelectionChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleLobbyFpsCapChanged); }
+	if (BackgroundAudioCheck) { BackgroundAudioCheck->OnCheckStateChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleBackgroundAudioChanged); }
 	if (VSyncCheck) { VSyncCheck->OnCheckStateChanged.AddDynamic(this, &UFoundrySettingsMenu::HandleVSyncChanged); }
 
 	if (MasterSlider)
@@ -124,6 +165,7 @@ void UFoundrySettingsMenu::NativeConstruct()
 	ScrubComboChrome(ResolutionCombo);
 	ScrubComboChrome(QualityCombo);
 	ScrubComboChrome(FpsCapCombo);
+	ScrubComboChrome(LobbyFpsCapCombo);
 	PopulateAudioAndInterface();
 	PopulateControls();
 	Show(NoteText, false);
@@ -294,34 +336,7 @@ void UFoundrySettingsMenu::PopulateVideo()
 		}
 	}
 
-	if (FpsCapCombo)
-	{
-		FpsCapCombo->ClearOptions();
-		for (const TCHAR* Label : FpsCapLabels)
-		{
-			FpsCapCombo->AddOption(Label);
-		}
-		const float CurrentLimit = GUS->GetFrameRateLimit();
-		int32 MatchIndex = INDEX_NONE;
-		for (int32 i = 0; i < static_cast<int32>(UE_ARRAY_COUNT(FpsCaps)); ++i)
-		{
-			if (FMath::IsNearlyEqual(FpsCaps[i], CurrentLimit, 0.5f))
-			{
-				MatchIndex = i;
-				break;
-			}
-		}
-		if (MatchIndex != INDEX_NONE)
-		{
-			FpsCapCombo->SetSelectedOption(FpsCapLabels[MatchIndex]);
-		}
-		else
-		{
-			const FString CustomLabel = FString::Printf(TEXT("%.0f"), CurrentLimit);
-			FpsCapCombo->AddOption(CustomLabel);
-			FpsCapCombo->SetSelectedOption(CustomLabel);
-		}
-	}
+	PopulateFrameRates();
 
 	if (VSyncCheck)
 	{
@@ -399,14 +414,70 @@ void UFoundrySettingsMenu::HandleQualityChanged(FString SelectedItem, ESelectInf
 	}
 }
 
+void UFoundrySettingsMenu::PopulateFrameRates()
+{
+	const UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get();
+	Show(FpsCapRow, Settings != nullptr, true);
+	Show(LobbyFpsCapRow, Settings != nullptr, true);
+	if (Settings == nullptr)
+	{
+		return;
+	}
+	FillFpsCombo(LobbyFpsCapCombo, Settings->GetLobbyFrameRateLimit(), /*bWithMonitor*/ false);
+	FillFpsCombo(FpsCapCombo, Settings->GetMatchFrameRateLimit(), /*bWithMonitor*/ true);
+}
+
+void UFoundrySettingsMenu::ApplyFrameRateNow()
+{
+	UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get();
+	if (Settings == nullptr)
+	{
+		return;
+	}
+	const UObject* Host = FindMenuHost();
+	const EFoundryPauseContext Context = Host ? IFoundryMenuHost::Execute_GetPauseContext(Host) : EFoundryPauseContext::Lobby;
+	Settings->ApplyFrameRateForContext(Context);
+	Settings->SaveSettings();
+}
+
 void UFoundrySettingsMenu::HandleFpsCapChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
 {
 	if (bPopulating || SelectedItem.IsEmpty() || SelectionType == ESelectInfo::Direct)
 	{
 		return;
 	}
-	PendingVideo.FpsCap = (SelectedItem == TEXT("Off")) ? 0.0f : FCString::Atof(*SelectedItem);
-	SetPendingVideoDirty(true);
+	if (UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get())
+	{
+		Settings->SetMatchFrameRateLimit(ParseFpsLabel(SelectedItem));
+		ApplyFrameRateNow();
+	}
+}
+
+void UFoundrySettingsMenu::HandleLobbyFpsCapChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	if (bPopulating || SelectedItem.IsEmpty() || SelectionType == ESelectInfo::Direct)
+	{
+		return;
+	}
+	if (UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get())
+	{
+		Settings->SetLobbyFrameRateLimit(ParseFpsLabel(SelectedItem));
+		ApplyFrameRateNow();
+	}
+}
+
+void UFoundrySettingsMenu::HandleBackgroundAudioChanged(bool bIsChecked)
+{
+	if (bPopulating)
+	{
+		return;
+	}
+	if (UFoundryGameUserSettings* Settings = UFoundryGameUserSettings::Get())
+	{
+		Settings->SetPlayAudioInBackground(bIsChecked);
+		Settings->ApplyAudio(this);
+		Settings->SaveSettings();
+	}
 }
 
 void UFoundrySettingsMenu::HandleVSyncChanged(bool bIsChecked)
@@ -432,7 +503,8 @@ void UFoundrySettingsMenu::HandleApplyClicked()
 	{
 		GUS->SetOverallScalabilityLevel(PendingVideo.Quality);
 	}
-	GUS->SetFrameRateLimit(PendingVideo.FpsCap);
+	// The frame-rate cap is NOT staged: the lobby / match combos apply live (UFoundryGameUserSettings), and
+	// ApplySettings below re-applies the engine's FrameRateLimit, which ApplyFrameRateForContext keeps current.
 	GUS->SetVSyncEnabled(PendingVideo.bVSync);
 	GUS->ApplySettings(false);
 	GUS->SaveSettings();
@@ -467,6 +539,7 @@ void UFoundrySettingsMenu::PopulateAudioAndInterface()
 	SetText(UIScaleValueText, FString::Printf(TEXT("%.2fx"), Settings->GetUIScale()));
 	if (ReducedMotionCheck) { ReducedMotionCheck->SetIsChecked(Settings->IsReducedMotion()); }
 	if (DeveloperModeCheck) { DeveloperModeCheck->SetIsChecked(Settings->IsDeveloperModeEnabled()); }
+	if (BackgroundAudioCheck) { BackgroundAudioCheck->SetIsChecked(Settings->IsPlayAudioInBackground()); }
 }
 
 void UFoundrySettingsMenu::HandleMasterVolumeChanged(float Value)
@@ -865,8 +938,10 @@ void UFoundrySettingsMenu::BuildDescribedRows()
 		TEXT("Your monitor's native resolution is sharpest. Lower it for more frames."));
 	Add(QualityRow, TEXT("QualityRow"), TEXT("Quality"),
 		TEXT("One preset for every scalability group. Custom shows when the groups differ."));
-	Add(FpsCapRow, TEXT("FpsCapRow"), TEXT("FPS cap"),
-		TEXT("Caps the frame rate so the GPU does not run flat out. Off = uncapped."));
+	Add(LobbyFpsCapRow, TEXT("LobbyFpsCapRow"), TEXT("Lobby frame rate"),
+		TEXT("Caps the frame rate in the lobby and menus, so the GPU stays cool while you wait. Unlimited = no cap."));
+	Add(FpsCapRow, TEXT("FpsCapRow"), TEXT("Match frame rate"),
+		TEXT("Caps the frame rate in a match. Monitor matches your display's refresh rate. Unlimited = no cap."));
 	Add(VSyncRow, TEXT("VSyncRow"), TEXT("V-Sync"),
 		TEXT("Removes tearing by syncing to your monitor; adds a little input delay."));
 	Add(MasterRow, TEXT("MasterRow"), TEXT("Master volume"),
@@ -875,6 +950,8 @@ void UFoundrySettingsMenu::BuildDescribedRows()
 		TEXT("Controls music only - sound effects are unaffected."));
 	Add(SFXRow, TEXT("SFXRow"), TEXT("SFX volume"),
 		TEXT("Controls sound effects only - music is unaffected."));
+	Add(BackgroundAudioRow, TEXT("BackgroundAudioRow"), TEXT("Play audio in background"),
+		TEXT("Keep the game's sound on while another window is in front."));
 	Add(UIScaleRow, TEXT("UIScaleRow"), TEXT("UI scale"),
 		TEXT("Makes every menu and HUD element bigger or smaller."));
 	Add(ReducedMotionRow, TEXT("ReducedMotionRow"), TEXT("Reduced motion"),

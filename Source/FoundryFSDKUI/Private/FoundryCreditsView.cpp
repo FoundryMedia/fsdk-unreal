@@ -89,6 +89,7 @@ void UFoundryCreditsView::Populate()
 			if (UFoundryCreditRow* Row = CreateWidget<UFoundryCreditRow>(this, RowClass))
 			{
 				Row->SetEntry(FText::FromString(Entry.Name), FText::FromString(Entry.Role));
+				Row->SetHandle(FText::FromString(Entry.Handle));
 				Row->SetLinks(Entry.Links);
 				EntriesBox->AddChild(Row);
 			}

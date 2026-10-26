@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/GameUserSettings.h"
+#include "FoundryMenuHost.h" // EFoundryPauseContext
 #include "FoundryGameUserSettings.generated.h"
 
 /**
@@ -31,6 +32,18 @@ public:
 
 	UPROPERTY(Config)
 	float SFXVolume = 1.0f;
+
+	/** Keep playing sound while the game window is not focused (alt-tabbed). On by default. */
+	UPROPERTY(Config)
+	bool bPlayAudioInBackground = true;
+
+	/** Frame-rate cap in the front end (lobby, menus). 0 = unlimited. A lobby rarely needs more. */
+	UPROPERTY(Config)
+	float LobbyFrameRateLimit = 60.0f;
+
+	/** Frame-rate cap in a match. -1 = the monitor's refresh rate (else 144 when it cannot be read), 0 = unlimited. */
+	UPROPERTY(Config)
+	float MatchFrameRateLimit = -1.0f;
 
 	/** Multiplier on the UI's on-screen sizes (1 = the reference metrics). Clamped 0.75..1.5. */
 	UPROPERTY(Config)
@@ -67,6 +80,41 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
 	float GetUIScale() const { return UIScale; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	bool IsPlayAudioInBackground() const { return bPlayAudioInBackground; }
+
+	/** Only stores the flag - ApplyAudio pushes it (the engine's unfocused volume multiplier). */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetPlayAudioInBackground(bool bEnabled) { bPlayAudioInBackground = bEnabled; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	float GetLobbyFrameRateLimit() const { return LobbyFrameRateLimit; }
+
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	float GetMatchFrameRateLimit() const { return MatchFrameRateLimit; }
+
+	/** 0 = unlimited; negative values clamp to 0. Does not apply - call ApplyFrameRateForContext. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetLobbyFrameRateLimit(float Limit) { LobbyFrameRateLimit = FMath::Max(0.0f, Limit); }
+
+	/** -1 = monitor refresh, 0 = unlimited. Does not apply - call ApplyFrameRateForContext. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void SetMatchFrameRateLimit(float Limit) { MatchFrameRateLimit = Limit < 0.0f ? -1.0f : Limit; }
+
+	/** The current refresh rate of the monitor the game window is on (Windows), else 0 (unknown). */
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	static int32 GetMonitorRefreshRate();
+
+	/** The cap a context runs at, resolved (monitor refresh / 144 fallback for -1). 0 = unlimited. */
+	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
+	float ResolveFrameRateLimit(EFoundryPauseContext Context) const;
+
+	/** Applies the context's cap live (engine max FPS + the engine's own FrameRateLimit, so its ApplySettings
+	 *  path keeps it). A game calls it whenever it enters the front end or a match (its player controller's
+	 *  BeginPlay); the settings menu re-applies it for the host's current context after a change. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI|Settings")
+	void ApplyFrameRateForContext(EFoundryPauseContext Context);
 
 	UFUNCTION(BlueprintPure, Category = "Foundry UI|Settings")
 	bool IsReducedMotion() const { return bReducedMotion; }
