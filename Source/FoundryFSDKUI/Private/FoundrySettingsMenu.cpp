@@ -17,6 +17,8 @@
 #include "FoundryGameUserSettings.h"
 #include "FoundryKeybindRow.h"
 #include "FoundryMenuHost.h"
+#include "FoundryToastSubsystem.h"
+#include "FoundryDisplayModeSubsystem.h"
 #include "FoundryUISettings.h"
 #include "FoundryUITheme.h"
 #include "GameFramework/GameUserSettings.h"
@@ -243,16 +245,15 @@ void UFoundrySettingsMenu::HandleBackClicked()
 	}
 }
 
-void UFoundrySettingsMenu::ShowNote(const FString& Message)
+void UFoundrySettingsMenu::ShowNote(const FString& Message, bool bError)
 {
-	SetText(NoteText, Message);
-	Show(NoteText, true);
-	NoteTimer = 3.0f;
+	Show(NoteText, false); // the toast replaced the inline note line
+	UFoundryToastSubsystem::ShowToast(this, FText::FromString(Message), bError ? EFoundryToastKind::Error : EFoundryToastKind::Info);
 }
 
-// -- Video: STAGED through PendingVideo, committed to the engine's own UGameUserSettings only by
-// ApplyButton. A resolution-revert countdown (ConfirmVideoMode / RevertVideoMode) is v2 - today
-// Apply is immediate and permanent, like every other commit on this menu. ------------------------
+// -- Video: every change applies at once. Window mode / resolution go through
+// UFoundryDisplayModeSubsystem (applied now, kept or reverted to a snapshot within 15 s); ApplyButton
+// is SAVE - it writes the file and toasts, nothing is staged behind it. ----------------------------
 
 void UFoundrySettingsMenu::PopulateVideo()
 {
@@ -353,10 +354,7 @@ void UFoundrySettingsMenu::SetPendingVideoDirty(bool bDirty)
 		return;
 	}
 	bPendingVideoDirty = bDirty;
-	if (ApplyButton)
-	{
-		ApplyButton->SetIsEnabled(bDirty);
-	}
+	// ApplyButton is SAVE now: always enabled (every setting applies the moment it changes).
 	OnVideoPendingChanged(bDirty);
 }
 
@@ -367,7 +365,7 @@ void UFoundrySettingsMenu::HandleWindowModeChanged(FString SelectedItem, ESelect
 		return; // PopulateVideo's own SetSelectedOption / ClearOptions calls, not a user pick
 	}
 	PendingVideo.WindowMode = ParseWindowMode(SelectedItem);
-	SetPendingVideoDirty(true);
+	ApplyDisplayChange();
 }
 
 void UFoundrySettingsMenu::HandleResolutionChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
@@ -382,7 +380,7 @@ void UFoundrySettingsMenu::HandleResolutionChanged(FString SelectedItem, ESelect
 		return;
 	}
 	PendingVideo.Resolution = FIntPoint(FCString::Atoi(*XStr), FCString::Atoi(*YStr));
-	SetPendingVideoDirty(true);
+	ApplyDisplayChange();
 }
 
 void UFoundrySettingsMenu::HandleQualityChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
@@ -400,7 +398,12 @@ void UFoundrySettingsMenu::HandleQualityChanged(FString SelectedItem, ESelectInf
 		if (SelectedItem == QualityLevelLabels[i])
 		{
 			PendingVideo.Quality = i;
-			SetPendingVideoDirty(true);
+			if (UGameUserSettings* GUS = GEngine ? GEngine->GetGameUserSettings() : nullptr)
+			{
+				GUS->SetOverallScalabilityLevel(i); // live: no display change, nothing to confirm
+				GUS->ApplyNonResolutionSettings();
+				GUS->SaveSettings();
+			}
 			// The "Custom" placeholder only belongs while scalability IS custom - drop it directly
 			// (a no-op RemoveOption::ClearSelection only fires if "Custom" were still selected, which
 			// it never is here) rather than re-running PopulateVideo, which would recurse through
@@ -487,7 +490,12 @@ void UFoundrySettingsMenu::HandleVSyncChanged(bool bIsChecked)
 		return; // PopulateVideo's own SetIsChecked call
 	}
 	PendingVideo.bVSync = bIsChecked;
-	SetPendingVideoDirty(true);
+	if (UGameUserSettings* GUS = GEngine ? GEngine->GetGameUserSettings() : nullptr)
+	{
+		GUS->SetVSyncEnabled(bIsChecked);
+		GUS->ApplyNonResolutionSettings();
+		GUS->SaveSettings();
+	}
 }
 
 void UFoundrySettingsMenu::HandleApplyClicked()
@@ -497,19 +505,42 @@ void UFoundrySettingsMenu::HandleApplyClicked()
 	{
 		return;
 	}
-	GUS->SetFullscreenMode(PendingVideo.WindowMode);
-	GUS->SetScreenResolution(PendingVideo.Resolution);
-	if (PendingVideo.Quality >= 0)
-	{
-		GUS->SetOverallScalabilityLevel(PendingVideo.Quality);
-	}
-	// The frame-rate cap is NOT staged: the lobby / match combos apply live (UFoundryGameUserSettings), and
-	// ApplySettings below re-applies the engine's FrameRateLimit, which ApplyFrameRateForContext keeps current.
-	GUS->SetVSyncEnabled(PendingVideo.bVSync);
-	GUS->ApplySettings(false);
+	// SAVE: every setting already applied (and saved) the moment it changed; display changes went through
+	// their own keep-or-revert prompt. This writes the file once more and says so.
 	GUS->SaveSettings();
-	PopulateVideo(); // re-seeds from the now-live settings and clears the pending flag
-	ShowNote(TEXT("Applied."));
+	UFoundryToastSubsystem::ShowToast(this, FText::FromString(TEXT("Settings saved")), EFoundryToastKind::Success);
+}
+
+void UFoundrySettingsMenu::ApplyDisplayChange()
+{
+	constexpr float RevertSeconds = 15.0f;
+	UGameInstance* GI = GetGameInstance();
+	UFoundryDisplayModeSubsystem* Display = GI ? GI->GetSubsystem<UFoundryDisplayModeSubsystem>() : nullptr;
+	if (Display == nullptr)
+	{
+		return;
+	}
+	Display->OnResolved.RemoveAll(this);
+	Display->OnResolved.AddWeakLambda(this, [this]() { PopulateVideo(); });
+	Display->ApplyPending(PendingVideo.WindowMode, PendingVideo.Resolution, RevertSeconds);
+
+	if (UFoundryConfirmDialog* Live = Display->GetLivePrompt())
+	{
+		Live->SetAutoCancel(RevertSeconds); // a second change while the prompt is up: count again
+		return;
+	}
+	UFoundryConfirmDialog* Dialog = OpenConfirmDialog(
+		FText::FromString(TEXT("Keep these display settings?")),
+		FText::FromString(TEXT("They revert on their own if you do nothing.")),
+		FText::FromString(TEXT("KEEP")),
+		FText::FromString(TEXT("REVERT")),
+		0.0f);
+	if (Dialog == nullptr)
+	{
+		return; // no prompt to show: the deadline still reverts - a broken mode never sticks unasked
+	}
+	Dialog->SetAutoCancel(RevertSeconds);
+	Display->SetPrompt(Dialog);
 }
 
 // -- Audio + Interface: UFoundryGameUserSettings. Both sections hide together when the project's
@@ -806,7 +837,7 @@ void UFoundrySettingsMenu::HandleKeyChosen(FName InMappingName, FKey Key)
 				const FText ConflictDisplay = (ConflictRow && ConflictRow->Mappings.Num() > 0)
 					? ConflictRow->Mappings.CreateConstIterator()->GetDisplayName()
 					: FText::FromName(Conflict);
-				ShowNote(FString::Printf(TEXT("Already used by %s"), *ConflictDisplay.ToString()));
+				ShowNote(FString::Printf(TEXT("Already used by %s"), *ConflictDisplay.ToString()), true);
 				RebuildKeybindRows(); // restores the row's previous key
 				return;
 			}
@@ -822,7 +853,7 @@ void UFoundrySettingsMenu::HandleKeyChosen(FName InMappingName, FKey Key)
 	InputSettings->MapPlayerKey(Args, Failure);
 	if (!Failure.IsEmpty())
 	{
-		ShowNote(TEXT("That key can't be used here."));
+		ShowNote(TEXT("That key can't be used here."), true);
 		RebuildKeybindRows(); // restores the row's previous key
 		return;
 	}

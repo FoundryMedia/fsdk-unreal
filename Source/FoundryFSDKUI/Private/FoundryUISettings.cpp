@@ -58,6 +58,7 @@ UFoundryUISettings::UFoundryUISettings()
 	DefaultSettingsMenu = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundrySettingsMenu.WBP_FoundrySettingsMenu_C")));
 	DefaultKeybindRow = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryKeybindRow.WBP_FoundryKeybindRow_C")));
 	DefaultTooltip = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryTooltip.WBP_FoundryTooltip_C")));
+	DefaultToast = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Menus/WBP_FoundryToast.WBP_FoundryToast_C")));
 
 	// The lobby app bar + match cluster family, generated into /FoundryFSDK/UI/Match.
 	DefaultAppBar = TSoftClassPtr<UUserWidget>(FSoftObjectPath(TEXT("/FoundryFSDK/UI/Match/WBP_FoundryAppBar.WBP_FoundryAppBar_C")));
@@ -71,7 +72,8 @@ UFoundryUISettings::UFoundryUISettings()
 	CreditsTitle = FText::FromString(TEXT("CREDITS"));
 	// \u00AE = registered mark, \u2013 = en dash (escapes keep the source ASCII).
 	CreditsFooter = FText::FromString(
-		FString(TEXT("Made with Foundry.\n"))
+		FString(TEXT("Powered by Foundry. Foundry and the Foundry logo are trademarks of Foundry Media LLC. "))
+		+ TEXT("Foundry Gaming Services, Copyright 2026, Foundry Media LLC. All rights reserved.\n\n")
 		+ TEXT("Powered by Unreal Engine. Unreal\u00AE is a trademark or registered trademark of Epic Games, Inc. in the United States of America and elsewhere. ")
 		  TEXT("Unreal\u00AE Engine, Copyright 1998 \u2013 2026, Epic Games, Inc. All rights reserved."));
 

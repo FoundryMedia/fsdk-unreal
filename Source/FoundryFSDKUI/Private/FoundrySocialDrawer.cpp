@@ -15,6 +15,7 @@
 #include "FoundryFSDKUILog.h"
 #include "FoundryInviteRow.h"
 #include "FoundryPartyRules.h"
+#include "FoundryToastSubsystem.h"
 #include "FoundrySocialSubsystem.h"
 #include "FoundryUISettings.h"
 #include "FoundryUITheme.h"
@@ -451,6 +452,13 @@ void UFoundrySocialDrawer::HandleActionSucceeded(FName Action, const FString& Me
 
 void UFoundrySocialDrawer::ShowActionNote(const FString& Message, bool bError, float Seconds)
 {
+	if (bError)
+	{
+		// Errors are a toast (they must be seen even with the drawer half off-screen); successes stay on the line.
+		Show(ActionNote, false);
+		UFoundryToastSubsystem::ShowToast(this, FText::FromString(Message), EFoundryToastKind::Error);
+		return;
+	}
 	SetText(ActionNote, Message);
 	if (ActionNote)
 	{

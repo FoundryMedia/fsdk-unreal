@@ -106,6 +106,7 @@
 #include "FoundrySettingsMenu.h"
 #include "FoundrySocialDrawer.h"
 #include "FoundryTooltip.h"
+#include "FoundryToast.h"
 #include "FoundryUISettings.h"
 #include "FoundryUITheme.h"
 #include "HAL/FileManager.h"
@@ -543,6 +544,7 @@ namespace
 		S += FString::Printf(TEXT("DefaultCreditsView=%s/%sCreditsView.%sCreditsView_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultCreditRow=%s/%sCreditRow.%sCreditRow_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		S += FString::Printf(TEXT("DefaultTooltip=%s/%sTooltip.%sTooltip_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
+		S += FString::Printf(TEXT("DefaultToast=%s/%sToast.%sToast_C") LINE_TERMINATOR, *MenusPath, *MenusPrefix, *MenusPrefix);
 		if (bMatch)
 		{
 			S += FString::Printf(TEXT("DefaultAppBar=%s/%sAppBar.%sAppBar_C") LINE_TERMINATOR, *MatchPath, *MatchPrefix, *MatchPrefix);
@@ -1912,7 +1914,7 @@ namespace
 		// fading note line.
 		FFoundryWidgetSpec FooterRow{ TEXT("HorizontalBox") };
 		FooterRow.P(TEXT("SlotPad"), TEXT("0,16,0,0"));
-		FooterRow.C(SettingsFooterButton(TEXT("ApplyButton"), TEXT("Primary"), TEXT("Primary"), TEXT("ApplyText"), TEXT("APPLY"), TEXT("Surface"))
+		FooterRow.C(SettingsFooterButton(TEXT("ApplyButton"), TEXT("Primary"), TEXT("Primary"), TEXT("ApplyText"), TEXT("SAVE"), TEXT("Surface"))
 			.P(TEXT("Disabled"), TEXT("SurfaceHigh")).P(TEXT("SlotPad"), TEXT("0,0,8,0")));
 		FooterRow.C(SettingsFooterButton(TEXT("BackButton"), TEXT("SurfaceHigh"), TEXT("Primary"), TEXT("BackText"), TEXT("BACK"), TEXT("Text")));
 		Left.C(MoveTemp(FooterRow));
@@ -2053,6 +2055,17 @@ namespace
 	// -- the kit tooltip pill (S3c) - a small pill UFoundryUIWidgetBase::ApplyKitTooltips/SetKitToolTip
 	// wrap plain tooltip text in. Never reparentable (like FriendRow/InviteRow/FriendMenu) - always
 	// UFoundryTooltip itself.
+	// -- the toast pill: UFoundryToast tints Pill per kind (success / error / info) at runtime and sets
+	// MessageText white; the generated fill is only the editor preview.
+	FFoundryWidgetSpec ToastSpec()
+	{
+		FFoundryWidgetSpec Root{ TEXT("Border"), TEXT("Pill"), true };
+		Root.P(TEXT("Fill"), TEXT("Online")).P(TEXT("HalfHeight"), TEXT("1"));
+		Root.C(FFoundryWidgetSpec{ TEXT("TextBlock"), TEXT("MessageText"), true }
+			.P(TEXT("FontSize"), 14.0f).P(TEXT("Bold"), TEXT("1")).P(TEXT("Color"), TEXT("White")).P(TEXT("SlotPad"), TEXT("22,10,22,10")));
+		return Root;
+	}
+
 	FFoundryWidgetSpec TooltipSpec()
 	{
 		FFoundryWidgetSpec Root{ TEXT("Border") };
@@ -2408,6 +2421,7 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	const FString CreditRowAssetName = bHasProfile ? (MenusPrefix + TEXT("CreditRow")) : TEXT("WBP_FoundryCreditRow");
 	// Never reparentable (like FriendRow/InviteRow/FriendMenu) - always UFoundryTooltip itself.
 	const FString TooltipAssetName = bHasProfile ? (MenusPrefix + TEXT("Tooltip")) : TEXT("WBP_FoundryTooltip");
+	const FString ToastAssetName = bHasProfile ? (MenusPrefix + TEXT("Toast")) : TEXT("WBP_FoundryToast");
 
 	UClass* PauseParentClass = UFoundryPauseMenu::StaticClass();
 	if (bHasProfile && !Profile.PauseParent.IsEmpty())
@@ -2639,6 +2653,7 @@ int32 UFoundryUIBuildCommandlet::Main(const FString& Params)
 	bAnySaveFailed |= !BuildWBP(MenusPath, *CreditsViewAssetName, CreditsParentClass, CreditsViewSpec(Radii), Palette, Radii, Fonts, Icons, MenusDump);
 	UE_LOG(LogFoundryUIBuild, Log, TEXT("credits -> %s/%s"), *MenusPath, *CreditsViewAssetName);
 	bAnySaveFailed |= !BuildWBP(MenusPath, *TooltipAssetName, UFoundryTooltip::StaticClass(), TooltipSpec(), Palette, Radii, Fonts, Icons, MenusDump);
+	bAnySaveFailed |= !BuildWBP(MenusPath, *ToastAssetName, UFoundryToast::StaticClass(), ToastSpec(), Palette, Radii, Fonts, Icons, MenusDump);
 	if (bBuildMatch)
 	{
 		bAnySaveFailed |= !BuildWBP(MatchPath, *AppBarAssetName, AppBarParentClass, AppBarSpec(), Palette, Radii, Fonts, Icons, MatchDump);

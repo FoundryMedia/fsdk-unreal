@@ -16,10 +16,18 @@ void UFoundryConfirmDialog::Setup(const FText& Title, const FText& Body, const F
 	SetText(BodyText, Body.ToString());
 	Show(BodyText, !Body.IsEmpty());
 	SetText(CancelText, CancelLabel.ToString());
+	CancelLabelCached = CancelLabel;
+	AutoCancelRemaining = 0.0f;
 
 	CooldownRemaining = FMath::Max(0.0f, CooldownSeconds);
 	LastAppliedCooldownCeil = -1; // force an immediate (re)apply even if the ceil happens to match
 	ApplyCooldownLabel(FMath::CeilToInt(CooldownRemaining));
+}
+
+void UFoundryConfirmDialog::SetAutoCancel(float Seconds)
+{
+	AutoCancelRemaining = bAnswered ? 0.0f : FMath::Max(0.0f, Seconds);
+	LastAutoCancelCeil = -1;
 }
 
 void UFoundryConfirmDialog::ApplyCooldownLabel(int32 RemainingCeil)
@@ -61,6 +69,20 @@ void UFoundryConfirmDialog::NativeTick(const FGeometry& MyGeometry, float InDelt
 		CooldownRemaining = FMath::Max(0.0f, CooldownRemaining - InDeltaTime);
 		ApplyCooldownLabel(FMath::CeilToInt(CooldownRemaining));
 	}
+	if (AutoCancelRemaining > 0.0f)
+	{
+		AutoCancelRemaining = FMath::Max(0.0f, AutoCancelRemaining - InDeltaTime);
+		const int32 Ceil = FMath::CeilToInt(AutoCancelRemaining);
+		if (Ceil != LastAutoCancelCeil)
+		{
+			LastAutoCancelCeil = Ceil;
+			SetText(CancelText, FString::Printf(TEXT("%s (%d)"), *CancelLabelCached.ToString(), Ceil));
+		}
+		if (AutoCancelRemaining <= 0.0f)
+		{
+			HandleCancelButtonClicked();
+		}
+	}
 }
 
 FReply UFoundryConfirmDialog::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
@@ -77,7 +99,7 @@ void UFoundryConfirmDialog::Dismiss()
 {
 	if (UObject* Host = FindMenuHost())
 	{
-		IFoundryMenuHost::Execute_RequestPopMenu(Host);
+		IFoundryMenuHost::Execute_RequestRemoveMenu(Host, this); // this layer, not whatever is on top
 	}
 	else
 	{
@@ -85,14 +107,37 @@ void UFoundryConfirmDialog::Dismiss()
 	}
 }
 
+void UFoundryConfirmDialog::CloseWithoutAnswer()
+{
+	if (bAnswered)
+	{
+		return;
+	}
+	bAnswered = true;
+	AutoCancelRemaining = 0.0f;
+	Dismiss();
+}
+
 void UFoundryConfirmDialog::HandleConfirmButtonClicked()
 {
+	if (bAnswered)
+	{
+		return;
+	}
+	bAnswered = true;
+	AutoCancelRemaining = 0.0f;
 	Dismiss();
 	OnConfirmed.Broadcast();
 }
 
 void UFoundryConfirmDialog::HandleCancelButtonClicked()
 {
+	if (bAnswered)
+	{
+		return;
+	}
+	bAnswered = true;
+	AutoCancelRemaining = 0.0f;
 	Dismiss();
 	OnCancelled.Broadcast();
 }

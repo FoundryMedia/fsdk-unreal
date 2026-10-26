@@ -44,6 +44,11 @@ public:
 	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
 	void RequestPushMenu(UUserWidget* Menu);
 
+	/** Remove THIS layer wherever it sits in the stack (a dialog that closes itself while another layer
+	 *  was pushed above it must not pop that one). */
+	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
+	void RequestRemoveMenu(UUserWidget* Menu);
+
 	/** Remove the current top layer. */
 	UFUNCTION(BlueprintNativeEvent, Category = "Foundry UI|Menu")
 	void RequestPopMenu();

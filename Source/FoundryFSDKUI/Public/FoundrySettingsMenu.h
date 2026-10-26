@@ -222,6 +222,9 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UFoundryConfirmDialog> ActiveResetConfirm;
 
+	/** Applies the staged window mode / resolution through UFoundryDisplayModeSubsystem (keep-or-revert). */
+	void ApplyDisplayChange();
+
 	// Same behavior as Back (discard pending video, pop through the host) - CloseButton's
 	// OnClicked binds straight to this, no separate handler needed.
 	UFUNCTION() void HandleBackClicked();
@@ -231,7 +234,8 @@ private:
 	void PopulateControls();
 	/** Rebuilds KeybindList from the active Enhanced Input key profile's player-mapped rows. */
 	void RebuildKeybindRows();
-	void ShowNote(const FString& Message);
+	/** A toast: Info, or Error when bError. */
+	void ShowNote(const FString& Message, bool bError = false);
 
 	// -- the right-hand description pane --
 

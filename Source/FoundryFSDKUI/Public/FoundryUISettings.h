@@ -233,6 +233,28 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultTooltip;
 
+	/** WBP_FoundryToast - the success / error pill UFoundryToastSubsystem::ShowToast stacks top-centre. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
+	TSoftClassPtr<UUserWidget> DefaultToast;
+
+	/** Seconds a success / info toast stays up (an error uses ErrorToastSeconds). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Toasts")
+	float ToastSeconds = 2.5f;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Toasts")
+	float ErrorToastSeconds = 5.0f;
+
+	/** Pixels from the top of the screen to the first toast (clears a top app bar). */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Toasts")
+	float ToastTopOffset = 96.0f;
+
+	/** Pixels between stacked toasts. */
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Toasts")
+	float ToastSpacing = 52.0f;
+
+	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Toasts")
+	int32 ToastMaxVisible = 3;
+
 	/** WBP_FoundryAppBar - the lobby's top bar (title, player chip, social + settings buttons). */
 	UPROPERTY(Config, EditAnywhere, Category = "Foundry UI|Default Widgets")
 	TSoftClassPtr<UUserWidget> DefaultAppBar;

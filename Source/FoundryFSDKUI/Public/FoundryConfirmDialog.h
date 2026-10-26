@@ -44,6 +44,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Foundry UI")
 	float GetCooldownRemaining() const { return CooldownRemaining; }
 
+	/** Cancels on its own after Seconds (CancelText reads "<label> (N)") - a keep-or-revert prompt that
+	 *  reverts when the player cannot see or answer it. Call after Setup. */
+	UFUNCTION(BlueprintCallable, Category = "Foundry UI")
+	void SetAutoCancel(float Seconds);
+
+	/** True once Confirm, Cancel or the auto-cancel answered (or CloseWithoutAnswer ran). */
+	bool IsAnswered() const { return bAnswered; }
+
+	/** Removes the dialog without firing OnConfirmed / OnCancelled (the owner already decided). */
+	void CloseWithoutAnswer();
+
 protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeConstruct() override;
@@ -74,6 +85,10 @@ private:
 
 	FText ConfirmLabelCached;
 	float CooldownRemaining = 0.0f;
+	float AutoCancelRemaining = 0.0f;
+	bool bAnswered = false;
+	int32 LastAutoCancelCeil = -1;
+	FText CancelLabelCached;
 	// -1 so the very first ApplyCooldownLabel call (from Setup) always applies, even when the
 	// computed ceil happens to be 0 (the member's own default).
 	int32 LastAppliedCooldownCeil = -1;
